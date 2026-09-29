@@ -1588,6 +1588,13 @@ fn render_flat_input_help(output: &mut String, description: &BuiltinToolDescript
             )
                 .expect("writing help to a String cannot fail");
         }
+        if description.name == "member.create" && argument.field == "confirmationToken" {
+            writeln!(
+                output,
+                "      Required one-time token from member.create.preview for this exact card, issued in this same user-triggered run."
+            )
+            .expect("writing help to a String cannot fail");
+        }
         if matches!(
             description.name.as_str(),
             "team.create_task" | "team.update_task"
@@ -1857,8 +1864,11 @@ fn operation_help_examples(operation: &str) -> &'static [&'static str] {
         "mission.status" => &["rovai mission status --status needs_you"],
         "camp.message.send" => &CAMP_MESSAGE_SEND_HELP_EXAMPLES,
         "member.create" => &[
-            "rovai member create --creation-key 2b945f3f-4b45-4ae5-92b2-739fce600338 --display-name 'Nova' --team-role 'Researcher'",
+            "rovai member create --creation-key 2b945f3f-4b45-4ae5-92b2-739fce600338 --confirmation-token <token-from-preview> --display-name 'Nova' --team-role 'Researcher'",
             "rovai member create --input-file confirmed-member.json",
+        ],
+        "member.create.preview" => &[
+            "rovai member create-preview --creation-key 2b945f3f-4b45-4ae5-92b2-739fce600338 --display-name 'Nova' --team-role 'Researcher'",
         ],
         "team.create_task" => {
             &["rovai task create --title 'Prepare release notes' --assignee-agent-id agent_27"]

@@ -65,7 +65,8 @@ use rovai_core::{
         AgentProfileService, ClearMemberRuntimeConfigurationCommand,
         CreateAdapterInstallationCommand, CreateAgentProfileCommand, DiscoveredManagedInstallation,
         FrozenAgentRuntimeConfig, InstallationClass, InstallationSource, ManagedProbeFailure,
-        RecordAdapterCapabilitySnapshotCommand, RemoveMemberCommand, ReorderAgentProfilesCommand,
+        RecordAdapterCapabilitySnapshotCommand, ArchiveMemberCommand, RemoveMemberCommand,
+        ReorderAgentProfilesCommand, RestoreMemberCommand,
         RuntimeEntrypointLocatorIdentity, RuntimeModelCatalogCacheStatus, RuntimeReadinessStatus,
         SetAgentProfileAvatarCommand, SetMemberPresenceCommand,
         SetMemberRuntimeConfigurationCommand, UpdateAdapterInstallationCommand,
@@ -196,7 +197,10 @@ use rovai_core::{
     },
     mcp_import::McpImportScanner,
     mcp_projection::{McpProjectionRequest, McpProjectionService, PreparedMcpProjection},
-    member_studio::{MEMBER_CREATE_TOOL_NAME, MemberCreateError, MemberCreateInput, create_member},
+    member_studio::{
+        MEMBER_CREATE_PREVIEW_TOOL_NAME, MEMBER_CREATE_TOOL_NAME, MemberCreateDraft,
+        MemberCreateError, MemberCreateInput, create_member, preview_member_create,
+    },
     memory::{
         AcceptHearthReviewItemCommand, CreateMemoryCommand, ForgetMemoryCommand, MemoryService,
         ReactivateMemoryCommand, RejectHearthReviewItemCommand, RetireMemoryCommand,
@@ -1101,6 +1105,8 @@ fn request_invalidates_navigation(method: &str) -> bool {
         method,
         "members.update"
             | "members.remove"
+            | "members.archive"
+            | "members.restore"
             | "navigation.campViewed"
             | "camps.create"
             | "camps.discardPending"
@@ -5904,6 +5910,17 @@ impl Core {
                     );
                     Ok(payload)
                 }
+                MEMBER_CREATE_PREVIEW_TOOL_NAME => {
+                    let input = serde_json::from_value::<MemberCreateDraft>(request.input)
+                        .context("member.create.preview input is invalid")?;
+                    let outcome = preview_member_create(
+                        &mut database,
+                        &self.data_dir,
+                        &authenticated_run,
+                        input,
+                    )?;
+                    Ok(serde_json::to_value(outcome)?)
+                }
                 TEAM_CREATE_TASK_TOOL_NAME => {
                     let input = serde_json::from_value::<TeamCreateTaskInput>(request.input)
                         .context("private create_task input is invalid")?;
@@ -8167,10 +8184,19 @@ impl Core {
                 )?)
             }
             "members.list" => {
+                let status_filter = request
+                    .params
+                    .get("statusFilter")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("active");
                 let database = self.database.lock().await;
-                Ok(serde_json::to_value(
-                    AgentProfileService::default().list_profiles(&database)?,
-                )?)
+                let mut profiles = AgentProfileService::default().list_profiles(&database)?;
+                match status_filter {
+                    "archived" => profiles.retain(|profile| profile.presence == "archived"),
+                    "all" => {}
+                    _ => profiles.retain(|profile| profile.presence != "archived"),
+                }
+                Ok(serde_json::to_value(profiles)?)
             }
             "members.get" => {
                 let params: AgentIdParams = serde_json::from_value(request.params.clone())?;
@@ -8316,6 +8342,48 @@ impl Core {
                 let agent_id = params.command.agent_id.clone();
                 let mut database = self.database.lock().await;
                 let execution = AgentProfileService::default().remove_member(
+                    &mut database,
+                    &user_command_envelope(params.command_id, params.command),
+                )?;
+                if execution.result.status == CommandResultStatus::Applied {
+                    self.runtime_fleet.invalidate_member(&agent_id).await;
+                    self.mark_skill_projections_dirty_best_effort(&mut database, true);
+                }
+                let state_changed = execution.result.status == CommandResultStatus::Applied;
+                drop(database);
+                emit_member_roster_if_applied(&self.output, &request.method, &execution);
+                if state_changed {
+                    self.delivery_batch_scheduler_notify.notify_one();
+                }
+                Ok(serde_json::to_value(execution.result)?)
+            }
+            "members.archive" => {
+                let params: UserCommandParams<ArchiveMemberCommand> =
+                    serde_json::from_value(request.params.clone())?;
+                let agent_id = params.command.agent_id.clone();
+                let mut database = self.database.lock().await;
+                let execution = AgentProfileService::default().archive_member(
+                    &mut database,
+                    &user_command_envelope(params.command_id, params.command),
+                )?;
+                if execution.result.status == CommandResultStatus::Applied {
+                    self.runtime_fleet.invalidate_member(&agent_id).await;
+                    self.mark_skill_projections_dirty_best_effort(&mut database, true);
+                }
+                let state_changed = execution.result.status == CommandResultStatus::Applied;
+                drop(database);
+                emit_member_roster_if_applied(&self.output, &request.method, &execution);
+                if state_changed {
+                    self.delivery_batch_scheduler_notify.notify_one();
+                }
+                Ok(serde_json::to_value(execution.result)?)
+            }
+            "members.restore" => {
+                let params: UserCommandParams<RestoreMemberCommand> =
+                    serde_json::from_value(request.params.clone())?;
+                let agent_id = params.command.agent_id.clone();
+                let mut database = self.database.lock().await;
+                let execution = AgentProfileService::default().restore_member(
                     &mut database,
                     &user_command_envelope(params.command_id, params.command),
                 )?;

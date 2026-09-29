@@ -365,7 +365,9 @@ export async function dispatchUserAutomation(
         runtimeKind: adapterKindField(input, 'adapterKind')
       })
     case 'member.list':
-      return dependencies.core.request<AgentProfile[]>('members.list')
+      return dependencies.core.request<AgentProfile[]>('members.list', {
+        statusFilter: optionalStringField(input, 'status') ?? 'active'
+      })
     case 'member.show':
       return dependencies.core.request<AgentProfile>('members.get', {
         agentId: stringField(input, 'agentId')
@@ -374,6 +376,22 @@ export async function dispatchUserAutomation(
       return dependencies.core.request<StoredCommandResult>('members.create', {
         commandId: stringField(input, 'commandId'),
         command: createMemberCommand(input)
+      })
+    case 'member.archive':
+      return dependencies.core.request<StoredCommandResult>('members.archive', {
+        commandId: stringField(input, 'commandId'),
+        command: {
+          agentId: stringField(input, 'agentId'),
+          expectedVersion: integerField(input, 'expectedVersion')
+        }
+      })
+    case 'member.restore':
+      return dependencies.core.request<StoredCommandResult>('members.restore', {
+        commandId: stringField(input, 'commandId'),
+        command: {
+          agentId: stringField(input, 'agentId'),
+          expectedVersion: integerField(input, 'expectedVersion')
+        }
       })
     case 'member.runtime.set':
       return dependencies.core.request<StoredCommandResult>('members.runtime.set', {

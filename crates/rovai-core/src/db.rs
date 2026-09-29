@@ -8163,6 +8163,12 @@ impl Database {
             if !self.schema_migration_applied(177)? {
                 migration_step!("migration_177", self.migrate_navigation_summary_v177());
             }
+            if !self.schema_migration_applied(178)? {
+                migration_step!(
+                    "migration_178",
+                    self.migrate_member_confirmation_v178()
+                );
+            }
             if let Err(error) =
                 crate::notification::maintain_notification_episode_retention(self.connection())
             {
@@ -8909,6 +8915,9 @@ impl Database {
         }
         if !self.schema_migration_applied(177)? {
             migration_step!("migration_177", self.migrate_navigation_summary_v177());
+        }
+        if !self.schema_migration_applied(178)? {
+            migration_step!("migration_178", self.migrate_member_confirmation_v178());
         }
         if let Err(error) =
             crate::notification::maintain_notification_episode_retention(self.connection())
@@ -28299,6 +28308,79 @@ impl Database {
             "Navigation summary migration failed current schema admission"
         );
         tx.commit()?;
+        Ok(())
+    }
+
+    fn migrate_member_confirmation_v178(&mut self) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        anyhow::ensure!(
+            matches!(
+                classify_database_contract(&transaction)?,
+                DatabaseContractClassification::Current(_)
+            ),
+            "member confirmation migration requires the current v1.72/schema 127 source"
+        );
+        transaction.execute_batch(
+            r#"
+            -- Reversible archived member status: 'archived' is reversible via
+            -- member.restore; 'removed' stays terminal (the trigger keeps
+            -- blocking any removed -> non-removed transition).
+            DROP TRIGGER IF EXISTS agent_profile_presence_insert_guard;
+            DROP TRIGGER IF EXISTS agent_profile_presence_update_guard;
+
+            CREATE TRIGGER agent_profile_presence_insert_guard
+            BEFORE INSERT ON agent_profile
+            WHEN NEW.profile_status NOT IN ('present', 'away', 'archived', 'removed')
+              OR (NEW.profile_status = 'removed' AND NEW.removed_at IS NULL)
+              OR (NEW.profile_status <> 'removed' AND NEW.removed_at IS NOT NULL)
+              OR (NEW.profile_status = 'archived' AND NEW.archived_at IS NULL)
+              OR (NEW.profile_status <> 'archived' AND NEW.archived_at IS NOT NULL)
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid agent_profile presence');
+            END;
+
+            CREATE TRIGGER agent_profile_presence_update_guard
+            BEFORE UPDATE OF profile_status, removed_at, archived_at ON agent_profile
+            WHEN NEW.profile_status NOT IN ('present', 'away', 'archived', 'removed')
+              OR (NEW.profile_status = 'removed' AND NEW.removed_at IS NULL)
+              OR (NEW.profile_status <> 'removed' AND NEW.removed_at IS NOT NULL)
+              OR (NEW.profile_status = 'archived' AND NEW.archived_at IS NULL)
+              OR (NEW.profile_status <> 'archived' AND NEW.archived_at IS NOT NULL)
+              OR (OLD.profile_status = 'removed' AND NEW.profile_status <> 'removed')
+              OR (OLD.profile_status = 'removed' AND NEW.removed_at <> OLD.removed_at)
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid agent_profile presence');
+            END;
+
+            -- Server-issued, one-time confirmation credentials for member.create.
+            CREATE TABLE IF NOT EXISTS member_create_credential (
+                creation_key TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                agent_run_id TEXT NOT NULL,
+                card_digest TEXT NOT NULL,
+                token_hash TEXT NOT NULL,
+                issued_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                consumed_at TEXT,
+                CHECK (consumed_at IS NULL OR consumed_at <> ''),
+                CHECK (expires_at > issued_at)
+            );
+            CREATE INDEX IF NOT EXISTS member_create_credential_expiry_idx
+                ON member_create_credential(expires_at);
+
+            INSERT INTO schema_migration(version, applied_at) VALUES (178, datetime('now'));
+            "#,
+        )?;
+        anyhow::ensure!(
+            matches!(
+                classify_database_contract(&transaction)?,
+                DatabaseContractClassification::Current(_)
+            ),
+            "member confirmation migration failed current-schema admission"
+        );
+        transaction.commit()?;
         Ok(())
     }
 

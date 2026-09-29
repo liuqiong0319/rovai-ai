@@ -904,6 +904,42 @@ impl DomainCommand for RemoveMemberCommand {
     const TYPE: &'static str = "agent_profile.remove";
 }
 
+/// Server-issued, one-time confirmation credential for a member creation.
+/// The atomic consumption lives in create_confirmed_profile; creationKey is
+/// only the idempotency key, never the credential itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberConfirmationCredential {
+    pub creation_key: String,
+    pub token_hash: String,
+    pub card_digest: String,
+    pub user_id: String,
+    pub agent_run_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveMemberCommand {
+    pub agent_id: String,
+    pub expected_version: i64,
+}
+
+impl sealed::Sealed for ArchiveMemberCommand {}
+impl DomainCommand for ArchiveMemberCommand {
+    const TYPE: &'static str = "agent_profile.archive";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreMemberCommand {
+    pub agent_id: String,
+    pub expected_version: i64,
+}
+
+impl sealed::Sealed for RestoreMemberCommand {}
+impl DomainCommand for RestoreMemberCommand {
+    const TYPE: &'static str = "agent_profile.restore";
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemberRemovalPreview {
@@ -2365,56 +2401,117 @@ impl AgentProfileService {
             envelope.payload.avatar_ref.as_deref(),
         )?;
         self.gateway.execute(database, envelope, |transaction| {
-            if profile_display_name_exists(transaction, &identity.display_name, None)? {
-                return Ok(CommandHandlerResult::rejected(
-                    "agent_profile.display_name_conflict",
-                    json!({ "displayName": identity.display_name }),
-                ));
-            }
-            let id = allocate_agent_id(transaction)?;
-            let profile_uuid = Uuid::new_v4().to_string();
+            apply_create_profile(transaction, &identity, envelope.payload.avatar_ref.as_deref())
+        })
+    }
+
+    /// Creates a member only after atomically consuming a server-issued
+    /// one-time confirmation credential inside the same transaction that
+    /// inserts the profile. A concurrent or replayed credential can therefore
+    /// never produce more than one member.
+    pub fn create_confirmed_profile(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<CreateAgentProfileCommand>,
+        confirmation: MemberConfirmationCredential,
+    ) -> Result<CommandExecution> {
+        let identity = normalize_member_identity(
+            &envelope.payload.display_name,
+            &envelope.payload.team_role,
+            &envelope.payload.professional_responsibilities,
+            &envelope.payload.personality_traits,
+            &envelope.payload.working_principles,
+            &envelope.payload.growth_topic,
+        )?;
+        crate::member_avatar::validate_new_member_avatar_ref(
+            envelope.payload.avatar_ref.as_deref(),
+        )?;
+        self.gateway.execute(database, envelope, |transaction| {
             let now = chrono::Utc::now().to_rfc3339();
-            transaction.execute(
+            let consumed = transaction.execute(
                 r#"
-                INSERT INTO agent_profile(
-                    uuid, id, slug, handle, display_name, avatar_ref,
-                    team_role, professional_responsibilities, personality_traits_json,
-                    working_principles, growth_topic,
-                    default_capabilities_json, accent,
-                    runtime_enabled, visual_state_json, profile_status, member_order, version,
-                    created_at, updated_at, archived_at
-                ) VALUES (
-                    ?9, ?1, ?1, NULL, ?2, ?10,
-                    ?3, ?4, ?5,
-                    ?6, ?7,
-                    '[]', '',
-                    0, '{}', 'present',
-                    (SELECT COALESCE(MAX(member_order), -1) + 1 FROM agent_profile), 1,
-                    ?8, ?8, NULL
-                )
+                UPDATE member_create_credential
+                SET consumed_at = ?6
+                WHERE creation_key = ?1
+                  AND consumed_at IS NULL
+                  AND token_hash = ?2
+                  AND card_digest = ?3
+                  AND user_id = ?4
+                  AND agent_run_id = ?5
+                  AND expires_at > ?6
                 "#,
                 params![
-                    id,
-                    identity.display_name,
-                    identity.team_role,
-                    identity.professional_responsibilities,
-                    serde_json::to_string(&identity.personality_traits)?,
-                    identity.working_principles,
-                    identity.growth_topic,
+                    confirmation.creation_key,
+                    confirmation.token_hash,
+                    confirmation.card_digest,
+                    confirmation.user_id,
+                    confirmation.agent_run_id,
                     now,
-                    profile_uuid,
-                    envelope.payload.avatar_ref,
                 ],
             )?;
-            Ok(CommandHandlerResult::applied(
-                "agent_profile.created",
-                json!({ "agentId": id, "version": 1 }),
-                Some(EntityReference {
-                    entity_type: "agent_profile".to_string(),
-                    entity_id: id,
-                }),
-            ))
+            if consumed != 1 {
+                // Distinguish the failure reason for a stable result code.
+                let row = transaction
+                    .query_row(
+                        r#"
+                        SELECT consumed_at, expires_at, card_digest, token_hash
+                        FROM member_create_credential
+                        WHERE creation_key = ?1
+                        "#,
+                        params![confirmation.creation_key],
+                        |row| {
+                            Ok((
+                                row.get::<_, Option<String>>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((consumed_at, expires_at, card_digest, token_hash)) = row else {
+                    return Ok(CommandHandlerResult::rejected(
+                        "member.confirmation_invalid",
+                        json!({}),
+                    ));
+                };
+                if consumed_at.is_some() {
+                    return Ok(CommandHandlerResult::rejected(
+                        "member.confirmation_already_consumed",
+                        json!({}),
+                    ));
+                }
+                if expires_at.as_str() <= now {
+                    return Ok(CommandHandlerResult::rejected(
+                        "member.confirmation_expired",
+                        json!({}),
+                    ));
+                }
+                if token_hash != confirmation.token_hash
+                    || card_digest != confirmation.card_digest
+                {
+                    return Ok(CommandHandlerResult::rejected(
+                        "member.confirmation_invalid",
+                        json!({}),
+                    ));
+                }
+                return Ok(CommandHandlerResult::rejected(
+                    "member.confirmation_already_consumed",
+                    json!({}),
+                ));
+            }
+            apply_create_profile(transaction, &identity, envelope.payload.avatar_ref.as_deref())
         })
+    }
+
+    /// Reports whether a member with this display name already exists.
+    pub fn display_name_exists(
+        &self,
+        database: &mut Database,
+        display_name: &str,
+    ) -> Result<bool> {
+        let transaction = database.connection_mut().transaction()?;
+        profile_display_name_exists(&transaction, display_name, None)
     }
 
     pub fn update_profile(
@@ -2988,6 +3085,154 @@ impl AgentProfileService {
         })?;
         crate::runtime::pump_targets_after_runs_terminal(database, &settled_run_ids)?;
         Ok(execution)
+    }
+
+    /// Reversibly archives a member (profile_status='archived'). Unlike the
+    /// terminal 'removed' state, an archived member can be restored.
+    pub fn archive_member(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<ArchiveMemberCommand>,
+    ) -> Result<CommandExecution> {
+        self.gateway.execute(database, envelope, |transaction| {
+            if !matches!(envelope.actor, crate::command::ActorRef::User { .. }) {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.archive_user_required",
+                    json!({}),
+                ));
+            }
+            let current = transaction
+                .query_row(
+                    r#"
+                    SELECT version, profile_status, removed_at, archived_at
+                    FROM agent_profile WHERE id = ?1
+                    "#,
+                    [&envelope.payload.agent_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((version, presence, removed_at, _archived_at)) = current else {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.not_found",
+                    json!({ "agentId": envelope.payload.agent_id }),
+                ));
+            };
+            if version != envelope.payload.expected_version {
+                return Ok(version_conflict(version));
+            }
+            if presence == "removed" || removed_at.is_some() {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.removed",
+                    json!({ "agentId": envelope.payload.agent_id }),
+                ));
+            }
+            if presence == "archived" {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.archived_already",
+                    json!({ "agentId": envelope.payload.agent_id }),
+                ));
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            transaction.execute(
+                r#"
+                UPDATE agent_profile
+                SET profile_status = 'archived', archived_at = ?2,
+                    version = version + 1, updated_at = ?2
+                WHERE id = ?1 AND version = ?3
+                "#,
+                params![
+                    envelope.payload.agent_id,
+                    now,
+                    envelope.payload.expected_version,
+                ],
+            )?;
+            Ok(profile_updated_result(
+                &envelope.payload.agent_id,
+                version + 1,
+                "agent_profile.archived",
+            ))
+        })
+    }
+
+    /// Restores a previously archived member back to 'present'. The DB
+    /// presence trigger keeps 'removed' terminal, so restoration can only
+    /// ever act on the reversible archived state.
+    pub fn restore_member(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<RestoreMemberCommand>,
+    ) -> Result<CommandExecution> {
+        self.gateway.execute(database, envelope, |transaction| {
+            if !matches!(envelope.actor, crate::command::ActorRef::User { .. }) {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.restore_user_required",
+                    json!({}),
+                ));
+            }
+            let current = transaction
+                .query_row(
+                    r#"
+                    SELECT version, profile_status, archived_at
+                    FROM agent_profile WHERE id = ?1
+                    "#,
+                    [&envelope.payload.agent_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((version, presence, archived_at)) = current else {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.not_found",
+                    json!({ "agentId": envelope.payload.agent_id }),
+                ));
+            };
+            if version != envelope.payload.expected_version {
+                return Ok(version_conflict(version));
+            }
+            if presence == "removed" {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.removed",
+                    json!({ "agentId": envelope.payload.agent_id }),
+                ));
+            }
+            if presence != "archived" || archived_at.is_none() {
+                return Ok(CommandHandlerResult::rejected(
+                    "agent_profile.not_archived",
+                    json!({ "agentId": envelope.payload.agent_id }),
+                ));
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            transaction.execute(
+                r#"
+                UPDATE agent_profile
+                SET profile_status = 'present', archived_at = NULL,
+                    version = version + 1, updated_at = ?2
+                WHERE id = ?1 AND version = ?3 AND profile_status = 'archived'
+                "#,
+                params![
+                    envelope.payload.agent_id,
+                    now,
+                    envelope.payload.expected_version,
+                ],
+            )?;
+            Ok(profile_updated_result(
+                &envelope.payload.agent_id,
+                version + 1,
+                "agent_profile.restored",
+            ))
+        })
     }
 
     pub fn create_installation(
@@ -5401,6 +5646,62 @@ fn legacy_trae_permission_schema_can_normalize(
                 })
         })
     }))
+}
+
+fn apply_create_profile(
+    transaction: &Transaction<'_>,
+    identity: &NormalizedMemberIdentity,
+    avatar_ref: Option<&str>,
+) -> Result<CommandHandlerResult> {
+    if profile_display_name_exists(transaction, &identity.display_name, None)? {
+        return Ok(CommandHandlerResult::rejected(
+            "agent_profile.display_name_conflict",
+            json!({ "displayName": identity.display_name }),
+        ));
+    }
+    let id = allocate_agent_id(transaction)?;
+    let profile_uuid = Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    transaction.execute(
+        r#"
+        INSERT INTO agent_profile(
+            uuid, id, slug, handle, display_name, avatar_ref,
+            team_role, professional_responsibilities, personality_traits_json,
+            working_principles, growth_topic,
+            default_capabilities_json, accent,
+            runtime_enabled, visual_state_json, profile_status, member_order, version,
+            created_at, updated_at, archived_at
+        ) VALUES (
+            ?9, ?1, ?1, NULL, ?2, ?10,
+            ?3, ?4, ?5,
+            ?6, ?7,
+            '[]', '',
+            0, '{}', 'present',
+            (SELECT COALESCE(MAX(member_order), -1) + 1 FROM agent_profile), 1,
+            ?8, ?8, NULL
+        )
+        "#,
+        params![
+            id,
+            identity.display_name,
+            identity.team_role,
+            identity.professional_responsibilities,
+            serde_json::to_string(&identity.personality_traits)?,
+            identity.working_principles,
+            identity.growth_topic,
+            now,
+            profile_uuid,
+            avatar_ref,
+        ],
+    )?;
+    Ok(CommandHandlerResult::applied(
+        "agent_profile.created",
+        json!({ "agentId": id, "version": 1 }),
+        Some(EntityReference {
+            entity_type: "agent_profile".to_string(),
+            entity_id: id,
+        }),
+    ))
 }
 
 fn profile_display_name_exists(
