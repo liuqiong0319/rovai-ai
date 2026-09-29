@@ -293,7 +293,7 @@ impl MainCampMigrationSource {
 }
 
 pub(crate) const CURRENT_DATA_CONTRACT_VERSION: &str = "v1.72";
-pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 127;
+pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 128;
 const V147_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.54";
 const V147_MIGRATION_SOURCE_PROJECTION_SCHEMA_VERSION: i64 = 96;
 const V145_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.53";
@@ -8163,6 +8163,12 @@ impl Database {
             if !self.schema_migration_applied(177)? {
                 migration_step!("migration_177", self.migrate_navigation_summary_v177());
             }
+            if !self.schema_migration_applied(178)? {
+                migration_step!(
+                    "migration_178",
+                    self.migrate_member_confirmation_v178()
+                );
+            }
             if let Err(error) =
                 crate::notification::maintain_notification_episode_retention(self.connection())
             {
@@ -8909,6 +8915,9 @@ impl Database {
         }
         if !self.schema_migration_applied(177)? {
             migration_step!("migration_177", self.migrate_navigation_summary_v177());
+        }
+        if !self.schema_migration_applied(178)? {
+            migration_step!("migration_178", self.migrate_member_confirmation_v178());
         }
         if let Err(error) =
             crate::notification::maintain_notification_episode_retention(self.connection())
@@ -28298,6 +28307,158 @@ impl Database {
             ),
             "Navigation summary migration failed current schema admission"
         );
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// migration 178: member.create confirmation state machine (preview/event/
+    /// capability/publish-intent tables) + reversible archived presence status.
+    /// Source v1.72/127 (now SupportedMigrationSource since CURRENT bumped to
+    /// 128); post state v1.72/128 == Current. SQL validated end-to-end against
+    /// SQLite 3.43.2 (see p0-v24-sql-harness.py in the plan notes).
+    fn migrate_member_confirmation_v178(&mut self) -> Result<()> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        anyhow::ensure!(
+            matches!(
+                classify_database_contract(&tx)?,
+                DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                    if marker.contract_version == "v1.72"
+                        && marker.projection_schema_version == 127
+            ),
+            "member confirmation migration requires the v1.72/schema 127 source"
+        );
+        tx.execute_batch(
+            r#"
+            DROP TRIGGER IF EXISTS agent_profile_presence_insert_guard;
+            DROP TRIGGER IF EXISTS agent_profile_presence_update_guard;
+
+            CREATE TRIGGER agent_profile_presence_insert_guard BEFORE INSERT ON agent_profile
+            WHEN NEW.profile_status NOT IN ('present','away','archived','removed')
+              OR (NEW.profile_status='removed' AND NEW.removed_at IS NULL)
+              OR (NEW.profile_status<>'removed' AND NEW.removed_at IS NOT NULL)
+              OR (NEW.profile_status='archived' AND NEW.archived_at IS NULL)
+              OR (NEW.profile_status<>'archived' AND NEW.archived_at IS NOT NULL)
+            BEGIN SELECT RAISE(ABORT,'invalid presence'); END;
+
+            CREATE TRIGGER agent_profile_presence_update_guard BEFORE UPDATE OF profile_status, removed_at, archived_at ON agent_profile
+            WHEN NEW.profile_status NOT IN ('present','away','archived','removed')
+              OR (NEW.profile_status='removed' AND NEW.removed_at IS NULL)
+              OR (NEW.profile_status<>'removed' AND NEW.removed_at IS NOT NULL)
+              OR (NEW.profile_status='archived' AND NEW.archived_at IS NULL)
+              OR (NEW.profile_status<>'archived' AND NEW.archived_at IS NOT NULL)
+              OR (OLD.profile_status='removed' AND NEW.profile_status<>'removed')
+              OR (OLD.profile_status='removed' AND NEW.removed_at<>OLD.removed_at)
+            BEGIN SELECT RAISE(ABORT,'invalid presence'); END;
+
+            CREATE TABLE IF NOT EXISTS member_create_preview (
+                preview_id TEXT PRIMARY KEY,
+                creation_key TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                scope_kind TEXT NOT NULL CHECK(scope_kind IN ('camp','global_ui')),
+                scope_id TEXT,
+                card_digest TEXT NOT NULL,
+                avatar_sha256 TEXT,
+                identity_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('active','confirmed','consumed','superseded','cancelled','expired')),
+                superseded_by TEXT REFERENCES member_create_preview(preview_id),
+                confirmation_event_id TEXT REFERENCES member_confirmation_event(event_id),
+                source_run_id TEXT NOT NULL,
+                issued_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                confirmed_at TEXT,
+                consumed_at TEXT,
+                superseded_at TEXT,
+                cancelled_at TEXT,
+                CHECK ((status NOT IN ('confirmed','consumed')) OR (confirmed_at IS NOT NULL)),
+                CHECK ((status NOT IN ('active','expired')) OR (confirmed_at IS NULL)),
+                CHECK ((status NOT IN ('active','expired','confirmed')) OR (consumed_at IS NULL AND superseded_at IS NULL AND cancelled_at IS NULL)),
+                CHECK ((status='consumed') = (consumed_at IS NOT NULL)),
+                CHECK ((status='superseded') = (superseded_at IS NOT NULL)),
+                CHECK ((status='cancelled') = (cancelled_at IS NOT NULL)),
+                CHECK ((status<>'consumed') OR (superseded_at IS NULL AND cancelled_at IS NULL)),
+                CHECK ((status<>'superseded') OR (consumed_at IS NULL AND cancelled_at IS NULL)),
+                CHECK ((status<>'cancelled') OR (consumed_at IS NULL AND superseded_at IS NULL)),
+                CHECK ((confirmation_event_id IS NOT NULL) = (confirmed_at IS NOT NULL)),
+                CHECK ((scope_kind='camp' AND scope_id IS NOT NULL) OR (scope_kind='global_ui' AND scope_id IS NULL)),
+                CHECK (expires_at > issued_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_preview_creation_key ON member_create_preview(creation_key);
+            CREATE INDEX IF NOT EXISTS idx_preview_scope ON member_create_preview(scope_kind, scope_id);
+
+            CREATE TABLE IF NOT EXISTS member_confirmation_event (
+                event_id TEXT PRIMARY KEY,
+                message_id TEXT,
+                preview_id TEXT NOT NULL REFERENCES member_create_preview(preview_id),
+                action TEXT NOT NULL CHECK(action IN ('confirm','cancel')),
+                user_id TEXT NOT NULL,
+                camp_id TEXT,
+                created_at TEXT NOT NULL,
+                event_json TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_event_confirm_once ON member_confirmation_event(preview_id) WHERE action='confirm';
+
+            CREATE TABLE IF NOT EXISTS member_create_capability (
+                credential_id TEXT PRIMARY KEY,
+                preview_id TEXT NOT NULL REFERENCES member_create_preview(preview_id),
+                creation_key TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                scope_kind TEXT NOT NULL CHECK(scope_kind IN ('camp','global_ui')),
+                scope_id TEXT,
+                card_digest TEXT NOT NULL,
+                token_hash TEXT NOT NULL,
+                confirmation_event_id TEXT NOT NULL REFERENCES member_confirmation_event(event_id),
+                authorized_run_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('issued','consumed','revoked','expired')),
+                invalidated_reason TEXT,
+                issued_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                consumed_at TEXT,
+                revoked_at TEXT,
+                CHECK ((status='consumed') = (consumed_at IS NOT NULL)),
+                CHECK ((status='revoked') = (revoked_at IS NOT NULL)),
+                CHECK ((status='revoked') = (invalidated_reason IS NOT NULL)),
+                CHECK ((status='issued' OR status='expired') = (consumed_at IS NULL AND revoked_at IS NULL)),
+                CHECK ((scope_kind='camp' AND scope_id IS NOT NULL) OR (scope_kind='global_ui' AND scope_id IS NULL)),
+                CHECK (expires_at > issued_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_capability_creation_key ON member_create_capability(creation_key);
+            CREATE INDEX IF NOT EXISTS idx_capability_scope ON member_create_capability(scope_kind, scope_id);
+            CREATE INDEX IF NOT EXISTS idx_capability_preview ON member_create_capability(preview_id);
+
+            CREATE TABLE IF NOT EXISTS member_avatar_publish_intent (
+                preview_id TEXT PRIMARY KEY,
+                credential_id TEXT NOT NULL REFERENCES member_create_capability(credential_id),
+                creation_key TEXT NOT NULL,
+                asset_id TEXT NOT NULL,
+                staged_path TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('staged','published','recovery_conflict','recovery_failed')),
+                recovery_note TEXT,
+                created_at TEXT NOT NULL,
+                resolved_at TEXT
+            );
+
+            INSERT INTO schema_migration VALUES (178, datetime('now'));
+            UPDATE rovai_data_contract SET projection_schema_version=128, updated_at=datetime('now') WHERE singleton=1;
+            "#,
+        )?;
+        anyhow::ensure!(
+            matches!(
+                classify_database_contract(&tx)?,
+                DatabaseContractClassification::Current(_)
+            ),
+            "member confirmation migration failed current schema admission"
+        );
+        validate_migration_foreign_keys(
+            &tx,
+            &[
+                "member_create_preview",
+                "member_confirmation_event",
+                "member_create_capability",
+                "member_avatar_publish_intent",
+            ],
+        )?;
         tx.commit()?;
         Ok(())
     }
