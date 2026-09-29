@@ -16,10 +16,7 @@ use crate::{
         HistorySearchInput,
     },
     camp_message_send_teaching::CAMP_MESSAGE_SEND_SUMMARY,
-    member_studio::{
-        MEMBER_CREATE_PREVIEW_TOOL_NAME, MEMBER_CREATE_TOOL_NAME, MemberCreateDraft,
-        MemberCreateInput, member_create_input_schema, member_create_preview_input_schema,
-    },
+    member_studio::{MEMBER_CREATE_TOOL_NAME, MemberCreateInput, member_create_input_schema},
     memory_retrieval::{
         MEMORY_READ_TOOL_NAME, MEMORY_SEARCH_TOOL_NAME, MEMORY_VIEW_TOOL_NAME, MemoryReadInput,
         MemoryRetrievalService, MemorySearchInput, MemoryViewInput,
@@ -47,9 +44,6 @@ pub fn validate_builtin_tool_input(canonical_name: &str, input: &Value) -> Resul
         }
         MEMBER_CREATE_TOOL_NAME => {
             serde_json::from_value::<MemberCreateInput>(input.clone()).map(|_| ())
-        }
-        MEMBER_CREATE_PREVIEW_TOOL_NAME => {
-            serde_json::from_value::<MemberCreateDraft>(input.clone()).map(|_| ())
         }
         TEAM_CREATE_TASK_TOOL_NAME => {
             serde_json::from_value::<TeamCreateTaskInput>(input.clone()).map(|_| ())
@@ -401,19 +395,6 @@ fn member_create_success_schema() -> Value {
             "version": {"type": "integer", "minimum": 1},
             "avatarRef": {"type": ["string", "null"]},
             "avatarStatus": {"type": "string", "enum": ["saved", "not_requested"]}
-        }
-    })
-}
-
-fn member_create_preview_success_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["card", "confirmationToken", "tokenExpiresAt"],
-        "properties": {
-            "card": {"type": "object"},
-            "confirmationToken": {"type": "string", "minLength": 32},
-            "tokenExpiresAt": {"type": "string"}
         }
     })
 }
@@ -1126,16 +1107,9 @@ pub fn builtin_tool_definitions() -> Vec<Value> {
         json!({
             "name": MEMBER_CREATE_TOOL_NAME,
             "title": "Create a confirmed Rovai member",
-            "description": "Create one durable Rovai member from the final member card only after the user explicitly confirms it in this direct user-triggered run. Run member.create.preview first in this same run, show the returned card, receive the user's explicit confirmation, then pass the issued confirmationToken here. The token is server-issued, one-time, and consumed atomically with the creation; it can never be reused or self-asserted. Reuse creationKey only for an exact retry. avatarFile is optional and must name a run-readable local PNG or JPEG; Rovai safely normalizes and imports it without persisting the path.",
+            "description": "Create one durable Rovai member from the final member card only after the user explicitly confirms it in this direct user-triggered run. Reuse creationKey only for an exact retry. avatarFile is optional and must name a run-readable local PNG or JPEG; Rovai safely normalizes and imports it without persisting the path. If image preparation is unavailable or fails, retry without avatarFile to use the default avatar.",
             "inputSchema": member_create_input_schema(),
             "outputSchema": member_create_success_schema()
-        }),
-        json!({
-            "name": MEMBER_CREATE_PREVIEW_TOOL_NAME,
-            "title": "Preview a confirmed Rovai member creation",
-            "description": "Validate a draft member card without persisting anything, return the final member card and impact, and issue the one-time confirmationToken that member.create must receive in the same user-triggered run after the user explicitly confirms this exact card. A name conflict fails here explicitly so the draft can be fixed and previewed again.",
-            "inputSchema": member_create_preview_input_schema(),
-            "outputSchema": member_create_preview_success_schema()
         }),
         json!({
             "name": TEAM_CREATE_TASK_TOOL_NAME,

@@ -191,11 +191,6 @@ pub const BUILTIN_TOOL_CLI_IDENTITIES: [BuiltinToolCliIdentity; 26] = [
         action: "create",
     },
     BuiltinToolCliIdentity {
-        operation: "member.create.preview",
-        group: "member",
-        action: "create-preview",
-    },
-    BuiltinToolCliIdentity {
         operation: "team.create_task",
         group: "task",
         action: "create",
@@ -872,28 +867,10 @@ fn error_contracts(operation: &str) -> Vec<BuiltinToolErrorContract> {
             for code in [
                 "member.user_confirmation_required",
                 "member.creation_key_conflict",
-                "member.confirmation_invalid",
-                "member.confirmation_expired",
-                "member.confirmation_already_consumed",
-                "member.card_mismatch",
             ] {
                 errors.push(BuiltinToolErrorContract {
                     code: code.to_string(),
                     recovery: BuiltinToolRecovery::Stop,
-                });
-            }
-        }
-        "member.create.preview" => {
-            for code in [
-                "member.invalid_creation_key",
-                "member.invalid_identity",
-                "member.avatar_invalid",
-                "agent_profile.display_name_conflict",
-                "member.user_confirmation_required",
-            ] {
-                errors.push(BuiltinToolErrorContract {
-                    code: code.to_string(),
-                    recovery: BuiltinToolRecovery::FixInput,
                 });
             }
         }
@@ -965,7 +942,6 @@ pub fn projection_identity(operation: &str) -> Result<&'static str> {
         "camp.message.send" => Ok("camp-message-send-v2"),
         "memory.write" => Ok("memory-write-v2"),
         "member.create"
-        | "member.create.preview"
         | "team.create_task"
         | "team.get_task"
         | "team.list_tasks"

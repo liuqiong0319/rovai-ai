@@ -298,8 +298,6 @@ async fn execute(args: &[String]) -> Result<u8> {
             0
         }
         ("member", Some("create")) => member_create(&flags).await?,
-        ("member", Some("archive")) => member_archive(&flags).await?,
-        ("member", Some("restore")) => member_restore(&flags).await?,
         ("member", Some("runtime.set")) => member_runtime_set(&flags).await?,
         ("member", Some("runtime.clear")) => member_runtime_clear(&flags).await?,
         ("camp", Some("create")) => camp_create(&flags).await?,
@@ -435,7 +433,7 @@ async fn evaluation_actions_reach_their_public_help_without_owner_ipc() {
 
 fn print_help() {
     println!(
-        "Rovai User Automation CLI\n\nOperations:\n  rovai app status\n  rovai app runtime list|check|models\n  rovai app member list|show|create|archive|restore\n  rovai app member runtime set|clear\n  rovai app camp create|send|open\n  rovai app agent-run show|watch|export|cancel\n  rovai app trial run\n  rovai app trace export|schedule|schedules\n  rovai app eval configure|gate|weekly|schedule|status|cancel\n\nThe Desktop App must already be running. V1 never launches it automatically."
+        "Rovai User Automation CLI\n\nOperations:\n  rovai app status\n  rovai app runtime list|check|models\n  rovai app member list|show|create\n  rovai app member runtime set|clear\n  rovai app camp create|send|open\n  rovai app agent-run show|watch|export|cancel\n  rovai app trial run\n  rovai app trace export|schedule|schedules\n  rovai app eval configure|gate|weekly|schedule|status|cancel\n\nThe Desktop App must already be running. V1 never launches it automatically."
     );
 }
 
@@ -445,16 +443,10 @@ fn print_command_help(command: &str, action: Option<&str>) -> Result<()> {
         ("runtime", Some("list")) => "rovai app runtime list [--ready-only] [--json]",
         ("runtime", Some("check")) => "rovai app runtime check --adapter <adapter> [--json]",
         ("runtime", Some("models")) => "rovai app runtime models --adapter <adapter> [--json]",
-        ("member", Some("list")) => "rovai app member list [--runtime <adapter>] [--status active|archived|all] [--json]",
+        ("member", Some("list")) => "rovai app member list [--runtime <adapter>] [--json]",
         ("member", Some("show")) => "rovai app member show --agent-id <id> [--json]",
         ("member", Some("create")) => {
             "rovai app member create --display-name <name> [--avatar-ref <ref>] [--team-role <role>] [--professional-responsibilities <text>] [--personality-trait <trait> ...] [--working-principles <text>] [--growth-topic <text>] [--command-id <id>] [--json]"
-        }
-        ("member", Some("archive")) => {
-            "rovai app member archive --agent-id <id> --expected-version <version> [--command-id <id>] [--json]"
-        }
-        ("member", Some("restore")) => {
-            "rovai app member restore --agent-id <id> --expected-version <version> [--command-id <id>] [--json]"
         }
         ("member", Some("runtime.set")) => {
             "rovai app member runtime set --agent-id <id> --expected-version <version> --adapter <adapter> (--runtime-default | --model <model-id>) --permission-schema-version <version> --permissions-json <object> [--model-options-json <object>] [--command-id <id>] [--json]"
@@ -612,20 +604,9 @@ async fn runtime_models(flags: &Flags) -> Result<()> {
 
 async fn member_list(flags: &Flags) -> Result<()> {
     flags
-        .validate(&["runtime", "status"], &["json"])
+        .validate(&["runtime"], &["json"])
         .map_err(anyhow::Error::new)?;
-    let status = flags
-        .one("status")
-        .map_err(anyhow::Error::new)?
-        .unwrap_or("active");
-    if !matches!(status, "active" | "archived" | "all") {
-        return Err(CliError::new(
-            "automation_invalid_input",
-            "--status must be active, archived, or all",
-        )
-        .into());
-    }
-    let mut members = invoke("member.list", json!({ "statusFilter": status })).await?;
+    let mut members = invoke("member.list", json!({})).await?;
     if let Some(runtime) = flags.one("runtime").map_err(anyhow::Error::new)? {
         let filtered = members
             .as_array()
@@ -690,48 +671,6 @@ fn member_create_params(flags: &Flags) -> Result<Value> {
 
 async fn member_create(flags: &Flags) -> Result<u8> {
     let result = invoke("member.create", member_create_params(flags)?).await?;
-    print_json(&result)?;
-    Ok(command_result_exit_code(&result))
-}
-
-async fn member_archive(flags: &Flags) -> Result<u8> {
-    flags
-        .validate(&["agent-id", "expected-version", "command-id"], &["json"])
-        .map_err(anyhow::Error::new)?;
-    let result = invoke(
-        "member.archive",
-        json!({
-            "commandId": flags.one("command-id").map_err(anyhow::Error::new)?
-                .map(str::to_string).unwrap_or_else(command_id),
-            "agentId": flags.required("agent-id").map_err(anyhow::Error::new)?,
-            "expectedVersion": parse_positive_i64(
-                flags.required("expected-version").map_err(anyhow::Error::new)?,
-                "expected-version"
-            )?
-        }),
-    )
-    .await?;
-    print_json(&result)?;
-    Ok(command_result_exit_code(&result))
-}
-
-async fn member_restore(flags: &Flags) -> Result<u8> {
-    flags
-        .validate(&["agent-id", "expected-version", "command-id"], &["json"])
-        .map_err(anyhow::Error::new)?;
-    let result = invoke(
-        "member.restore",
-        json!({
-            "commandId": flags.one("command-id").map_err(anyhow::Error::new)?
-                .map(str::to_string).unwrap_or_else(command_id),
-            "agentId": flags.required("agent-id").map_err(anyhow::Error::new)?,
-            "expectedVersion": parse_positive_i64(
-                flags.required("expected-version").map_err(anyhow::Error::new)?,
-                "expected-version"
-            )?
-        }),
-    )
-    .await?;
     print_json(&result)?;
     Ok(command_result_exit_code(&result))
 }
