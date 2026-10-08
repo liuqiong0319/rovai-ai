@@ -1,11 +1,11 @@
 import { useRef, useState, type ReactNode } from 'react'
 import { createRoot } from 'react-dom/client'
-import type { CampSnapshot, StructuredCampMessageContent, MessageQuoteSnapshot, MessageQuoteSelection } from '@contracts'
+import type { ThreadSnapshot, StructuredThreadMessageContent, MessageQuoteSnapshot, MessageQuoteSelection } from '@contracts'
 import { MessageQuotes, MessageQuoteSelectionToolbar } from '../../../apps/desktop/src/renderer/src/MessageQuotes'
 import { quoteProjectionDigest, revealMessageQuote } from '../../../apps/desktop/src/renderer/src/message-quote-reveal'
 import { SafeMarkdown } from '../../../apps/desktop/src/renderer/src/SafeMarkdown'
 import { projectQuoteBody, quoteDomOffset, readMessageQuoteSelection } from '../../../apps/desktop/src/renderer/src/message-quote-selection'
-import { AgentMessageMarkdownBody, StructuredMessageBody } from '../../../apps/desktop/src/renderer/src/CampWorkspace'
+import { AgentMessageMarkdownBody, StructuredMessageBody, TruncatedStructuredMessageBody } from '../../../apps/desktop/src/renderer/src/ThreadWorkspace'
 import { CurrentUserProfileContext } from '../../../apps/desktop/src/renderer/src/CurrentUserProfile'
 import cases from '../../../packages/contracts/fixtures/message-quote-projection-v1.json'
 import '../../../apps/desktop/src/renderer/src/styles.css'
@@ -14,6 +14,24 @@ const lineSourceIndex = cases.length
 const messages = cases.map((entry, index) => ({ id: `source-${index}`, authorType: entry.authorType ?? 'agent', body: entry.source }))
 messages.push({ id: `source-${lineSourceIndex}`, authorType: 'agent', body: 'Before the code.\n\n```ts\nconst first = 1;\nconst second = 2;\nconst third = 3;\nconst fourth = 4;\n```\n\nsame text\n\nsame text' })
 messages.push({ id: `source-${lineSourceIndex + 1}`, authorType: 'agent', body: 'A following message.' })
+const longUserSourceIndex = messages.length
+const longUserText = [
+  '\n**这份批复大部分是正确的架构校正。**',
+  '',
+  '主线仍然坚持：**保留原目标，重新构建当前动态上下文。** 🌸',
+  '',
+  ...Array.from({ length: 6 }, (_, index) => [
+    `## ${index + 1}. 需要讨论的边界`,
+    '',
+    '> 提供已有证据，不要求平台先证明全部业务效果。',
+    '',
+    '- 复用当前 `Run` 的相关事实。',
+    ''
+  ].join('\n')),
+  '**最后一段也应该能够引用。**'
+].join('\n')
+const longUserBody = `@芝士*${longUserText}`
+messages.push({ id: `source-${longUserSourceIndex}`, authorType: 'user', body: longUserBody })
 const errors: string[] = []
 window.addEventListener('error', event => errors.push(String(event.error ?? event.message)))
 window.addEventListener('unhandledrejection', event => errors.push(String(event.reason)))
@@ -46,11 +64,17 @@ function select(index: number, start = 0, end?: number) {
   return range
 }
 function messageBody(index: number): ReactNode {
+  if (index === longUserSourceIndex) return <TruncatedStructuredMessageBody
+    body={longUserBody}
+    content={[{ kind: 'member_mention', agentId: 'agent_a' }, { kind: 'text', text: longUserText }]}
+    members={[{ agentId: 'agent_a', displayName: '芝士*' }] as ThreadSnapshot['members']}
+    truncate forceExpanded={false}
+  />
   const entry = cases[index]
   if (entry?.authorType === 'user') return entry.source
   if (!entry?.content) return <SafeMarkdown>{messages[index].body}</SafeMarkdown>
-  const content = entry.content as StructuredCampMessageContent
-  const members = [{ agentId: 'agent_a', displayName: '芝士*' }] as CampSnapshot['members']
+  const content = entry.content as StructuredThreadMessageContent
+  const members = [{ agentId: 'agent_a', displayName: '芝士*' }] as ThreadSnapshot['members']
   const body = content.some(part => part.kind === 'current_user_mention')
     ? <StructuredMessageBody body={entry.source} content={content} members={members} renderLeadingCurrentUserMarkdown />
     : <AgentMessageMarkdownBody body={entry.source} content={content} members={members} onActivateMemberMention={() => undefined} />
@@ -64,21 +88,21 @@ function Fixture() {
     if (fail) throw { kind: 'infrastructure_failure', code: 'CORE_REQUEST_FAILED', message: 'quote.limit_exceeded', retryable: false, generation: 1, details: {} }
     const locator = { projectionVersion: 1 as const, startScalar: selection.startScalar, endScalar: selection.endScalar, projectionDigest: await quoteProjectionDigest(projectQuoteBody(root(Number(selection.messageId.split('-')[1]))).text) }
     setQuotes(current => [...current, { locator, version: 1, quoteId: crypto.randomUUID(),
-      source: { scope: 'camp', campId: 'fixture', messageId: selection.messageId }, authorAtCapture: { type: 'agent', agentId: 'agent_1', displayName: '叮叮' },
+      source: { scope: 'camp', threadId: 'fixture', messageId: selection.messageId }, authorAtCapture: { type: 'agent', agentId: 'agent_1', displayName: '叮叮' },
       text: selection.text, format: 'plain_text', capturedAt: '2026-09-09T00:00:00Z', sourceContentDigest: 'fixture', snapshotDigest: 'fixture' }])
   }
   return <main style={{ maxWidth: 780, margin: '24px auto', padding: 20 }}>
     <div className="conversation-timeline" style={{ maxHeight: 410, overflow: 'auto' }}>
       <div className="single-chat-transcript" style={{ display: 'block', padding: 0 }}>
         {messages.map((message, index) => <section key={message.id}>
-          <div className="final-copy" data-message-quote-body={message.id} data-quote-owner="camp:fixture">
+          <div className="final-copy" data-message-quote-body={message.id} data-quote-owner="thread:fixture">
             {messageBody(index)}
           </div>
           {index === 0 && <div data-quote-exclude>文件卡片 <button>复制文件</button></div>}
         </section>)}
       </div>
     </div>
-    <MessageQuoteSelectionToolbar ownerKey="camp:fixture" messages={messages} onAdd={add} disabled={false} />
+    <MessageQuoteSelectionToolbar ownerKey="thread:fixture" messages={messages} onAdd={add} disabled={false} />
     <div style={{ marginTop: 12 }}><MessageQuotes history quotes={quotes} onReveal={quote => revealMessageQuote(quote, root(Number(quote.source.messageId.split('-')[1])))} /></div>
     <div className="composer-box" style={{ marginTop: 18 }}>
       <div style={{ padding: '8px 12px' }}>回复 叮叮</div>
@@ -88,28 +112,55 @@ function Fixture() {
       }} />
       <textarea ref={composer} aria-label="本次问题" defaultValue="这几处如何一起调整？" style={{ width: '100%', minHeight: 64, background: 'transparent', border: 0, padding: 12, color: 'inherit' }} />
     </div>
-    <div id="excluded-test" data-message-quote-body="source-0" data-quote-owner="camp:fixture"><span>First</span><button data-quote-exclude>卡片</button><span>code.</span></div>
+    <div id="excluded-test" data-message-quote-body="source-0" data-quote-owner="thread:fixture"><span>First</span><button data-quote-exclude>卡片</button><span>code.</span></div>
   </main>
 }
 createRoot(document.getElementById('root')!).render(<Fixture />)
 Object.assign(window, { quoteTest: {
   async run() {
     await frames()
+    const longRoot = root(longUserSourceIndex)
+    const longToggle = longRoot.querySelector<HTMLButtonElement>('.message-long-toggle')!
+    for (const expanded of [false, true, false]) {
+      if (longToggle.getAttribute('aria-expanded') !== String(expanded)) { longToggle.click(); await frames() }
+      check(longToggle.getAttribute('aria-expanded') === String(expanded), 'long user message expand state')
+      const excerpt = expanded ? '**最后一段也应该能够引用。**' : '主线仍然坚持：**保留原目标，重新构建当前动态上下文。** 🌸'
+      const start = Array.from(longUserBody.slice(0, longUserBody.indexOf(excerpt))).length
+      const range = select(longUserSourceIndex, start, start + Array.from(excerpt).length)
+      range.startContainer.parentElement!.scrollIntoView({ block: 'end' })
+      // Keep the chosen line inside the viewport even when its text node contains many lines.
+      const viewport = document.querySelector<HTMLElement>('.conversation-timeline')!
+      viewport.scrollTop += range.getBoundingClientRect().bottom - viewport.getBoundingClientRect().bottom + 45
+      document.dispatchEvent(new Event('scroll')); await frames()
+      const candidate = readMessageQuoteSelection(window.getSelection(), 'thread:fixture', id => messages.find(message => message.id === id))
+      check(candidate?.selection.text === excerpt, `long user ${expanded ? 'expanded' : 'collapsed'} selection excludes folding announcements`)
+      check(candidate.selection.bodyAtSelection === longUserBody && candidate.selection.startScalar === start,
+        'long user selection keeps the original body and Unicode offsets')
+      check(document.querySelector('.message-quote-selection-toolbar button'), 'long user selection exposes quote action')
+      const announcement = longRoot.querySelector('.sr-only')!
+      check(announcement.getAttribute('aria-live') === 'polite' && announcement.textContent?.includes(expanded ? '全文已展开' : '其余内容已收起'),
+        'folding continues to announce its state to screen readers')
+      // Selecting the body together with its controls is still outside the quote boundary.
+      range.selectNodeContents(longRoot)
+      check(!readMessageQuoteSelection(window.getSelection(), 'thread:fixture', id => messages.find(message => message.id === id)),
+        'long user selection cannot include expand controls or announcements')
+      window.getSelection()!.removeAllRanges(); await frames()
+    }
     for (const [index, entry] of cases.entries()) {
       check(projectQuoteBody(root(index)).text === entry.text, `projection: ${entry.name}: ${JSON.stringify(projectQuoteBody(root(index)).text)}`)
       select(index)
-      const candidate = readMessageQuoteSelection(window.getSelection(), 'camp:fixture', id => messages.find(message => message.id === id))
+      const candidate = readMessageQuoteSelection(window.getSelection(), 'thread:fixture', id => messages.find(message => message.id === id))
       check(candidate?.selection.text === entry.text, `selection: ${entry.name}`)
       if (entry.currentUserName) check(candidate?.selection.currentUserDisplayName === entry.currentUserName, 'capture only the displayed local-user token name')
-      check(!readMessageQuoteSelection(window.getSelection(), 'camp:other', id => messages.find(message => message.id === id)), 'cross owner')
+      check(!readMessageQuoteSelection(window.getSelection(), 'thread:other', id => messages.find(message => message.id === id)), 'cross owner')
     }
     const range = select(0)
     const final = projectQuoteBody(root(1)).positions.at(-1)!
     range.setEnd(final.node, final.node.length)
-    check(!readMessageQuoteSelection(window.getSelection(), 'camp:fixture', id => messages.find(message => message.id === id)), 'cross message')
+    check(!readMessageQuoteSelection(window.getSelection(), 'thread:fixture', id => messages.find(message => message.id === id)), 'cross message')
     const excluded = document.getElementById('excluded-test')!
     range.selectNodeContents(excluded)
-    check(!readMessageQuoteSelection(window.getSelection(), 'camp:fixture', id => messages.find(message => message.id === id)), 'card between endpoints')
+    check(!readMessageQuoteSelection(window.getSelection(), 'thread:fixture', id => messages.find(message => message.id === id)), 'card between endpoints')
     for (let index = 0; index < 3; index++) {
       root(0).scrollIntoView(); select(0, index, 14 + index); await frames()
       const button = document.querySelector<HTMLButtonElement>('.message-quote-selection-toolbar button')
@@ -171,7 +222,7 @@ Object.assign(window, { quoteTest: {
     check(band.getBoundingClientRect().top > code.getBoundingClientRect().top + height, 'first code row untouched')
     check(Math.abs(band.getBoundingClientRect().width - code.clientWidth) < 2, 'whole row width')
     select(lineSourceIndex, start, end)
-    check(readMessageQuoteSelection(window.getSelection(), 'camp:fixture', id => messages.find(message => message.id === id)), 'highlight decorations preserve native selection')
+    check(readMessageQuoteSelection(window.getSelection(), 'thread:fixture', id => messages.find(message => message.id === id)), 'highlight decorations preserve native selection')
     document.querySelector<HTMLElement>('main')!.style.maxWidth = '520px'; await pause(60)
     check(Math.abs(root(lineSourceIndex).querySelector('.message-quote-line-band')!.getBoundingClientRect().width - code.clientWidth) < 2, 'line bands track reflow')
     document.querySelector<HTMLElement>('main')!.style.maxWidth = '780px'; await frames()
@@ -220,7 +271,7 @@ Object.assign(window, { quoteTest: {
     click('.message-quote-selection-toolbar button', 'add excerpt after clearing'); await pause(30); await frames()
     check(latest.length === 1 && !document.querySelector('.message-quotes-popover'), 'new selection after clearing starts with a collapsed label')
     check(!errors.length, errors.join('\n'))
-    return { ok: true, verified: ['shared projection', 'Unicode and code', 'cross message and cards', 'multiple compact quotes', 'failure retention', 'stale copy selection', 'hover and keyboard disclosure', 'full row navigation and direct removal', 'last removal closes and returns focus', 'persisted code-line anchors', 'duplicate and stale source', 'reflow and multi-block highlights'] }
+    return { ok: true, verified: ['long user collapsed and expanded selection', 'shared projection', 'Unicode and code', 'cross message and cards', 'multiple compact quotes', 'failure retention', 'stale copy selection', 'hover and keyboard disclosure', 'full row navigation and direct removal', 'last removal closes and returns focus', 'persisted code-line anchors', 'duplicate and stale source', 'reflow and multi-block highlights'] }
   },
   async linePreview() {
     await revealMessageQuote(latest.at(-1)!, root(lineSourceIndex)); await frames()
@@ -243,7 +294,7 @@ Object.assign(window, { quoteTest: {
   },
   lastLineState() {
     const selection = window.getSelection()
-    const candidate = readMessageQuoteSelection(selection, 'camp:fixture', id => messages.find(message => message.id === id))
+    const candidate = readMessageQuoteSelection(selection, 'thread:fixture', id => messages.find(message => message.id === id))
     return {
       text: selection?.toString().trim(),
       toolbar: !!document.querySelector('.message-quote-selection-toolbar'),

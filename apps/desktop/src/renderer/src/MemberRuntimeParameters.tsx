@@ -13,7 +13,7 @@ import type {
   RuntimeModelCatalogCache,
   RuntimeModelCatalogView
 } from '@contracts'
-import { UiText, uiAttribute } from './interface-language'
+import { UiText, uiAttribute, useInterfaceLanguage } from './interface-language'
 
 export type MemberRuntimeDraft = {
   model: ModelSelection
@@ -23,7 +23,7 @@ export type MemberRuntimeDraft = {
 type RuntimeParameterProps = {
   adapterKind: AdapterKind
   installation: AdapterInstallation
-  snapshot: NonNullable<AdapterInstallation['snapshot']>
+  permissionOptions: PermissionOptionDescriptor[]
   draft: MemberRuntimeDraft
   disabled: boolean
   onOpenModelCatalog?: () => Promise<RuntimeModelCatalogView>
@@ -52,16 +52,8 @@ export function runtimeModelSelectionAvailable(
 ): boolean {
   if (!installation?.memberRuntimeDefaults || !model) return false
   if (model.mode === 'runtime_default') return true
-  if (!installation.modelCatalog || !modelCatalogIsServiceable(installation.modelCatalog)) {
-    return false
-  }
-  const descriptor = installation.snapshot?.models.find((candidate) => (
-    candidate.id === model.modelId
-    && !candidate.hidden
-    && !candidate.deprecated
-    && !candidate.id.endsWith('://runtime-default')
-  ))
-  return descriptor !== undefined
+  return model.modelId.trim().length > 0 && typeof model.options === 'object' && model.options !== null
+
 }
 
 export function runtimeDraftForMember(
@@ -128,20 +120,21 @@ export function MemberRuntimeParameters({
   onOpenModelCatalog?: () => Promise<RuntimeModelCatalogView>
   onChange(draft: MemberRuntimeDraft): void
 }): React.JSX.Element {
+  useInterfaceLanguage()
   const titleId = useId()
-  const snapshot = installation?.snapshot ?? null
-  const content = installation && snapshot && draft
+  const permissionOptions = installation?.permissionOptions ?? installation?.snapshot?.permissionOptions ?? []
+  const content = installation && draft
     ? runtimeParametersFor(adapterKind, {
         adapterKind,
         installation,
-        snapshot,
+        permissionOptions,
         draft,
         disabled,
         onOpenModelCatalog,
         onChange
       })
     : (
-        <p className="runtime-parameter-empty"><UiText zh={"当前还没有可编辑的能力快照。你仍可保存智能体选择；检查完成后需要回来保存运行参数。"} /></p>
+        <p className="runtime-parameter-empty"><UiText zh={"请先选择已安装的智能体。运行时会验证模型和权限设置。"} /></p>
       )
   return (
     <section className={inline ? 'member-runtime-parameters member-editor-runtime-fields' : 'member-runtime-parameters'} aria-label={inline ? uiAttribute("运行参数") : undefined} aria-labelledby={inline ? undefined : titleId}>
@@ -171,9 +164,9 @@ export function MemberModelParameters({
   onOpenModelCatalog?: () => Promise<RuntimeModelCatalogView>
   onChange(model: ModelSelection): void
 }): React.JSX.Element {
-  const snapshot = installation?.snapshot ?? null
+  const permissionOptions = installation?.permissionOptions ?? installation?.snapshot?.permissionOptions ?? []
   const defaults = installation?.memberRuntimeDefaults ?? null
-  if (!installation || !snapshot || !defaults || !model) {
+  if (!installation || !defaults || !model) {
     return (
       <p className="runtime-parameter-empty"><UiText zh={"当前没有可编辑的模型目录；如果智能体已准备好，将使用它的默认模型。"} /></p>
     )
@@ -187,7 +180,7 @@ export function MemberModelParameters({
       {modelFieldsFor(adapterKind, {
         adapterKind,
         installation,
-        snapshot,
+        permissionOptions,
         draft,
         disabled,
         onOpenModelCatalog,
@@ -427,7 +420,6 @@ function modelFieldsFor(
 function ModelFields({
   adapterKind,
   installation,
-  snapshot,
   draft,
   disabled,
   onOpenModelCatalog,
@@ -528,6 +520,7 @@ function RuntimeModelPicker({
   const models = activeLiveCatalog
     ? selectableModels(activeLiveCatalog.models)
     : initialModels
+  const canFilterOptions = modelCatalogCanValidateOptions(initialCache, liveCatalog)
   const explicit = draft.model.mode === 'explicit' ? draft.model : null
   const selectedModel = explicit
     ? models.find((model) => model.id === explicit.modelId) ?? null
@@ -575,12 +568,13 @@ function RuntimeModelPicker({
   }
 
   const selectModel = (value: string): void => {
+    if (value === selectedValue) return
     if (value === 'runtime_default') {
       onChange({ ...draft, model: { mode: 'runtime_default' } })
       return
     }
     const model = models.find((candidate) => candidate.id === value)
-    if (model) onChange({ ...draft, model: explicitSelection(model) })
+    if (model) onChange({ ...draft, model: explicitSelection(model, draft.model, canFilterOptions) })
   }
 
   const statusCopy = modelCatalogStatusCopy(cache, {
@@ -589,8 +583,7 @@ function RuntimeModelPicker({
     servingCachedModels: models.length > 0,
     refreshStatus: loading ? 'joined' : activeLiveCatalog?.refreshStatus ?? null
   })
-  const missingSelectionLabel = explicit && !selectedModel
-    ? missingModelLabel(explicit.modelId, cache.status)
+  const missingSelectionLabel = explicit && !selectedModel ? missingModelLabel(explicit.modelId, cache.status)
     : null
   const triggerLabel = draft.model.mode === 'runtime_default'
     ? uiAttribute('默认')
@@ -661,6 +654,19 @@ export function liveCatalogIsAtLeastAsRecent(
   return Date.parse(liveObservedAt) >= Date.parse(initialObservedAt)
 }
 
+export function modelCatalogCanValidateOptions(
+  installationCache: RuntimeModelCatalogCache,
+  liveCatalog: RuntimeModelCatalogView | null
+): boolean {
+  const activeLiveCatalog = liveCatalogIsAtLeastAsRecent(liveCatalog, installationCache)
+    ? liveCatalog
+    : null
+  const cache = activeLiveCatalog?.cache ?? installationCache
+  // A local response for the same observation cannot undo Core's later expiry.
+  return modelCatalogIsServiceable(cache)
+    && (cache.observedAt !== installationCache.observedAt || modelCatalogIsServiceable(installationCache))
+}
+
 function latestCatalogRefreshFailed(installation: AdapterInstallation, cache: RuntimeModelCatalogCache): boolean {
   const attempt = installation.lastProbeAttempt
   if (attempt?.status !== 'failed') return false
@@ -708,16 +714,32 @@ export function modelCatalogStatusCopy(
   return ''
 }
 
-function explicitSelection(model: ModelDescriptor): ModelSelection {
+export function explicitSelection(
+  model: ModelDescriptor,
+  previous: ModelSelection,
+  canFilterOptions: boolean
+): ModelSelection {
+  const previousOptions = previous.mode === 'explicit' ? previous.options : {}
+  // Expired history can form a draft, but cannot prove that an override is unsupported.
+  const options = canFilterOptions
+    ? Object.fromEntries(Object.entries(previousOptions).filter(([key, value]) => (
+        typeof value === 'string'
+        && model.options.some((option) => (
+          option.key === key
+          && option.values.some((choice) => choice.value === value)
+        ))
+      )))
+    : { ...previousOptions }
   return {
     mode: 'explicit',
     modelId: model.id,
-    options: {}
+    options
   }
 }
 
 function PermissionSelect({
-  snapshot,
+  installation,
+  permissionOptions,
   draft,
   disabled,
   onChange,
@@ -729,7 +751,7 @@ function PermissionSelect({
   label: string
   choiceDescriptions?: Record<string, string>
 }): React.JSX.Element {
-  const descriptor = permissionDescriptor(snapshot.permissionOptions, fieldKey)
+  const descriptor = permissionDescriptor(permissionOptions, fieldKey)
   if (!descriptor) {
     return <p className="runtime-parameter-unavailable"><UiText zh={"当前能力快照未提供“"} />{label}”。</p>
   }
@@ -739,6 +761,8 @@ function PermissionSelect({
   return (
     <RuntimeParameterSelect
       label={label}
+      recommendedValue={stringValue(installation.memberRuntimeDefaults?.permissions.values[fieldKey]) || undefined}
+      menuGuidance={uiAttribute("建议使用最高权限，体验更顺畅。")}
       value={currentValue}
       disabled={disabled}
       onChange={(value) => updatePermission(draft, fieldKey, value, onChange)}
@@ -755,7 +779,8 @@ function PermissionSelect({
 }
 
 function PermissionSwitch({
-  snapshot,
+  installation,
+  permissionOptions,
   draft,
   disabled,
   onChange,
@@ -765,18 +790,23 @@ function PermissionSwitch({
   fieldKey: string
   label: string
 }): React.JSX.Element {
-  const descriptor = permissionDescriptor(snapshot.permissionOptions, fieldKey)
+  const language = useInterfaceLanguage()
+  const hintId = useId()
+  const descriptor = permissionDescriptor(permissionOptions, fieldKey)
   const checked = draft.permissions.values[fieldKey] === 'on'
+  const recommendEnabling = descriptor?.choices.some(choice => choice.value === 'on') === true
+    && installation.memberRuntimeDefaults?.permissions.values[fieldKey] === 'on'
   return (
     <label className="field-label runtime-parameter-switch-field">
-      <span>{label}</span>
+      <span className="permission-switch-label">{label}</span>
       <span className="runtime-parameter-switch">
         <span className="runtime-parameter-switch-state" aria-hidden="true">
-          {checked ? uiAttribute("开启") : uiAttribute("关闭")}
+          {checked ? uiAttribute("开启") : uiAttribute(language === 'en' ? "已关闭" : "关闭")}
         </span>
         <input
           type="checkbox"
           aria-label={label}
+          aria-describedby={recommendEnabling ? hintId : undefined}
           checked={checked}
           disabled={disabled || !descriptor}
           onChange={(event) => updatePermission(
@@ -787,6 +817,7 @@ function PermissionSwitch({
           )}
         />
       </span>
+      {recommendEnabling && <span id={hintId} className="permission-switch-guidance"><UiText zh={"建议开启，体验更顺畅。"} /></span>}
     </label>
   )
 }

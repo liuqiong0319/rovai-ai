@@ -88,6 +88,7 @@ All Members 候选继续显示广播说明，范围仍是发送时 Camp 中的�
 
 Member 人物信息卡保持非模态，宽 392px，采用“布局 2”：左侧 128px 受控 4:5 portrait，右侧依次显示名称、
 团队角色、Presence、智能体、专业职责、工作准则和性格底色。它不是队员页链接、Dialog 或全局 Toast。
+正常配置时智能体一栏只显示产品名称（例如 `Codex CLI`）；未配置或异常时才附加必要状态。
 点击外部或 Esc 关闭，Popover 不设 focus trap；拖选文本不得误触打开。Atom 本身不进入独立 tab 顺序；需要
 键盘激活时由编辑器 command 统一处理。
 
@@ -160,7 +161,7 @@ Agent 消息中的 Current User Mention 可为前缀，也可位于任意已解�
 
 | 层级 | 权威入口 |
 | --- | --- |
-| public Composer 本地所有权、发送快照、失败保留与退出边界 | [Camp Composer Draft v15](../../contracts/camp-composer-draft-v15.md)与[Pending Camp Activation v2](../../contracts/pending-camp-activation-v2.md) |
+| public Composer 本地所有权、发送快照、失败保留与退出边界 | [Camp Composer Draft v16](../../contracts/camp-composer-draft-v16.md)与[Pending Camp Activation v4](../../contracts/pending-camp-activation-v4.md) |
 | Lexical/React/Core 所有权、局部编辑、同步与 replacement | [Composer 架构](../../architecture/camp-composer-draft.md) |
 | Reply/Continuation 来源、物化与无 fallback | [Composer Draft 不变量](../../architecture/foundational-invariants.md#camp-composer) |
 | Renderer 视觉、Typeahead、Popover、IME、键盘与 Clipboard | 本文 |

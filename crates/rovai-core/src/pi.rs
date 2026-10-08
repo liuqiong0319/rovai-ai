@@ -7,7 +7,7 @@ use rovai_core::{
     action::ActionResultOutcome,
     agent_profile::{AdapterKind, FrozenAgentRuntimeConfig},
     command::canonical_json_digest,
-    storage_layout::CampOutputDirectory,
+    storage_layout::ThreadOutputDirectory,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -22,7 +22,7 @@ pub(crate) use host::{
 pub use host::{PiAgentRunRuntimeRequest, PiRpcRuntimeAdapter, PiRuntime};
 
 pub(crate) const PI_PROTOCOL_VERSION: &str = "pi-jsonl-rpc-v1";
-pub(crate) const PI_HOST_EXTENSION_VERSION: &str = "rovai-pi-host-v7";
+pub(crate) const PI_HOST_EXTENSION_VERSION: &str = "rovai-pi-host-v8";
 pub(super) const PI_MAX_JSONL_RECORD_BYTES: usize = 4 * 1024 * 1024;
 pub(super) const PI_COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -89,6 +89,42 @@ pub fn normalize_event(message: &Value) -> (&'static str, Value) {
                 }),
             )
         }
+        Some("message_update")
+            if message
+                .pointer("/assistantMessageEvent/type")
+                .and_then(Value::as_str)
+                == Some("thinking_delta") =>
+        {
+            (
+                "agent.thought.delta",
+                json!({
+                    "delta": message.pointer("/assistantMessageEvent/delta").and_then(Value::as_str).unwrap_or(""),
+                    "contentIndex": message.pointer("/assistantMessageEvent/contentIndex"),
+                }),
+            )
+        }
+        Some("message_update")
+            if matches!(
+                message
+                    .pointer("/assistantMessageEvent/type")
+                    .and_then(Value::as_str),
+                Some("thinking_start" | "thinking_end")
+            ) =>
+        {
+            let event = if message
+                .pointer("/assistantMessageEvent/type")
+                .and_then(Value::as_str)
+                == Some("thinking_start")
+            {
+                "agent.thought.started"
+            } else {
+                "agent.thought.completed"
+            };
+            (
+                event,
+                json!({"contentIndex": message.pointer("/assistantMessageEvent/contentIndex")}),
+            )
+        }
         Some("message_update") => ("runtime.event", json!({"type": "message_update"})),
         Some("tool_execution_start") => (
             "runtime.action",
@@ -103,6 +139,7 @@ pub fn normalize_event(message: &Value) -> (&'static str, Value) {
         Some("tool_execution_update") => (
             "runtime.action",
             json!({
+                "runtimePhaseBoundary": false,
                 "toolCallId": message.get("toolCallId"),
                 "toolName": message.get("toolName"),
                 "status": "in_progress",
@@ -163,10 +200,12 @@ pub fn normalize_event(message: &Value) -> (&'static str, Value) {
 
 /// Pi's delta frame contains a contentIndex, not a message identity. Keep that
 /// index scoped to this Runtime's explicit message_start/message_end interval.
+
 #[derive(Default)]
 pub(super) struct PiTextState {
     message_ordinal: u64,
     native_message_id: Option<String>,
+    assistant_active: bool,
 }
 
 impl PiTextState {
@@ -184,14 +223,22 @@ impl PiTextState {
         let event = message.get("type").and_then(Value::as_str);
         let assistant =
             message.pointer("/message/role").and_then(Value::as_str) == Some("assistant");
+        if assistant
+            && matches!(event, Some("message_start" | "message_end"))
+            && !crate::runtime::is_root_output(message)
+        {
+            return vec![];
+        }
         if event == Some("message_start") && assistant {
             self.message_ordinal += 1;
+            self.assistant_active = crate::runtime::is_root_output(message);
             self.native_message_id = message
                 .pointer("/message/id")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
         }
         if event == Some("message_end") && assistant {
+            self.assistant_active = false;
             return message.pointer("/message/content").and_then(Value::as_array)
                 .into_iter().flatten().enumerate().filter_map(|(index, block)| {
                     (block.get("type").and_then(Value::as_str) == Some("text"))
@@ -206,12 +253,28 @@ impl PiTextState {
                 }).collect();
         }
         let (event_type, mut payload) = normalize_event(message);
-        if event_type == "agent.text.delta" {
+        if matches!(
+            event_type,
+            "agent.thought.delta" | "agent.thought.started" | "agent.thought.completed"
+        ) && (!self.assistant_active || !crate::runtime::is_root_output(message))
+        {
+            return vec![];
+        }
+        if matches!(
+            event_type,
+            "agent.text.delta"
+                | "agent.thought.delta"
+                | "agent.thought.started"
+                | "agent.thought.completed"
+        ) {
             let index = message
                 .pointer("/assistantMessageEvent/contentIndex")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
             payload["itemId"] = json!(self.item_id(index));
+        }
+        if !crate::runtime::is_root_output(message) {
+            payload["runtimeRootOutput"] = json!(false);
         }
         vec![(event_type, payload)]
     }
@@ -220,7 +283,7 @@ impl PiTextState {
 pub(crate) fn runtime_compatibility_digest(
     frozen_runtime: &FrozenAgentRuntimeConfig,
     cwd: &Path,
-    _attachment_authorization: &CampOutputDirectory,
+    _attachment_authorization: &ThreadOutputDirectory,
 ) -> Result<String> {
     let cwd = cwd
         .canonicalize()
@@ -458,6 +521,35 @@ mod tests {
         state.normalize(&json!({"type":"message_start","message":{"role":"assistant"}}));
         let a = state.normalize(&json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"A"}}));
         let b = state.normalize(&json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":2,"delta":"B"}}));
+        let thinking = json!({"type":"message_update","assistantMessageEvent":{
+            "type":"thinking_delta","contentIndex":1,"delta":"PRIVATE_THOUGHT_MARKER",
+            "partial":{"content":[{"type":"thinking","thinking":"PRIVATE_FULL_BLOCK"}]}
+        }});
+        let thought = state.normalize(&thinking);
+        assert_eq!(thought[0].0, "agent.thought.delta");
+        assert_ne!(thought[0].1["itemId"], a[0].1["itemId"]);
+        assert!(
+            !serde_json::to_string(&thought[0].1)
+                .unwrap()
+                .contains("PRIVATE_FULL_BLOCK")
+        );
+        for (native, normalized) in [
+            ("thinking_start", "agent.thought.started"),
+            ("thinking_end", "agent.thought.completed"),
+        ] {
+            let frame = json!({"type":"message_update","assistantMessageEvent":{"type":native,"contentIndex":1,"content":"PRIVATE_SIGNATURE"}});
+            let events = state.normalize(&frame);
+            assert_eq!(events[0].0, normalized);
+            assert_eq!(events[0].1["itemId"], thought[0].1["itemId"]);
+            assert_eq!(events[0].1.as_object().unwrap().len(), 2);
+        }
+        assert!(state.normalize(&json!({"type":"message_end","parent_tool_use_id":"child","message":{"role":"assistant","content":[{"type":"text","text":"child"}]}})).is_empty());
+        assert!(!state.normalize(&thinking).is_empty());
+        for field in ["subagentId", "parent_tool_use_id", "replay", "snapshot"] {
+            let mut excluded = thinking.clone();
+            excluded["assistantMessageEvent"]["partial"][field] = json!(true);
+            assert!(state.normalize(&excluded).is_empty());
+        }
         let terminal = state.normalize(&json!({"type":"message_end","message":{"role":"assistant","stopReason":"aborted","content":[{"type":"text","text":"A final"},{"type":"toolCall","id":"tool"},{"type":"text","text":"B partial"}]}}));
         assert_ne!(a[0].1["itemId"], b[0].1["itemId"]);
         assert_eq!(terminal.len(), 2);
@@ -466,6 +558,7 @@ mod tests {
         assert_eq!(terminal[1].1["itemId"], b[0].1["itemId"]);
         assert_eq!(terminal[0].1["text"], "A final");
         assert_eq!(terminal[0].1["status"], "interrupted");
+        assert!(state.normalize(&thinking).is_empty());
         state.normalize(&json!({"type":"message_start","message":{"role":"assistant"}}));
         let next = state.normalize(&json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"C"}}));
         assert_ne!(next[0].1["itemId"], a[0].1["itemId"]);
@@ -481,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_extension_only_reports_session_and_injects_bootstrap() {
+    fn managed_extension_reports_numeric_session_state_and_injects_bootstrap() {
         let source = include_str!("pi/managed-host.ts");
         assert!(!source.contains("PI_CODING_AGENT_DIR"));
         assert!(!source.contains("ANTHROPIC_AUTH_TOKEN"));
@@ -507,7 +600,9 @@ mod tests {
         assert!(!source.contains("Rovai partial approval"));
         assert!(!source.contains("Rovai managed input receipt"));
         assert!(!source.contains("approvedBindingDigest"));
-        assert_eq!(source.matches("pi.on(").count(), 2);
+        assert_eq!(source.matches("pi.on(").count(), 4);
+        assert!(source.contains("ctx.getContextUsage()"));
+        assert!(source.contains("rovai-managed-context-usage"));
         assert!(source.contains("pi.on(\"session_start\""));
         assert!(source.contains("pi.on(\"before_agent_start\""));
         assert!(source.contains("const current = loadBinding()"));
@@ -600,6 +695,8 @@ mod tests {
             "args": {"line": 10}
         });
         reconcile_terminal_tool_message(&mut update, &start);
+        let (_, progress) = normalize_event(&update);
+        assert_eq!(progress["runtimePhaseBoundary"], false);
         let mut terminal = json!({
             "type": "tool_execution_end",
             "toolCallId": "tool-read",

@@ -22,7 +22,7 @@ import {
   screen,
   shell
 } from 'electron'
-import { isCampId } from '@contracts'
+import { isThreadId } from '@contracts'
 import type {
   AppearancePreferences,
   AppearanceSnapshot,
@@ -71,6 +71,8 @@ import { legacyUserDataPath } from './user-data-path'
 import { deleteRetiredManagedDirectory } from './quick-chat-cutover'
 import { CurrentUserProfileStore } from './current-user-profile'
 import { NavigationPreferencesStore } from './navigation-preferences'
+import { isNavigationThreadReadState } from '../shared/navigation-preferences-model'
+import { revealProjectDirectory } from './reveal-project-directory'
 import {
   ProjectAccessTransactionCoordinator,
   removedProjectRootsFromSnapshot,
@@ -130,6 +132,11 @@ import {
 import { AppQuitCoordinator } from './app-quit-coordinator'
 import { requestRendererQuitPreparation } from './renderer-quit-preparation'
 import { createWindowCloseHandler } from './window-close-guard'
+import { WindowsWindowClose, restoreMainWindow } from './windows-window-close'
+import { WindowClosePreferences } from './window-close-preferences'
+import { createWindowsTray } from './windows-tray'
+import { WINDOW_CLOSE_CHANNEL, WINDOW_CLOSE_CHANGED } from '../shared/window-close'
+import { createWindowCloseRequestHandler } from './window-close-ipc'
 import { installCloseTabShortcut } from '../shared/close-tab-shortcut'
 import { ChannelSettingsService } from './channel-settings'
 import { optionalChannelKind } from './channel-kind-input'
@@ -164,7 +171,7 @@ import { FilePreviewService } from './file-preview/file-preview-service'
 import {
   parseChooseRootRequest,
   parseCopyPathRequest,
-  parseFilePreviewCamp,
+  parseFilePreviewThread,
   parseGenerationRequest,
   parseHtmlSiteRequest,
   parseHandleRequest,
@@ -184,10 +191,11 @@ const allowedMethods = new Set<CoreMethod>([
   'health.check',
   'diagnostics.check',
   'monitoring.snapshot',
+  'monitoring.execution',
   ...RUNTIME_RENDERER_CORE_METHODS,
   'members.list',
   'members.get',
-  'members.camps.list',
+  'members.threads.list',
   'members.create',
   'members.update',
   'members.avatar.set',
@@ -256,12 +264,12 @@ const allowedMethods = new Set<CoreMethod>([
   'mcp.import.commit',
   'conversations.restartNativeSession',
   'app.info',
-  'camps.creationPreflight',
+  'threads.creationPreflight',
   'workspaces.inspect',
   'navigation.snapshot',
-  'navigation.camps',
-  'navigation.groupCamps',
-  'navigation.findCamp',
+  'navigation.threads',
+  'navigation.groupThreads',
+  'navigation.findThread',
   'navigation.campViewed',
   'missions.workspace.cleanup',
   'missions.cleanup.list',
@@ -278,22 +286,23 @@ const allowedMethods = new Set<CoreMethod>([
   'missions.status',
   'missions.start',
   'missions.linkPr',
-  'camps.create',
-  'camps.discardPending',
-  'camps.rename',
-  'camps.members.fast.check',
-  'camps.members.fast.set',
-  'camps.members.add',
-  'camps.members.removalPreview',
-  'camps.members.remove',
-  'camps.changeDefaultLead',
-  'camps.reconcileDefaultLead',
-  'camps.exists',
-  'camps.enter',
-  'camps.open',
-  'camps.delete',
-  'camps.deletionIssues',
-  'camps.retryDeletion',
+  'threads.create',
+  'threads.discardPending',
+  'threads.pendingDraft.setPresence',
+  'threads.rename',
+  'threads.members.fast.check',
+  'threads.members.fast.set',
+  'threads.members.add',
+  'threads.members.removalPreview',
+  'threads.members.remove',
+  'threads.changeDefaultLead',
+  'threads.reconcileDefaultLead',
+  'threads.exists',
+  'threads.enter',
+  'threads.open',
+  'threads.delete',
+  'threads.deletionIssues',
+  'threads.retryDeletion',
   'singleChat.list',
   'singleChat.get',
   'singleChat.open',
@@ -301,12 +310,12 @@ const allowedMethods = new Set<CoreMethod>([
   'singleChat.end',
   'singleChat.pendingInputs.edit',
   'agentRuns.cancel',
-  'camps.snapshot',
+  'threads.snapshot',
   'agentRunFileChanges.get',
   'agentRunImages.read',
-  'camp.messages.page',
-  'camp.messages.around',
-  'camp.messages.find',
+  'thread.messages.page',
+  'thread.messages.around',
+  'thread.messages.find',
   'agentRunEvidence.getContent',
   'agentRunEvidence.list',
   'agentRunExecution.page',
@@ -315,12 +324,12 @@ const allowedMethods = new Set<CoreMethod>([
   'tasks.update',
   'tasks.list',
   'tasks.get',
-  'camp.attachments.location',
+  'thread.attachments.location',
   'messageQuotes.mutateDraft',
   'messageQuotes.capture',
-  'camp.messages.send',
-  'camp.messages.withdraw',
-  'userAutomation.camp.send',
+  'thread.messages.send',
+  'thread.messages.withdraw',
+  'userAutomation.thread.send',
   'action.approvals.resolve',
   'notifications.inbox',
   'notifications.changesSince',
@@ -400,6 +409,7 @@ let lastDiagnosticsExportPath: string | null = null
 let lastMonitoringExportPath: string | null = null
 let lastAppearanceSignature = ''
 let generalPreferences: GeneralPreferencesStore | null = null
+let windowsWindowClose: WindowsWindowClose | null = null
 let currentUserProfile: CurrentUserProfileStore | null = null
 let onboarding: OnboardingStore | null = null
 let restorableLocations: RestorableLocationStore | null = null
@@ -582,7 +592,7 @@ const filePreview = new FilePreviewService(
         || mainWindow.webContents.id !== notification.webContentsId
       ) return
       mainWindow.webContents.send('rovai:file-preview-external-update', {
-        campId: notification.campId,
+        threadId: notification.threadId,
         previewKeys: notification.previewKeys
       })
     }
@@ -858,12 +868,22 @@ function createWindow(): void {
       console.error('Rovai Renderer window-close preparation failed; the window remains open', error)
     }
   )
+  let sessionEnding = false
+  if (process.platform === 'win32') window.on('session-end', () => {
+    sessionEnding = true
+    windowsWindowClose?.beginQuit()
+  })
   window.on('close', (event) => {
     if (persistBoundsTimer) clearTimeout(persistBoundsTimer)
     persistBoundsTimer = null
     flushBounds()
+    if (sessionEnding) return
     if (process.platform === 'darwin') handleWindowClose(event)
-    else appQuitCoordinator.handleQuitRequest(event)
+    else if (windowsWindowClose && appUpdates?.get().status !== 'installing') windowsWindowClose.handleClose(event)
+    else {
+      windowsWindowClose?.beginQuit()
+      appQuitCoordinator.handleQuitRequest(event)
+    }
   })
   window.on('closed', () => {
     if (pageZoomFeedbackTimer !== null) clearTimeout(pageZoomFeedbackTimer)
@@ -899,13 +919,13 @@ function createWindow(): void {
   }
 }
 
-async function openCampFromAutomation(campId: string): Promise<{ campId: string; opened: true }> {
-  if (!isCampId(campId)) {
-    throw new UserAutomationError('automation_invalid_input', 'campId is not canonical')
+async function openThreadFromAutomation(threadId: string): Promise<{ threadId: string; opened: true }> {
+  if (!isThreadId(threadId)) {
+    throw new UserAutomationError('automation_invalid_input', 'threadId is not canonical')
   }
-  const exists = await core.request<boolean>('camps.exists', { campId })
+  const exists = await core.request<boolean>('threads.exists', { threadId })
   if (!exists) {
-    throw new UserAutomationError('camp_not_found', 'The requested Camp does not exist.')
+    throw new UserAutomationError('camp_not_found', 'The requested Thread does not exist.')
   }
   if (!mainWindow || mainWindow.isDestroyed()) createWindow()
   const window = mainWindow
@@ -917,7 +937,7 @@ async function openCampFromAutomation(campId: string): Promise<{ campId: string;
   window.focus()
   const publish = (): void => {
     if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
-      window.webContents.send('rovai:user-automation-open-camp', { campId })
+      window.webContents.send('rovai:user-automation-open-camp', { threadId })
     }
   }
   if (window.webContents.isLoadingMainFrame()) {
@@ -925,7 +945,7 @@ async function openCampFromAutomation(campId: string): Promise<{ campId: string;
   } else {
     publish()
   }
-  return { campId, opened: true }
+  return { threadId, opened: true }
 }
 
 if (primaryInstance) void app.whenReady().then(async () => {
@@ -959,6 +979,19 @@ if (primaryInstance) void app.whenReady().then(async () => {
     console.warn('[rovai] Execution Web service did not start; channel execution remains available.', error)
   })
   generalPreferences = GeneralPreferencesStore.defaults(generalPreferencesPath)
+  if (process.platform === 'win32') {
+    windowsWindowClose = new WindowsWindowClose({
+      preferences: new WindowClosePreferences(join(userDataPath, 'window-close.json')),
+      window: () => mainWindow,
+      createTray: (open, quit) => createWindowsTray(open, quit, requireGeneralPreferences().get().interfaceLanguage === 'en'),
+      quit: () => app.quit(),
+      publish: snapshot => {
+        if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isDestroyed()) {
+          mainWindow.webContents.send(WINDOW_CLOSE_CHANGED, snapshot)
+        }
+      }
+    })
+  }
   onboarding = OnboardingStore.defaults(onboardingPath)
   restorableLocations = RestorableLocationStore.defaults(restorableLocationPath)
   navigationPreferences = NavigationPreferencesStore.defaults(navigationPreferencesPath)
@@ -1015,6 +1048,7 @@ if (primaryInstance) void app.whenReady().then(async () => {
   restorableLocations = loadedRestorableLocations
   navigationPreferences = loadedNavigationPreferences
   currentUserProfile = loadedCurrentUserProfile
+  windowsWindowClose?.initialize()
   localStoresReady = true
   resolveLocalStoresLoaded()
   const restorableDegradation: StructuredError | null =
@@ -1058,7 +1092,7 @@ if (primaryInstance) void app.whenReady().then(async () => {
   userAutomation = coreDataPath === null ? null : await startUserAutomationOptional(
     () => new UserAutomationServer(
       userAutomationRoot(app.getPath('appData'), userDataPath, hasExplicitUserDataDirectory),
-      { core, openCamp: openCampFromAutomation, appVersion: app.getVersion(), dailyAnalysis: dailyAnalysis ?? undefined, evaluation: evaluationHost ?? undefined }
+      { core, openThread: openThreadFromAutomation, appVersion: app.getVersion(), dailyAnalysis: dailyAnalysis ?? undefined, evaluation: evaluationHost ?? undefined }
     )
   )
   if (userAutomation) {
@@ -1107,6 +1141,10 @@ async function removeRetiredChannelCredentialFiles(userDataPath: string): Promis
 }
 
 app.on('second-instance', () => {
+  if (process.platform === 'win32') {
+    restoreMainWindow(mainWindow)
+    return
+  }
   if (!mainWindow || mainWindow.isDestroyed()) return
   if (mainWindow.isMinimized()) mainWindow.restore()
   mainWindow.focus()
@@ -1128,14 +1166,14 @@ ipcMain.handle('rovai:request', async (_event, method: CoreMethod, params?: unkn
   }
   try {
     const value = await core.request(method, params)
-    if ((method === 'camps.delete' || method === 'camps.discardPending') && params && typeof params === 'object') {
-      const command = (params as { command?: { campId?: unknown } }).command
+    if ((method === 'threads.delete' || method === 'threads.discardPending') && params && typeof params === 'object') {
+      const command = (params as { command?: { threadId?: unknown } }).command
       const status = value && typeof value === 'object'
         ? (value as { status?: unknown }).status
         : undefined
-      if (typeof command?.campId === 'string' && status !== 'rejected') {
-        void filePreview.releaseCamp(command.campId).catch((error) => {
-          console.warn(`Camp ${command.campId as string} preview release remains pending`, error)
+      if (typeof command?.threadId === 'string' && status !== 'rejected') {
+        void filePreview.releaseThread(command.threadId).catch((error) => {
+          console.warn(`Thread ${command.threadId as string} preview release remains pending`, error)
         })
       }
     }
@@ -1201,7 +1239,7 @@ ipcMain.handle('rovai:file-preview-retention', (event, value: unknown) =>
   filePreview.updateRetention(requireFilePreviewSender(event), parseRetentionState(value)))
 
 ipcMain.handle('rovai:file-preview-bind-camp', (event, value: unknown) =>
-  filePreview.bindCamp(requireFilePreviewSender(event), parseFilePreviewCamp(value)))
+  filePreview.bindThread(requireFilePreviewSender(event), parseFilePreviewThread(value)))
 
 ipcMain.handle('rovai:file-preview-open', (event, value: unknown) =>
   filePreview.open(requireFilePreviewSender(event), parseOpenFilePreviewRequest(value)))
@@ -1351,6 +1389,10 @@ ipcMain.handle('rovai:desktop-session-commit-location', async (_event, location:
   if (!restorableLocations) throw new Error('Restorable Location store is unavailable')
   await restorableLocations.commit(validated)
 })
+
+ipcMain.handle(WINDOW_CLOSE_CHANNEL, createWindowCloseRequestHandler(
+  process.platform, () => windowsWindowClose, () => mainWindow
+))
 
 ipcMain.handle('rovai:general-preferences-get', () => hostGeneralPreferences().get())
 
@@ -1525,8 +1567,16 @@ ipcMain.handle('rovai:onboarding-record-runtime', (_event, version: unknown) => 
   return requireOnboarding().recordProvisionedRuntime(version)
 })
 
-ipcMain.handle('rovai:onboarding-record-camp', (_event, campId: unknown) => {
-  return requireOnboarding().recordProvisionedCamp(campId)
+ipcMain.handle('rovai:onboarding-prepare-runtime-copies', (_event, targets: unknown) => {
+  return requireOnboarding().prepareRuntimeCopies(targets)
+})
+
+ipcMain.handle('rovai:onboarding-record-runtime-copy', (_event, agentId: unknown, commandId: unknown, outcome: unknown) => {
+  return requireOnboarding().recordRuntimeCopy(agentId, commandId, outcome)
+})
+
+ipcMain.handle('rovai:onboarding-record-camp', (_event, threadId: unknown) => {
+  return requireOnboarding().recordProvisionedThread(threadId)
 })
 
 ipcMain.handle('rovai:onboarding-complete', () => requireOnboarding().complete())
@@ -1549,6 +1599,19 @@ ipcMain.handle('rovai:window-reset-bounds', (event) => {
       bounds
     )
   )
+})
+
+ipcMain.handle('rovai:navigation-preferences-set-thread-read-state', (_event, threadId: unknown, state: unknown) => {
+  if (typeof threadId !== 'string' || (state !== null && !isNavigationThreadReadState(state))) {
+    throw new Error('Invalid Thread read state request')
+  }
+  return projectAccessTransactions.run(async () => {
+    const snapshot = await requireNavigationPreferences().setThreadReadState(threadId, state)
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed()) window.webContents.send('rovai:navigation-preferences-changed', snapshot)
+    }
+    return snapshot
+  })
 })
 
 ipcMain.handle('rovai:navigation-preferences-get', () =>
@@ -1585,8 +1648,8 @@ ipcMain.handle(
 
 ipcMain.handle(
   'rovai:navigation-preferences-remove-project',
-  async (_event, targetKey: unknown, relatedCampIds: unknown) => {
-    if (typeof targetKey !== 'string' || !Array.isArray(relatedCampIds)) {
+  async (_event, targetKey: unknown, relatedThreadIds: unknown) => {
+    if (typeof targetKey !== 'string' || !Array.isArray(relatedThreadIds)) {
       throw new Error('Invalid Project removal request')
     }
     if (!targetKey.startsWith('directory:')) {
@@ -1596,7 +1659,7 @@ ipcMain.handle(
       const executionRoot = targetKey.slice('directory:'.length)
       await core.request('skills.projectAccess.remove', { executionRoot })
       try {
-        const result = await requireNavigationPreferences().removeProject(targetKey, relatedCampIds)
+        const result = await requireNavigationPreferences().removeProject(targetKey, relatedThreadIds)
         core.setRemovedSkillProjectRoots(removedProjectRootsFromSnapshot(result))
         return result
       } catch (error) {
@@ -1691,7 +1754,7 @@ async function resolveDesktopAttachmentTarget(
   if (local) return local
   try {
     const value = await core.request<unknown>(
-      'camp.attachments.desktopOpenTarget' as CoreMethod,
+      'thread.attachments.desktopOpenTarget' as CoreMethod,
       locator
     )
     const target = parseDesktopAttachmentTarget(value, locator.attachmentRefId)
@@ -1720,16 +1783,16 @@ function requireAttachmentOwnerLocator(value: unknown): LocalAttachmentOwnerLoca
   }
   const input = value as Record<string, unknown>
   const owner = input.owner
-  const campId = requireIpcString(input.campId, 'Camp ID')
+  const threadId = requireIpcString(input.threadId, 'Thread ID')
   const attachmentRefId = requireIpcString(input.attachmentRefId, '附件 ID')
-  if (!isCampId(campId) || !isAttachmentId(attachmentRefId)) {
+  if (!isThreadId(threadId) || !isAttachmentId(attachmentRefId)) {
     throw new Error('Attachment Owner 无效。')
   }
-  if (owner === 'composer') return { owner, campId, attachmentRefId }
+  if (owner === 'composer') return { owner, threadId, attachmentRefId }
   if (owner === 'pending') {
     return {
       owner,
-      campId,
+      threadId,
       pendingInputId: requireIpcString(input.pendingInputId, 'Pending Input ID'),
       attachmentRefId
     }
@@ -1737,7 +1800,7 @@ function requireAttachmentOwnerLocator(value: unknown): LocalAttachmentOwnerLoca
   if (owner === 'pending_edit') {
     return {
       owner,
-      campId,
+      threadId,
       pendingInputId: requireIpcString(input.pendingInputId, 'Pending Input ID'),
       editToken: requireIpcString(input.editToken, 'Edit Token'),
       attachmentRefId
@@ -1746,7 +1809,7 @@ function requireAttachmentOwnerLocator(value: unknown): LocalAttachmentOwnerLoca
   if (owner === 'message') {
     return {
       owner,
-      campId,
+      threadId,
       messageId: requireIpcString(input.messageId, 'Message ID'),
       attachmentRefId
     }
@@ -1754,7 +1817,7 @@ function requireAttachmentOwnerLocator(value: unknown): LocalAttachmentOwnerLoca
   if (owner === 'mission') {
     return {
       owner,
-      campId,
+      threadId,
       missionId: requireIpcString(input.missionId, 'Mission ID'),
       attachmentRefId
     }
@@ -1762,7 +1825,7 @@ function requireAttachmentOwnerLocator(value: unknown): LocalAttachmentOwnerLoca
   if (owner === 'single_chat_composer') {
     return {
       owner,
-      campId,
+      threadId,
       conversationId: requireIpcString(input.conversationId, 'Conversation ID'),
       attachmentRefId
     }
@@ -1770,7 +1833,7 @@ function requireAttachmentOwnerLocator(value: unknown): LocalAttachmentOwnerLoca
   if (owner === 'single_chat_pending') {
     return {
       owner,
-      campId,
+      threadId,
       conversationId: requireIpcString(input.conversationId, 'Conversation ID'),
       pendingInputId: requireIpcString(input.pendingInputId, 'Pending Input ID'),
       attachmentRefId
@@ -1779,7 +1842,7 @@ function requireAttachmentOwnerLocator(value: unknown): LocalAttachmentOwnerLoca
   if (owner === 'single_chat_pending_edit') {
     return {
       owner,
-      campId,
+      threadId,
       conversationId: requireIpcString(input.conversationId, 'Conversation ID'),
       pendingInputId: requireIpcString(input.pendingInputId, 'Pending Input ID'),
       editToken: requireIpcString(input.editToken, 'Edit Token'),
@@ -1789,7 +1852,7 @@ function requireAttachmentOwnerLocator(value: unknown): LocalAttachmentOwnerLoca
   if (owner === 'single_chat_message') {
     return {
       owner,
-      campId,
+      threadId,
       conversationId: requireIpcString(input.conversationId, 'Conversation ID'),
       conversationMessageId: requireIpcString(
         input.conversationMessageId,
@@ -1816,7 +1879,7 @@ function requireDraftRevision(value: unknown): number {
 }
 
 type SingleChatPendingAttachmentOwner = {
-  campId: string
+  threadId: string
   conversationId: string
   pendingInputId: string
   expectedRevision: number
@@ -1831,7 +1894,7 @@ function requireSingleChatPendingAttachmentOwner(
   }
   const input = value as Record<string, unknown>
   return {
-    campId: requireIpcString(input.campId, 'Camp ID'),
+    threadId: requireIpcString(input.threadId, 'Thread ID'),
     conversationId: requireIpcString(input.conversationId, 'Conversation ID'),
     pendingInputId: requireIpcString(input.pendingInputId, 'Pending Input ID'),
     expectedRevision: requireDraftRevision(input.expectedRevision),
@@ -1848,12 +1911,12 @@ function temporarySourceAttachmentPath(displayName: string): string {
 }
 
 async function stageLocalComposerAttachment(
-  campId: string,
+  threadId: string,
   sourcePath: string,
   displayName: string,
   mediaType: string | null
 ): Promise<LocalAttachmentSourceView> {
-  return localComposerAttachments.prepare({ campId, sourcePath, displayName, mediaType })
+  return localComposerAttachments.prepare({ threadId, sourcePath, displayName, mediaType })
 }
 
 type MissionAttachmentIpcInput = {
@@ -1947,16 +2010,16 @@ ipcMain.handle(
   'rovai:composer-attachment-prepare-path',
   async (
     _event,
-    campId: unknown,
+    threadId: unknown,
     expectedRevision: unknown,
     sourcePath: unknown,
     displayName: unknown,
     mediaType: unknown
   ) => {
-    const resolvedCampId = requireIpcString(campId, 'Camp ID')
+    const resolvedThreadId = requireIpcString(threadId, 'Thread ID')
     requireDraftRevision(expectedRevision)
     return stageLocalComposerAttachment(
-      resolvedCampId,
+      resolvedThreadId,
       requireIpcString(sourcePath, '附件路径'),
       requireIpcString(displayName, '附件名称'),
       typeof mediaType === 'string' && mediaType.trim() ? mediaType : null
@@ -1968,13 +2031,13 @@ ipcMain.handle(
   'rovai:composer-attachment-prepare-bytes',
   async (
     _event,
-    campId: unknown,
+    threadId: unknown,
     expectedRevision: unknown,
     displayName: unknown,
     mediaType: unknown,
     input: unknown
   ) => {
-    const resolvedCampId = requireIpcString(campId, 'Camp ID')
+    const resolvedThreadId = requireIpcString(threadId, 'Thread ID')
     requireDraftRevision(expectedRevision)
     const resolvedDisplayName = requireIpcString(displayName, '附件名称')
     if (!(input instanceof Uint8Array) || input.byteLength > MAX_COMPOSER_ATTACHMENT_BYTES) {
@@ -1985,7 +2048,7 @@ ipcMain.handle(
     try {
       await writeFile(temporaryPath, input, { flag: 'wx', mode: 0o600 })
       const attachment = await stageLocalComposerAttachment(
-        resolvedCampId,
+        resolvedThreadId,
         temporaryPath,
         resolvedDisplayName,
         typeof mediaType === 'string' && mediaType.trim() ? mediaType : null
@@ -2000,8 +2063,8 @@ ipcMain.handle(
 
 ipcMain.handle(
   'rovai:composer-attachment-restore',
-  async (_event, campId: unknown, attachments: unknown) => {
-    const resolvedCampId = requireIpcString(campId, 'Camp ID')
+  async (_event, threadId: unknown, attachments: unknown) => {
+    const resolvedThreadId = requireIpcString(threadId, 'Thread ID')
     if (!Array.isArray(attachments) || attachments.length > 10) {
       throw new Error('Composer 附件列表无效。')
     }
@@ -2037,21 +2100,21 @@ ipcMain.handle(
         availability: attachment.availability
       } as LocalAttachmentSourceView
     })
-    return localComposerAttachments.restore(resolvedCampId, requested)
+    return localComposerAttachments.restore(resolvedThreadId, requested)
   }
 )
 
 ipcMain.handle(
   'rovai:composer-attachment-discard',
-  async (_event, campId: unknown, attachmentRefIds: unknown) => {
-    const resolvedCampId = requireIpcString(campId, 'Camp ID')
+  async (_event, threadId: unknown, attachmentRefIds: unknown) => {
+    const resolvedThreadId = requireIpcString(threadId, 'Thread ID')
     if (attachmentRefIds !== undefined && (
       !Array.isArray(attachmentRefIds)
       || attachmentRefIds.length > 10
       || attachmentRefIds.some((id) => !isAttachmentId(id))
     )) throw new Error('Composer 附件清理范围无效。')
     await localComposerAttachments.discard(
-      resolvedCampId,
+      resolvedThreadId,
       attachmentRefIds as string[] | undefined
     )
   }
@@ -2068,7 +2131,7 @@ ipcMain.handle(
         path: string
         mediaType: string
         byteSize: number
-      } | null>('camp.attachments.previewSource' as CoreMethod, locator)
+      } | null>('thread.attachments.previewSource' as CoreMethod, locator)
       if (!source) return { preview: null, availability: 'missing' as const }
       if (source.byteSize > MAX_COMPOSER_PREVIEW_BYTES) {
         return { preview: null, availability: 'available' as const }
@@ -2294,6 +2357,10 @@ ipcMain.handle(
   }
 )
 
+ipcMain.handle('rovai:reveal-project-directory', (_event, projectPath: unknown) =>
+  revealProjectDirectory(projectPath, path => shell.showItemInFolder(path))
+)
+
 ipcMain.handle('rovai:select-workspace-directory', async () => {
   const options = {
     title: '选择工作目录',
@@ -2480,10 +2547,9 @@ const appQuitCoordinator = new AppQuitCoordinator({
   beforeDrain: () => {
     // Keep services and Core fully available until Renderer Draft preparation succeeds.
   },
-  prepareRenderer: () => requestRendererQuitPreparation(
-    mainWindow,
-    () => new MessageChannelMain()
-  ),
+  prepareRenderer: () => windowsWindowClose
+    ? windowsWindowClose.settlePending().then(() => requestRendererQuitPreparation(mainWindow, () => new MessageChannelMain()))
+    : requestRendererQuitPreparation(mainWindow, () => new MessageChannelMain()),
   drain: async () => {
     if (desktopBackgroundTimer) {
       clearInterval(desktopBackgroundTimer)
@@ -2513,10 +2579,12 @@ const appQuitCoordinator = new AppQuitCoordinator({
   },
   reportPreparationFailure: (error) => {
     console.error('Rovai Renderer quit preparation failed; the App remains open', error)
+    windowsWindowClose?.quitPreparationFailed()
   },
   finish: () => {
     // The updater has already staged its installer before update-driven quit.
     // app.exit finishes the bounded drain without reopening native negotiation.
+    windowsWindowClose?.dispose()
     app.exit(0)
   }
 })
@@ -2526,6 +2594,7 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', (event) => {
+  windowsWindowClose?.beginQuit()
   appQuitCoordinator.handleQuitRequest(event)
 })
 

@@ -1,6 +1,6 @@
 import { useEditingRecovery } from './camp-client'
 import { useMobileLayout } from './MobileLayout'
-import type { CampComposerDraftView, ComposerAtom, ComposerDocument } from '@contracts'
+import type { ThreadComposerDraftView, ComposerAtom, ComposerDocument } from '@contracts'
 import { LexicalExtensionComposer } from '@lexical/react/LexicalExtensionComposer'
 import { ContentEditable } from '@lexical/react/LexicalContentEditable'
 import { useLexicalComposerContext } from '@lexical/react/LexicalComposerContext'
@@ -35,6 +35,7 @@ import {
 } from './ComposerAtomNode'
 import { ComposerTypeaheadPlugin } from './ComposerTypeaheadPlugin'
 import { MemberAvatar } from './MemberAvatar'
+import { NavigationIcon } from './NavigationIcon'
 import {
   RovaiComposerExtension,
   setComposerExtensionRuntime,
@@ -71,7 +72,7 @@ export interface StructuredMentionMember {
   teamRole: string
   avatarRef?: string | null
   mentionable?: boolean
-  inCamp?: boolean
+  inThread?: boolean
 }
 
 export type StructuredMentionOption =
@@ -81,7 +82,7 @@ export type StructuredMentionOption =
   | { kind: 'back_to_camp' }
 
 export interface StructuredMentionComposerHandle {
-  flush(): Promise<ComposerFlushResult<CampComposerDraftView>>
+  flush(): Promise<ComposerFlushResult<ThreadComposerDraftView>>
   setInteractionLocked(locked: boolean): void
   replaceDocument(
     document: ComposerDocument,
@@ -99,11 +100,12 @@ export interface StructuredMentionComposerProps {
   draftIdentity: string
   document: ComposerDocument
   ready?: boolean
-  getAuthoritativeDraft?(): CampComposerDraftView | null
+  getAuthoritativeDraft?(): ThreadComposerDraftView | null
   members: readonly StructuredMentionMember[]
   skills?: readonly ComposerSkillOption[] | null
   skillCatalogStatus?: 'loading' | 'ready' | 'error'
   skillCatalogErrors?: readonly string[]
+  skillCatalogRefreshFailed?: boolean
   skillCatalogRefreshing?: boolean
   onNeedSkills?(): void
   onRefreshSkills?(): void
@@ -143,8 +145,8 @@ export function structuredMentionOptions(
   const matches = (member: StructuredMentionMember): boolean =>
     member.mentionable !== false
       && `${member.displayName}\n${member.teamRole}`.toLocaleLowerCase().includes(normalizedQuery)
-  const current = members.filter((member) => member.inCamp !== false && matches(member))
-  const outside = members.filter((member) => member.inCamp === false && matches(member))
+  const current = members.filter((member) => member.inThread !== false && matches(member))
+  const outside = members.filter((member) => member.inThread === false && matches(member))
   if (inviteLayer) {
     options.push({ kind: 'back_to_camp' })
     options.push(...outside.slice(0, 49).map((member) => ({ kind: 'member' as const, member })))
@@ -157,7 +159,7 @@ export function structuredMentionOptions(
     .map((member) => ({ kind: 'member' as const, member })))
   if (normalizedQuery) options.push(...outside.slice(0, 50 - options.length)
     .map((member) => ({ kind: 'member' as const, member })))
-  else if (members.some((member) => member.inCamp === false && member.mentionable !== false)) {
+  else if (members.some((member) => member.inThread === false && member.mentionable !== false)) {
     options.push({ kind: 'invite_other' })
   }
   return options
@@ -188,7 +190,9 @@ export function StructuredMentionOptionAvatar({
   option: StructuredMentionOption
 }): JSX.Element {
   if (option.kind === 'all_members') {
-    return <span className="mention-avatar" aria-hidden="true">@</span>
+    return <span className="mention-avatar" aria-hidden="true">
+      <NavigationIcon name="users" />
+    </span>
   }
   if (option.kind === 'invite_other' || option.kind === 'back_to_camp') {
     return <span className="mention-avatar mention-action-avatar" aria-hidden="true">
@@ -248,6 +252,7 @@ function ComposerBridge({
   skills = [],
   skillCatalogStatus = 'ready',
   skillCatalogErrors = [],
+  skillCatalogRefreshFailed = false,
   skillCatalogRefreshing = false,
   onNeedSkills,
   onRefreshSkills,
@@ -281,7 +286,7 @@ function ComposerBridge({
   authorityDocument.current = document
   const recoveryAttempted = useRef(false)
   const generatedId = useId()
-  const syncRef = useRef<ComposerDraftSync<CampComposerDraftView> | null>(null)
+  const syncRef = useRef<ComposerDraftSync<ThreadComposerDraftView> | null>(null)
   const initializedRef = useRef(false)
   const readyRef = useRef(ready)
   const previousReadyRef = useRef(ready)
@@ -400,7 +405,7 @@ function ComposerBridge({
       $replaceEditorWithComposerDocument(initialDocument)
     }, { discrete: true, tag: ROVAI_COMPOSER_INITIALIZE_TAG })
     const sync = new ComposerDraftSync(editor, editor.getEditorState(), bindings())
-    const runtime: ComposerExtensionRuntime<CampComposerDraftView> = {
+    const runtime: ComposerExtensionRuntime<ThreadComposerDraftView> = {
       sync,
       submit: () => { void callbacks.current.onSubmit() },
       enterInsertsLineBreak: () => mobileRef.current,
@@ -632,6 +637,7 @@ function ComposerBridge({
             skillMenuOptions,
             members,
             skillCatalogErrors ?? [],
+            skillCatalogRefreshFailed,
             skillCatalogRefreshing,
             onRefreshSkills,
             selectedIndex,
@@ -662,11 +668,11 @@ function renderMentionMenu(
           key={option.kind === 'member' ? `member:${option.member.agentId}` : option.kind}
           aria-selected={selectedIndex === index}
           aria-label={option.kind === 'member'
-            ? `${option.member.displayName}，${structuredMentionMemberDescription(option.member)}${option.member.inCamp === false ? `，${pendingInviteIds.includes(option.member.agentId) ? uiAttribute('待邀请') : uiAttribute('邀请加入')}` : ''}`
+            ? `${option.member.displayName}${uiAttribute('，')}${structuredMentionMemberDescription(option.member)}${option.member.inThread === false ? `${uiAttribute('，')}${pendingInviteIds.includes(option.member.agentId) ? uiAttribute('待邀请') : uiAttribute('邀请加入')}` : ''}`
             : option.kind === 'all_members' ? uiAttribute('所有队员，仅本会话')
               : option.kind === 'invite_other' ? uiAttribute('邀请其他队员') : uiAttribute('返回本会话')}
           className={[selectedIndex === index ? 'active' : '',
-            option.kind === 'member' && option.member.inCamp === false ? 'is-invitable' : '',
+            option.kind === 'member' && option.member.inThread === false ? 'is-invitable' : '',
             option.kind === 'invite_other' || option.kind === 'back_to_camp' ? 'is-mention-action' : ''
           ].filter(Boolean).join(' ')}
           onMouseMove={() => setHighlightedIndex(index)}
@@ -684,7 +690,7 @@ function renderMentionMenu(
                 : option.kind === 'back_to_camp' ? uiAttribute('查看当前会话队员')
                   : structuredMentionMemberDescription(option.member)}</small>
           </span>
-          {option.kind === 'member' && option.member.inCamp === false
+          {option.kind === 'member' && option.member.inThread === false
             ? <span className="mention-option-state">{pendingInviteIds.includes(option.member.agentId)
               ? <UiText zh={'待邀请'} /> : <UiText zh={'邀请'} />}</span>
             : option.kind === 'invite_other'
@@ -694,12 +700,13 @@ function renderMentionMenu(
   </div>
 }
 
-function renderSkillMenu(
+export function renderSkillMenu(
   menuId: string,
   status: 'loading' | 'ready' | 'error',
   options: readonly ComposerSkillOption[],
   members: readonly StructuredMentionMember[],
   errors: readonly string[],
+  refreshFailed: boolean,
   refreshing: boolean,
   onRefresh: (() => void) | undefined,
   selectedIndex: number,
@@ -724,7 +731,7 @@ function renderSkillMenu(
             {section.entries.map(({ option, index }) => <button type="button" role="option" id={`${menuId}-option-${index}`}
               key={`skill:${option.id}`} data-skill-name={option.name}
               aria-selected={selectedIndex === index}
-              aria-label={`/${option.name}，${option.source === 'toolbox' ? uiAttribute("工具箱") : option.sourceScope === 'project' ? uiAttribute("项目 Skill") : uiAttribute("用户 Skill")}${option.memberIds?.length ? uiAttribute("，关联队员：{0}", String(members.filter((member) => option.memberIds?.includes(member.agentId)).map((member) => member.displayName).join('、'))) : ''}`}
+              aria-label={`/${option.name}${uiAttribute('，')}${option.source === 'toolbox' ? uiAttribute("工具箱") : option.sourceScope === 'project' ? uiAttribute("项目 Skill") : uiAttribute("用户 Skill")}${option.memberIds?.length ? uiAttribute("，关联队员：{0}", members.filter((member) => option.memberIds?.includes(member.agentId)).map((member) => member.displayName).join(uiAttribute('、'))) : ''}`}
               className={selectedIndex === index ? 'active' : ''}
               onMouseMove={() => setHighlightedIndex(index)}
               onMouseDown={(event) => event.preventDefault()}
@@ -734,7 +741,7 @@ function renderSkillMenu(
                 <strong>/{option.name}</strong>
                 <small>{option.description}</small>
               </span>
-              {option.memberIds && <span className="skill-picker-member-count" title={`${option.source === 'toolbox' ? uiAttribute("已配置此 Skill 的队员") : uiAttribute("在以下队员的环境中发现")}：${members.filter((member) => option.memberIds?.includes(member.agentId)).map((member) => member.displayName).join('、')}`}>{option.memberIds.slice(0, 3).map((id) => {
+              {option.memberIds && <span className="skill-picker-member-count" title={`${option.source === 'toolbox' ? uiAttribute("已配置此 Skill 的队员") : uiAttribute("在以下队员的环境中发现")}${uiAttribute('：')}${members.filter((member) => option.memberIds?.includes(member.agentId)).map((member) => member.displayName).join(uiAttribute('、'))}`}>{option.memberIds.slice(0, 3).map((id) => {
                 const member = members.find((candidate) => candidate.agentId === id)
                 return member ? <MemberAvatar key={id} agentId={id} avatarRef={member.avatarRef ?? null} displayName={member.displayName} size="execution" decorative /> : null
               })}{option.memberIds.length > 3 && <small>+{option.memberIds.length - 3}</small>}</span>}
@@ -742,7 +749,7 @@ function renderSkillMenu(
             </button>)}
           </div>)}
     {refreshing && <p className="structured-mention-empty" role="status"><UiText zh={"正在刷新 Skill 候选…"} /></p>}
-    {errors.includes(uiAttribute('刷新失败'))
+    {refreshFailed
       ? <p className="structured-mention-empty" role="alert"><UiText zh={"刷新失败，当前显示上次读取的候选。请重试。"} /></p>
       : errors.length > 0 && <p className="structured-mention-empty" role="status"><UiText zh={"部分来源暂不可读，仍可选择已发现的 Skill。"} /></p>}
   </div>
@@ -759,11 +766,11 @@ function atomPresentation(
     const member = input.members.find((candidate) => candidate.agentId === atom.agentId)
     const available = Boolean(member && member.mentionable !== false)
     const label = member?.displayName ?? atom.labelFallback ?? uiAttribute('不可用队员')
-    const pendingInvite = available && member?.inCamp === false
+    const pendingInvite = available && member?.inThread === false
     return {
       label: label.startsWith('@') ? label : `@${label}`,
       availability: available ? 'available' : 'unavailable',
-      interactive: Boolean(available && member?.inCamp !== false && input.onActivateMemberMention),
+      interactive: Boolean(available && member?.inThread !== false && input.onActivateMemberMention),
       ariaLabel: pendingInvite ? uiAttribute('成员 {0} 待邀请，发送时加入', String(label))
         : available ? uiAttribute("成员 {0}", String(label)) : uiAttribute("成员 {0} 当前不可用", String(label))
     }
@@ -773,7 +780,7 @@ function atomPresentation(
       label:uiAttribute("@所有队员"),
       availability: 'available',
       interactive: Boolean(input.onActivateAllMembersMention),
-      ariaLabel: '所有队员'
+      ariaLabel: uiAttribute('所有队员')
     }
   }
   const skill = (input.skills ?? []).find((candidate) => candidate.id === atom.skillId)

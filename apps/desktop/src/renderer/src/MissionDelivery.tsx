@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import type { AgentProfile, CheckoutState, MissionActivity, MissionChangedFile, MissionDelivery as Delivery, MissionFileDiff, MissionRecord, MissionWorkspaceChangesView } from '@contracts'
-import { useCampClient } from './camp-client'
+import { useThreadClient } from './camp-client'
 import { AttachmentCard } from './AttachmentCard'
-import { Icon, statuses } from './MissionControls'
+import { Icon, useMissionStatuses } from './MissionControls'
 import { missionCommand, missionError } from './useMissions'
 import { readErrorMessage } from './error-message'
 import { missionDate } from './MissionBoard'
@@ -13,10 +13,10 @@ import { NavigationIcon } from './NavigationIcon'
 import { DialogControlIcon } from './AppDialog'
 import { writeClipboardText } from './clipboard'
 import { displayProjectPath } from '../../shared/project-display-name'
-import { UiText, uiAttribute } from './interface-language'
+import { UiText, getInterfaceLanguage, uiAttribute, useUiText } from './interface-language'
 
 export function MissionActivityDocument({ mission, agents, onSource, onNotify, onWorkspaceCleanupRequested }: {
-  mission: MissionRecord; agents: AgentProfile[]; onSource(id: string): void; onNotify(message: string): void; onWorkspaceCleanupRequested(campId: string): Promise<void>
+  mission: MissionRecord; agents: AgentProfile[]; onSource(id: string): void; onNotify(message: string): void; onWorkspaceCleanupRequested(threadId: string): Promise<void>
 }) {
   const preview = useFilePreview(), layout = useOptionalFilePreviewLayout()
   const source = (id: string) => { if (layout?.compact) preview.hidePane(); onSource(id) }
@@ -34,8 +34,8 @@ export function missionChangesVisible(git: boolean, workspaceState: MissionWorks
 export function missionCleanupAttentionVisible(workspaceState: MissionWorkspaceState | null, diagnostic: string | null): boolean {
   return Boolean(diagnostic) && (workspaceState === 'ready' || workspaceState === 'cleanup_failed')
 }
-export function MissionDeliveryPanel({ mission, agents, onSource, onNotify, onWorkspaceCleanupRequested }: { mission: MissionRecord; agents: AgentProfile[]; onSource(id: string): void; onNotify(message: string): void; onWorkspaceCleanupRequested(campId: string): Promise<void> }) {
-  const client = useCampClient()
+export function MissionDeliveryPanel({ mission, agents, onSource, onNotify, onWorkspaceCleanupRequested }: { mission: MissionRecord; agents: AgentProfile[]; onSource(id: string): void; onNotify(message: string): void; onWorkspaceCleanupRequested(threadId: string): Promise<void> }) {
+  const client = useThreadClient()
   const [data, setData] = useState<Delivery | null>(null), [error, setError] = useState(''), [revision, setRevision] = useState(0)
   const [cleanupBusy, setCleanupBusy] = useState(false)
   useEffect(() => {
@@ -50,7 +50,7 @@ export function MissionDeliveryPanel({ mission, agents, onSource, onNotify, onWo
       setData(current => current?.workspace
         ? { ...current, workspace: { ...current.workspace, state: 'cleanup_pending', diagnostic: null } }
         : current)
-      void onWorkspaceCleanupRequested(mission.campId).catch(error => onNotify(uiAttribute("使命 Worktree 清理已开始，但信息刷新失败：{0}", String(missionError(error)))))
+      void onWorkspaceCleanupRequested(mission.threadId).catch(error => onNotify(uiAttribute("使命 Worktree 清理已开始，但信息刷新失败：{0}", String(missionError(error)))))
     } catch (error) { onNotify(missionError(error)) } finally { setCleanupBusy(false) }
   }
   const cleanupRefused = data?.workspace?.state === 'ready' && Boolean(data.workspace.diagnostic)
@@ -70,7 +70,7 @@ export function MissionDeliveryPanel({ mission, agents, onSource, onNotify, onWo
       </div>
       {missionChangesVisible(data.git, data.workspace?.state ?? null) && <MissionChanges key={`${data.workspace?.id}:${data.workspace?.baseSha}`} mission={mission} baseSha={data.workspace?.baseSha ?? null}/>}
       <section className="mission-delivery-section"><h3><UiText zh={"队员交付 "} /><span>{data.files.length || ''}</span></h3>{data.files.map(file => <div className="mission-delivery-file" key={`${file.messageId}:${file.attachmentId}`}>
-        <div className="mission-artifact"><AttachmentCard presentation="agent-timeline" attachment={{ id: file.attachmentId, displayName: file.displayName, kind: file.kind, fileCount: file.fileCount, mediaType: file.mediaType, byteSize: file.byteSize, previewKind: file.previewKind, availability: 'unknown' }} locator={{ owner: 'message', campId: mission.campId, messageId: file.messageId, attachmentRefId: file.attachmentId }} onNotify={onNotify}/><small>{agents.find(a => a.agentId === file.agentId)?.displayName ?? uiAttribute('队员')} · {missionDate(file.createdAt)}</small></div>
+        <div className="mission-artifact"><AttachmentCard presentation="agent-timeline" attachment={{ id: file.attachmentId, displayName: file.displayName, kind: file.kind, fileCount: file.fileCount, mediaType: file.mediaType, byteSize: file.byteSize, previewKind: file.previewKind, availability: 'unknown' }} locator={{ owner: 'message', threadId: mission.threadId, messageId: file.messageId, attachmentRefId: file.attachmentId }} onNotify={onNotify}/><small>{agents.find(a => a.agentId === file.agentId)?.displayName ?? uiAttribute('队员')} · {missionDate(file.createdAt)}</small></div>
         <button className="mission-source-link" onClick={() => onSource(file.messageId)}><UiText zh={"查看来源"} /></button>
       </div>)}{!data.files.length && <p className="mission-section-empty"><UiText zh={"暂无队员交付的文件。"} /></p>}</section>
     </>}
@@ -97,9 +97,9 @@ function putMissionDiff(store: MissionDiffStore, fileId: string, diff: MissionFi
     store.cache.delete(oldest)
   }
 }
-function eventCampId(params: unknown): string | null {
-  return typeof params === 'object' && params !== null && typeof (params as Record<string, unknown>).campId === 'string'
-    ? (params as Record<string, string>).campId
+function eventThreadId(params: unknown): string | null {
+  return typeof params === 'object' && params !== null && typeof (params as Record<string, unknown>).threadId === 'string'
+    ? (params as Record<string, string>).threadId
     : null
 }
 function staleMissionDiffSnapshot(error: unknown): boolean {
@@ -238,6 +238,7 @@ function MissionFileTree({ files, selected, query, expanded, scope, onQueryChang
   onExpandedChange(expanded: Set<string>): void
   onSelect(fileId: string, target: HTMLButtonElement): void
 }): React.JSX.Element {
+  const t = useUiText()
   const normalizedQuery = query.trim().toLocaleLowerCase()
   const matchingFiles = useMemo(() => normalizedQuery
     ? files.filter(file => `${file.path}\n${file.oldPath ?? ''}`.toLocaleLowerCase().includes(normalizedQuery))
@@ -370,7 +371,7 @@ function MissionFileTree({ files, selected, query, expanded, scope, onQueryChang
         const directory = node.kind === 'directory'
         const key = missionTreeKey(node)
         const open = directory && (Boolean(normalizedQuery) || expanded.has(node.path))
-        const accessible = directory ? uiAttribute("{0}，{1} 个变更文件", String(node.path), String(node.count)) : `${node.path}，${kinds[node.file.kind]}${node.file.binary ? uiAttribute('，二进制文件') : ''}${node.file.oldPath ? uiAttribute("，原路径 {0}", String(node.file.oldPath)) : ''}`
+        const accessible = directory ? t('{0}，{1} 个变更文件', node.path, node.count) : `${node.path}${t('，')}${t(kinds[node.file.kind])}${node.file.binary ? t('，二进制文件') : ''}${node.file.oldPath ? t('，原路径 {0}', node.file.oldPath) : ''}`
         return <button ref={element => { if (element) rows.current.set(key, element); else rows.current.delete(key) }} type="button" role="treeitem" aria-level={entry.depth + 1} aria-posinset={entry.position} aria-setsize={entry.siblings} aria-expanded={directory ? open : undefined} aria-selected={!directory ? node.file.id === selected : undefined} tabIndex={key === tabKey ? 0 : -1} className={`changes-tree-row ${directory ? 'is-directory' : 'is-file'}`} data-node-key={key} data-file-id={directory ? undefined : node.file.id} style={{ '--depth': entry.depth } as CSSProperties} title={node.path} aria-label={accessible} key={key}
           onFocus={() => setFocusedKey(key)} onKeyDown={event => onTreeKeyDown(event, entry, index)} onClick={event => { if (directory) toggleDirectory(node.path); else onSelect(node.file.id, event.currentTarget) }}>
           {Array.from({ length: entry.depth }, (_, guide) => <span className="tree-guide" style={{ '--guide': guide } as CSSProperties} aria-hidden="true" key={guide}/>)}
@@ -386,14 +387,19 @@ function MissionFileTree({ files, selected, query, expanded, scope, onQueryChang
   </>
 }
 
-function checkoutStateLabel(state: CheckoutState): { text: string; title?: string } {
+function checkoutStateLabel(state: CheckoutState, t: ReturnType<typeof useUiText>): { text: string; title?: string } {
   if (state.kind === 'branch') return { text: state.branch, title: `${state.branch} · ${state.head}` }
   if (state.kind === 'detached') return { text: `detached HEAD · ${state.head.slice(0, 12)}`, title: state.head }
-  return { text: '分支信息暂不可用' }
+  return { text: t('分支信息暂不可用') }
+}
+
+function missionReadTime(value: string): string {
+  return new Date(value).toLocaleTimeString(getInterfaceLanguage() === 'en' ? 'en-US' : 'zh-CN', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
 }
 
 function MissionChanges({ mission, baseSha }: { mission: MissionRecord; baseSha: string | null }) {
-  const client = useCampClient()
+  const t = useUiText()
+  const client = useThreadClient()
   const [expanded, setExpanded] = useState(false), [view, setView] = useState<MissionWorkspaceChangesView | null>(null)
   const [error, setError] = useState(''), [loading, setLoading] = useState(false), [attempted, setAttempted] = useState(false)
   const [stale, setStale] = useState(false), [readAt, setReadAt] = useState('')
@@ -404,7 +410,7 @@ function MissionChanges({ mission, baseSha }: { mission: MissionRecord; baseSha:
   const lastFocus = useRef<HTMLElement | null>(null)
   const diffStore = useRef<MissionDiffStore>({ epoch: 0, cache: new Map(), inFlight: new Map() })
   const files = view?.files ?? null
-  const checkout = view ? checkoutStateLabel(view.checkoutState) : null
+  const checkout = view ? checkoutStateLabel(view.checkoutState, t) : null
   const tree = useMemo(() => missionFileTree(files ?? []), [files])
   const directoryPaths = useMemo(() => missionTreeDirectoryPaths(tree), [tree])
   useEffect(() => { setDetailExpanded(new Set(directoryPaths)) }, [directoryPaths])
@@ -421,7 +427,7 @@ function MissionChanges({ mission, baseSha }: { mission: MissionRecord; baseSha:
       store.epoch += 1; store.cache.clear(); store.inFlight.clear()
       setSnapshotEpoch(store.epoch); setView(next)
       setSnapshotReady(Boolean(next.viewId && next.files))
-      setReadAt(new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }))
+      setReadAt(new Date().toISOString())
       setStale(invalidation !== invalidations.current)
       setSelected(previous => previous && next.files?.some(file => file.id === previous) ? previous : null)
     }).catch(failure => {
@@ -432,14 +438,14 @@ function MissionChanges({ mission, baseSha }: { mission: MissionRecord; baseSha:
   useEffect(() => {
     const terminal = client.onEvent?.(event => {
       if (event.method !== 'agent_run.terminal') return
-      const campId = eventCampId(event.params)
-      if (!campId || campId === mission.campId) markStale()
+      const threadId = eventThreadId(event.params)
+      if (!threadId || threadId === mission.threadId) markStale()
     })
     const visible = () => { if (document.visibilityState === 'visible') markStale() }
     window.addEventListener('focus', visible)
     document.addEventListener('visibilitychange', visible)
     return () => { terminal?.(); window.removeEventListener('focus', visible); document.removeEventListener('visibilitychange', visible) }
-  }, [client, markStale, mission.campId])
+  }, [client, markStale, mission.threadId])
   useEffect(() => {
     alive.current = true
     return () => {
@@ -487,7 +493,7 @@ function MissionChanges({ mission, baseSha }: { mission: MissionRecord; baseSha:
     {!expanded && !attempted && <p className="mission-section-empty mission-changes-unread"><UiText zh={"点击读取当前工作区变更"} /></p>}
     {!expanded && attempted && !view && <p className="mission-section-empty mission-changes-unread">{loading ? uiAttribute("正在读取工作区…") : uiAttribute("尚未读取成功")}</p>}
     <div id="mission-changes-content" hidden={!expanded} aria-busy={loading}>
-      {view && <div className="mission-changes-read-state" role="status"><span>{loading ? uiAttribute("正在刷新…") : stale ? uiAttribute("工作区可能已变化") : uiAttribute("读取于 {0}", String(readAt))}</span>{stale && !loading && <button type="button" onClick={refreshChanges}><UiText zh={"刷新变更"} /></button>}</div>}
+      {view && <div className="mission-changes-read-state" role="status"><span>{loading ? uiAttribute("正在刷新…") : stale ? uiAttribute("工作区可能已变化") : uiAttribute("读取于 {0}", missionReadTime(readAt))}</span>{stale && !loading && <button type="button" onClick={refreshChanges}><UiText zh={"刷新变更"} /></button>}</div>}
       {checkout && <div className="mission-evidence-row mission-changes-checkout"><Icon name="branch"/><span><UiText zh={"读取时分支"} /></span><code title={checkout.title}>{checkout.text}</code></div>}
       {loading && !view && <p className="mission-section-empty" role="status"><UiText zh={"正在读取工作区…"} /></p>}
       {error && <div className="mission-diff-error" role="alert"><p>{files ? uiAttribute("刷新失败，保留上次结果。") : error}</p><button className="compact-cancel" disabled={loading} onClick={refreshChanges}><UiText zh={"重新读取"} /></button></div>}
@@ -587,7 +593,7 @@ function MissionDiff({files, selected, baseSha, snapshotReady, snapshotEpoch, ca
   }
   return <Dialog.Root open onOpenChange={open => { if (!open) onClose() }}><Dialog.Portal><Dialog.Overlay className="dialog-overlay"/><Dialog.Content ref={contentRef} className="compact-dialog mission-diff-dialog" aria-describedby={undefined} onOpenAutoFocus={event => { event.preventDefault(); focusInitial() }} onCloseAutoFocus={event => event.preventDefault()} onEscapeKeyDown={event => { if (drag.current) { event.preventDefault(); finishResize(true) } }}>
     <header className="compact-header"><div className="diff-dialog-heading"><Dialog.Title><UiText zh={"累计文件变更"} /></Dialog.Title><div className="diff-dialog-baseline" aria-label={uiAttribute("固定基准与当前使命工作区比较")}><code title={baseSha ?? undefined}>{baseSha?.slice(0, 12) ?? uiAttribute("基准不可用")}</code><svg className="mission-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg><span><UiText zh={"当前使命工作区"} /></span></div></div><div className="diff-dialog-summary"><span>{files.length}<UiText zh={" 个文件"} /></span><span className="mission-diff-counts" aria-label={uiAttribute("合计增加 {0} 行，减少 {1} 行", String(additions), String(deletions))}><span>+{additions}</span><span>−{deletions}</span></span></div><Dialog.Close asChild><button className="compact-close" type="button" aria-label={uiAttribute("关闭累计文件变更")} title={uiAttribute("关闭")}><DialogControlIcon name="close"/></button></Dialog.Close></header>
-    <div className="compact-body"><div className="mission-diff-read-state" role="status"><span>{refreshing ? uiAttribute("正在刷新变更…") : stale ? uiAttribute("工作区可能已变化，当前显示上次读取的结果") : uiAttribute("读取于 {0}", String(readAt))}</span><button type="button" disabled={refreshing} onClick={onRefresh}><UiText zh={"刷新变更"} /></button></div><button ref={mobileToggleRef} type="button" className="mobile-files-toggle" aria-expanded={mobileFilesOpen} aria-controls="mission-modal-file-navigation" onClick={() => setMobileFilesOpen(value => !value)}><NavigationIcon name="folder-open"/><span><UiText zh={"变更文件 "} />{files.length}</span><Icon name="chevron"/></button>
+    <div className="compact-body"><div className="mission-diff-read-state" role="status"><span>{refreshing ? uiAttribute("正在刷新变更…") : stale ? uiAttribute("工作区可能已变化，当前显示上次读取的结果") : uiAttribute("读取于 {0}", missionReadTime(readAt))}</span><button type="button" disabled={refreshing} onClick={onRefresh}><UiText zh={"刷新变更"} /></button></div><button ref={mobileToggleRef} type="button" className="mobile-files-toggle" aria-expanded={mobileFilesOpen} aria-controls="mission-modal-file-navigation" onClick={() => setMobileFilesOpen(value => !value)}><NavigationIcon name="folder-open"/><span><UiText zh={"变更文件 "} />{files.length}</span><Icon name="chevron"/></button>
       <div ref={layoutRef} className="mission-diff-layout" style={{ '--diff-tree-width': `${treeWidth}px` } as CSSProperties}><nav id="mission-modal-file-navigation" className={`mission-diff-file-list${mobileFilesOpen ? ' is-mobile-open' : ''}`} aria-label={uiAttribute("变更文件")}><div className="modal-tree-heading"><span><UiText zh={"变更文件"} /></span><small>{files.length}</small><button className="mission-icon-button" type="button" aria-label={expanded.size ? uiAttribute("折叠全部目录") : uiAttribute("展开全部目录")} title={expanded.size ? uiAttribute("折叠全部目录") : uiAttribute("展开全部目录")} disabled={Boolean(query.trim())} onClick={() => setExpanded(expanded.size ? new Set() : new Set(missionTreeDirectoryPaths(missionFileTree(files))))}><TreeFoldIcon expanded={expanded.size > 0}/></button></div><MissionFileTree files={files} selected={selected} query={query} expanded={expanded} scope="modal" onQueryChange={setQuery} onExpandedChange={setExpanded} onSelect={fileId => selectFile(fileId)}/></nav>
         <div ref={separatorRef} className={`diff-resize-handle${resizing ? ' is-resizing' : ''}`} role="separator" tabIndex={0} aria-label={uiAttribute("调整变更文件树宽度")} aria-orientation="vertical" aria-controls="mission-modal-file-navigation mission-diff-reading" aria-valuemin={splitBounds.min} aria-valuemax={splitBounds.max} aria-valuenow={treeWidth} aria-valuetext={uiAttribute("文件树 {0} 像素，内容 {1} 像素", String(treeWidth), String(Math.max(0, splitBounds.total - treeWidth - 1)))} title={uiAttribute("拖动调整 · 双击恢复默认宽度 · 方向键调整")}
           onPointerDown={(event: ReactPointerEvent<HTMLDivElement>) => { if (event.button !== 0 || !event.isPrimary || drag.current || !layoutRef.current) return; event.preventDefault(); const bounds = layoutRef.current.getBoundingClientRect(); drag.current = { id: event.pointerId, startX: event.clientX, lastX: event.clientX, width: widthRef.current, previous: preferredWidth.current, scale: bounds.width / layoutRef.current.clientWidth || 1 }; event.currentTarget.setPointerCapture(event.pointerId); document.documentElement.classList.add('diff-resizing'); setResizing(true) }}
@@ -600,21 +606,24 @@ function MissionDiff({files, selected, baseSha, snapshotReady, snapshotEpoch, ca
   </Dialog.Content></Dialog.Portal></Dialog.Root>
 }
 
-function activityText(item: MissionActivity): string {
-  if (item.kind === 'created') return uiAttribute("创建了使命")
-  if (item.kind === 'started') return uiAttribute("开始了使命")
-  if (item.kind === 'status') return uiAttribute("将状态改为“{0}”", String(statuses.find(s => s.id === item.changes.status)?.label ?? item.changes.status))
-  if (item.kind === 'pull_request') return `${item.changes.removed ? uiAttribute('移除了') : uiAttribute('关联了')} Pull Request`
-  if (item.kind === 'members') return uiAttribute("更新了队员")
-  if (item.kind === 'lead') return uiAttribute("调整了队长")
-  const fields = Object.keys(item.changes).map(key => ({titleChanged:'标题',descriptionChanged:'使命描述',tagsChanged:'标签'}[key] ?? key))
-  return uiAttribute("更新了{0}", String(fields.join('、')))
+function activityText(item: MissionActivity, statuses: ReturnType<typeof useMissionStatuses>, t: ReturnType<typeof useUiText>): string {
+  if (item.kind === 'created') return t('创建了使命')
+  if (item.kind === 'started') return t('开始了使命')
+  if (item.kind === 'status') return t('将状态改为“{0}”', String(statuses.find(s => s.id === item.changes.status)?.label ?? item.changes.status))
+  if (item.kind === 'pull_request') return `${item.changes.removed ? t('移除了') : t('关联了')} Pull Request`
+  if (item.kind === 'members') return t('更新了队员')
+  if (item.kind === 'lead') return t('调整了队长')
+  const labels: Record<string, string> = { titleChanged: t('标题'), descriptionChanged: t('使命描述'), tagsChanged: t('标签') }
+  const fields = Object.keys(item.changes).map(key => labels[key] ?? key)
+  return t('更新了{0}', fields.join(t('、')))
 }
 export function MissionActivityPanel({ mission, agents, onSource }: {mission: MissionRecord; agents: AgentProfile[]; onSource(id: string): void}) {
-  const client = useCampClient(), [items, setItems] = useState<MissionActivity[]>([]), [loading, setLoading] = useState(true), [more, setMore] = useState(false), [error, setError] = useState(''), [retry, setRetry] = useState(0)
+  const t = useUiText()
+  const statuses = useMissionStatuses()
+  const client = useThreadClient(), [items, setItems] = useState<MissionActivity[]>([]), [loading, setLoading] = useState(true), [more, setMore] = useState(false), [error, setError] = useState(''), [retry, setRetry] = useState(0)
   useEffect(() => { let current=true; setLoading(true); void client.request<MissionActivity[]>('missions.activity', {missionId: mission.missionId}).then(items => {if(current) {setItems(items); setMore(items.length===100); setError('')}}).catch(error => {if(current) setError(missionError(error))}).finally(() => {if(current) setLoading(false)}); return () => {current=false} }, [client, mission.missionId, mission.updatedAt, retry])
   async function earlier() {setLoading(true); try {const next=await client.request<MissionActivity[]>('missions.activity',{missionId:mission.missionId,before:items.at(-1)?.id}); setItems(items => [...items,...next.filter(next=>!items.some(item=>item.id===next.id))]); setMore(next.length===100); setError('')}catch(error){setError(missionError(error))}finally{setLoading(false)}}
-  return <section className="mission-activity-panel" aria-label={uiAttribute("使命活动")}><h3><UiText zh={"使命历史"} /></h3>{items.map(item => <div className="mission-history-row" key={item.id}><Icon name="history"/><div><p><strong>{item.actorType==='user' ? uiAttribute("你") : agents.find(a=>a.agentId===item.actorId)?.displayName ?? uiAttribute('队员')}</strong> {activityText(item)}</p><time dateTime={item.createdAt} title={new Date(item.createdAt).toLocaleString()}>{missionDate(item.createdAt)}</time>{typeof item.changes.sourceMessageId==='string' && <button className="mission-source-link" onClick={()=>onSource(item.changes.sourceMessageId as string)}><UiText zh={"查看说明"} /></button>}</div></div>)}
+  return <section className="mission-activity-panel" aria-label={t('使命活动')}><h3><UiText zh={"使命历史"} /></h3>{items.map(item => <div className="mission-history-row" key={item.id}><Icon name="history"/><div><p><strong>{item.actorType==='user' ? t('你') : agents.find(a=>a.agentId===item.actorId)?.displayName ?? t('队员')}</strong> {activityText(item, statuses, t)}</p><time dateTime={item.createdAt} title={new Date(item.createdAt).toLocaleString(getInterfaceLanguage() === 'en' ? 'en-US' : 'zh-CN')}>{missionDate(item.createdAt)}</time>{typeof item.changes.sourceMessageId==='string' && <button className="mission-source-link" onClick={()=>onSource(item.changes.sourceMessageId as string)}><UiText zh={"查看说明"} /></button>}</div></div>)}
     {error && <div className="mission-load-error" role="alert"><span>{error}</span><button onClick={()=>setRetry(v=>v+1)}><UiText zh={"重试"} /></button></div>}{loading && <p className="mission-section-empty" role="status"><UiText zh={"正在读取历史…"} /></p>}{more && <button className="compact-cancel" disabled={loading} onClick={()=>void earlier()}><UiText zh={"查看更早活动"} /></button>}
   </section>
 }

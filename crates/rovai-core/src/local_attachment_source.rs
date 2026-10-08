@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::{
     db::Database,
     local_attachment_snapshot::{DIRECTORY_MEDIA_TYPE, normalize_display_name},
+    runtime::resolve_agent_local_path,
 };
 
 pub const EMPTY_SOURCE_ATTACHMENTS_JSON: &str = "[]";
@@ -119,13 +120,13 @@ impl LocalAttachmentSourceRef {
 #[serde(tag = "owner", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LocalAttachmentOwnerLocator {
     Composer {
-        #[serde(rename = "campId")]
+        #[serde(rename = "threadId", alias = "campId")]
         camp_id: String,
         #[serde(rename = "attachmentRefId")]
         attachment_ref_id: String,
     },
     Pending {
-        #[serde(rename = "campId")]
+        #[serde(rename = "threadId", alias = "campId")]
         camp_id: String,
         #[serde(rename = "pendingInputId")]
         pending_input_id: String,
@@ -133,7 +134,7 @@ pub enum LocalAttachmentOwnerLocator {
         attachment_ref_id: String,
     },
     PendingEdit {
-        #[serde(rename = "campId")]
+        #[serde(rename = "threadId", alias = "campId")]
         camp_id: String,
         #[serde(rename = "pendingInputId")]
         pending_input_id: String,
@@ -143,7 +144,7 @@ pub enum LocalAttachmentOwnerLocator {
         attachment_ref_id: String,
     },
     Message {
-        #[serde(rename = "campId")]
+        #[serde(rename = "threadId", alias = "campId")]
         camp_id: String,
         #[serde(rename = "messageId")]
         message_id: String,
@@ -151,7 +152,7 @@ pub enum LocalAttachmentOwnerLocator {
         attachment_ref_id: String,
     },
     Mission {
-        #[serde(rename = "campId")]
+        #[serde(rename = "threadId", alias = "campId")]
         camp_id: String,
         #[serde(rename = "missionId")]
         mission_id: String,
@@ -159,7 +160,7 @@ pub enum LocalAttachmentOwnerLocator {
         attachment_ref_id: String,
     },
     SingleChatComposer {
-        #[serde(rename = "campId")]
+        #[serde(rename = "threadId", alias = "campId")]
         camp_id: String,
         #[serde(rename = "conversationId")]
         conversation_id: String,
@@ -167,7 +168,7 @@ pub enum LocalAttachmentOwnerLocator {
         attachment_ref_id: String,
     },
     SingleChatPending {
-        #[serde(rename = "campId")]
+        #[serde(rename = "threadId", alias = "campId")]
         camp_id: String,
         #[serde(rename = "conversationId")]
         conversation_id: String,
@@ -177,7 +178,7 @@ pub enum LocalAttachmentOwnerLocator {
         attachment_ref_id: String,
     },
     SingleChatPendingEdit {
-        #[serde(rename = "campId")]
+        #[serde(rename = "threadId", alias = "campId")]
         camp_id: String,
         #[serde(rename = "conversationId")]
         conversation_id: String,
@@ -189,7 +190,7 @@ pub enum LocalAttachmentOwnerLocator {
         attachment_ref_id: String,
     },
     SingleChatMessage {
-        #[serde(rename = "campId")]
+        #[serde(rename = "threadId", alias = "campId")]
         camp_id: String,
         #[serde(rename = "conversationId")]
         conversation_id: String,
@@ -409,12 +410,7 @@ pub fn observe_agent_source_attachments(
     paths
         .iter()
         .map(|requested| {
-            let requested = Path::new(requested);
-            let path = if requested.is_absolute() {
-                requested.to_path_buf()
-            } else {
-                execution_root.join(requested)
-            };
+            let path = resolve_agent_local_path(Path::new(requested), execution_root);
             let name = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -782,6 +778,22 @@ mod tests {
                 .map(|source_ref| source_ref.source_path.clone())
                 .collect::<Vec<_>>()
         );
+        let observed = observe_agent_source_attachments(
+            &["./file.txt".into(), directory.to_str().unwrap().into()],
+            &root,
+        )
+        .unwrap();
+        assert_eq!(
+            observed[0].source_path,
+            root.join("./file.txt").to_str().unwrap()
+        );
+        assert_eq!(observed[1].source_path, directory.to_str().unwrap());
+        let missing = root.join("./missing.txt");
+        assert_eq!(
+            resolve_agent_local_path(Path::new("./missing.txt"), &root),
+            missing
+        );
+        assert_eq!(resolve_agent_local_path(&missing, &directory), missing);
         fs::remove_dir_all(root).unwrap();
     }
 

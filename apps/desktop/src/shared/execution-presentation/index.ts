@@ -4,7 +4,7 @@ import type {
   CanonicalRuntimeDiffProjectionView,
   CanonicalRuntimeActivityView,
   CoreEvent,
-  NavigationCampItem,
+  NavigationThreadItem,
   NavigationSnapshot
 } from '@contracts'
 import { safeMarkdownHasRenderableContent } from './safe-markdown-model'
@@ -24,10 +24,10 @@ export function railExpandedFromWidth(width: number): boolean {
   return width >= (RAIL_COLLAPSED_WIDTH + RAIL_EXPANDED_WIDTH) / 2
 }
 
-export function allNavigationCamps(navigation: NavigationSnapshot): NavigationCampItem[] {
+export function allNavigationThreads(navigation: NavigationSnapshot): NavigationThreadItem[] {
   return [
-    ...navigation.quickChat.recentCamps,
-    ...navigation.projects.flatMap((project) => project.recentCamps)
+    ...navigation.quickChat.recentThreads,
+    ...navigation.projects.flatMap((project) => project.recentThreads)
   ].sort((left, right) => {
     if (left.lastActivityGlobalSequence !== right.lastActivityGlobalSequence) {
       return right.lastActivityGlobalSequence - left.lastActivityGlobalSequence
@@ -183,12 +183,22 @@ export type ExecutionProgressItem =
   | { key: string; kind: 'narration'; body: string }
   | { key: string; kind: 'plan'; explanation: string; plan: ExecutionPlanStep[] }
   | { key: string; kind: 'diagnostic'; diagnostic: RuntimeDiagnostic }
+  | { key: string; kind: 'fast'; state: 'unknown' | 'standard' | 'fast' | 'cooldown'; disabledReason: string | null }
   | { key: string; kind: 'compaction'; compaction: RuntimeCompactionDisplayItem }
   | { key: string; kind: 'tool'; step: ExecutionStep }
+
+/** Titles are plain, single-line native labels; invalid input uses generic feedback. */
+export function runtimeThinkingTitleText(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const title = value.trim()
+  return title && Array.from(title).length <= 80 && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/u.test(title) ? title : null
+}
 
 export type LiveExecutionProgress = {
   items: ExecutionProgressItem[]
   runtimePhase?: 'thinking' | 'executing'
+  runtimeThinkingTitle?: string | null
+  runtimePhaseEpoch?: number
 }
 
 export type DiffLineKind = 'context' | 'addition' | 'deletion' | 'hunk' | 'metadata'
@@ -226,12 +236,29 @@ export function agentRunPresentation(
   if (run.status === 'running' && run.failure?.code === 'runtime_network_interrupted') {
     return { label: '正在恢复', tone: 'attention' }
   }
+  if (run.status === 'running' && run.waitReason === 'runtime_initializing') {
+    return { label: '正在初始化 Runtime', tone: 'info' }
+  }
   if (run.status === 'running') return { label: '执行中', tone: 'info' }
   if (run.status === 'succeeded') return { label: '已完成', tone: 'success' }
   if (run.terminalReasonCode === 'runtime_interrupted') {
     return { label: '执行已中断', tone: 'neutral' }
   }
-  if (run.status === 'failed') return { label: '失败', tone: 'danger' }
+  if (run.status === 'failed') {
+    const reasons: Record<string, string> = {
+      runtime_not_configured: '尚未配置 Runtime',
+      runtime_configuration_invalid: 'Runtime 配置不完整',
+      adapter_installation_missing: '未找到所选 Runtime 安装',
+      adapter_installation_disabled: '所选 Runtime 已停用',
+      runtime_configuration_adapter_mismatch: 'Runtime 与权限配置不匹配',
+      runtime_permission_adapter_mismatch: 'Runtime 与权限配置不匹配',
+      conversation_runtime_override_unsupported: '当前会话的 Runtime 覆盖配置不受支持',
+      runtime_adapter_not_implemented: '当前平台尚不支持所选 Runtime'
+    }
+    const code = run.terminalReasonCode ?? ''
+    return { label: reasons[code] ?? (code.startsWith('runtime_permission_')
+      ? 'Runtime 权限配置无效' : code.startsWith('runtime_model_') ? 'Runtime 模型配置无效' : '失败'), tone: 'danger' }
+  }
   if (run.status === 'cancelled') {
     return run.terminalReasonCode === 'planned_shutdown_cancelled'
       ? { label: '已停止', tone: 'neutral' }
@@ -265,6 +292,9 @@ export function agentRunStateTag(
   }
   if (run.status === 'running' && run.failure?.code === 'runtime_network_interrupted') {
     return { tag: 'RECOVERING', tone: 'attention' }
+  }
+  if (run.status === 'running' && run.waitReason === 'runtime_initializing') {
+    return { tag: 'STARTING', tone: 'brand' }
   }
   if (run.status === 'running') return { tag: 'RUNNING', tone: 'brand' }
   if (run.status === 'queued') return { tag: 'QUEUED', tone: 'neutral' }
@@ -320,6 +350,7 @@ const LIVE_RUNTIME_EVENT_TYPES = new Set([
   'runtime.plan',
   'runtime.plan.delta',
   'runtime.diagnostic',
+  'runtime.fast.observed',
   'runtime.compaction.display',
   'runtime.action',
   'agent_run.runtime_phase_changed'
@@ -460,7 +491,10 @@ export function runtimeAdapterDisplayLabel(kind: string): string {
   } as Record<string, string>)[kind] ?? kind
 }
 
-export function runtimeCompactionTitle(item: RuntimeCompactionDisplayItem): string {
+export function runtimeCompactionTitle(
+  item: RuntimeCompactionDisplayItem,
+  translate: (chinese: string) => string = (chinese) => chinese
+): string {
   const action = item.phase === 'imminent'
     ? '即将压缩会话上下文'
     : item.phase === 'started'
@@ -471,20 +505,21 @@ export function runtimeCompactionTitle(item: RuntimeCompactionDisplayItem): stri
   const tokenTransition = item.tokens.before !== undefined && item.tokens.after !== undefined
     ? ` · ${compactTokenCount(item.tokens.before)} → ${compactTokenCount(item.tokens.after)}`
     : ''
-  return `${action} · ${runtimeAdapterDisplayLabel(item.adapterKind)}${tokenTransition}`
+  return `${translate(action)} · ${runtimeAdapterDisplayLabel(item.adapterKind)}${tokenTransition}`
 }
 
 export function runtimeCompactionDetailText(
-  item: RuntimeCompactionDisplayItem
+  item: RuntimeCompactionDisplayItem,
+  translate: (chinese: string) => string = (chinese) => chinese
 ): string | null {
   if (!runtimeCompactionIsExpandable(item)) return null
   const metrics: string[] = []
   const formatTokens = (value: number): string => `${new Intl.NumberFormat('zh-CN').format(value)} tokens`
-  if (item.tokens.before !== undefined) metrics.push(`压缩前：${formatTokens(item.tokens.before)}`)
-  if (item.tokens.after !== undefined) metrics.push(`压缩后：${formatTokens(item.tokens.after)}`)
-  if (item.tokens.current !== undefined) metrics.push(`当前：${formatTokens(item.tokens.current)}`)
+  if (item.tokens.before !== undefined) metrics.push(`${translate('压缩前：')}${formatTokens(item.tokens.before)}`)
+  if (item.tokens.after !== undefined) metrics.push(`${translate('压缩后：')}${formatTokens(item.tokens.after)}`)
+  if (item.tokens.current !== undefined) metrics.push(`${translate('当前：')}${formatTokens(item.tokens.current)}`)
   if (item.tokens.contextWindow !== undefined) {
-    metrics.push(`上下文窗口：${formatTokens(item.tokens.contextWindow)}`)
+    metrics.push(`${translate('上下文窗口：')}${formatTokens(item.tokens.contextWindow)}`)
   }
   if (
     item.tokens.before !== undefined
@@ -495,21 +530,21 @@ export function runtimeCompactionDetailText(
     const percent = item.tokens.before > 0
       ? ` · ${((reduction / item.tokens.before) * 100).toFixed(1)}%`
       : ''
-    metrics.push(`减少：${formatTokens(reduction)}${percent}`)
+    metrics.push(`${translate('减少：')}${formatTokens(reduction)}${percent}`)
   }
   if (item.tokens.usagePercent !== undefined) {
-    metrics.push(`上下文使用：${item.tokens.usagePercent.toFixed(1)}%`)
+    metrics.push(`${translate('上下文使用：')}${item.tokens.usagePercent.toFixed(1)}%`)
   }
   if (item.messages.compacted !== undefined) {
-    metrics.push(`整理消息：${new Intl.NumberFormat('zh-CN').format(item.messages.compacted)}`)
+    metrics.push(`${translate('整理消息：')}${new Intl.NumberFormat('zh-CN').format(item.messages.compacted)}`)
   }
   if (item.elapsedMs !== undefined) {
     const seconds = (item.elapsedMs / 1_000).toFixed(2).replace(/\.00$/, '').replace(/(\.\d)0$/, '$1')
-    metrics.push(`耗时：${seconds} 秒`)
+    metrics.push(`${translate('耗时：')}${seconds} ${translate('秒')}`)
   }
   if (!item.summaryText) return metrics.join('\n') || null
   return metrics.length > 0
-    ? `${metrics.join('\n')}\n\n会话摘要\n\n${item.summaryText}`
+    ? `${metrics.join('\n')}\n\n${translate('会话摘要')}\n\n${item.summaryText}`
     : item.summaryText
 }
 
@@ -532,7 +567,10 @@ export function buildLiveExecutionProgress(
   let planExplanation = ''
   let plan: ExecutionPlanStep[] = []
   let runtimePhase: LiveExecutionProgress['runtimePhase']
+  let runtimeThinkingTitle: string | null = null
+  let phaseEpoch = -1
   const diagnosticsById = new Map<string, RuntimeDiagnostic>()
+  const fastById = new Map<string, Extract<ExecutionProgressItem, { kind: 'fast' }>>()
   const compactionsById = new Map<string, RuntimeCompactionDisplayItem>()
   const steps: ExecutionStep[] = []
   const stepIndexes = new Map<string, number>()
@@ -604,8 +642,12 @@ export function buildLiveExecutionProgress(
     if (event.eventType === 'agent_run.runtime_phase_changed') {
       const phase = stringField(payload, 'phase')
       if (phase === 'thinking' || phase === 'executing') {
+        const epoch = event.executionEpoch ?? 0
+        if (epoch < phaseEpoch) continue
+        phaseEpoch = epoch
         runtimePhase = phase
-        // The content-free phase edge preserves the public narration boundary
+        runtimeThinkingTitle = phase === 'thinking' ? runtimeThinkingTitleText(payload.thinkingTitle) : null
+        // The phase edge preserves the public narration boundary
         // that private reasoning frames used to imply.
         finishNarrationStream()
       }
@@ -655,6 +697,16 @@ export function buildLiveExecutionProgress(
       rememberItem('plan')
       const delta = stringField(payload, 'delta') ?? ''
       if (delta) planExplanation += delta
+      continue
+    }
+
+    if (event.eventType === 'runtime.fast.observed') {
+      const native = stringField(payload, 'state')
+      const key = `fast:${event.id}`
+      rememberItem(key)
+      fastById.set(key, { key, kind: 'fast',
+        state: native === 'fast' || native === 'standard' || native === 'cooldown' ? native : 'unknown',
+        disabledReason: stringField(payload, 'disabledReason') })
       continue
     }
 
@@ -852,6 +904,10 @@ export function buildLiveExecutionProgress(
         ? [{ key, kind: 'narration', body }]
         : []
     }
+    if (key.startsWith('fast:')) {
+      const fast = fastById.get(key)
+      return fast ? [fast] : []
+    }
     if (key.startsWith('diagnostic:')) {
       const diagnostic = diagnosticsById.get(key.slice('diagnostic:'.length))
       return diagnostic ? [{ key, kind: 'diagnostic', diagnostic }] : []
@@ -868,7 +924,9 @@ export function buildLiveExecutionProgress(
   })
   return {
     items,
-    runtimePhase
+    runtimePhase,
+    runtimeThinkingTitle,
+    runtimePhaseEpoch: phaseEpoch >= 0 ? phaseEpoch : undefined
   }
 }
 
@@ -1567,7 +1625,7 @@ function activeShellSyntax(value: string): boolean {
   return quote !== null
 }
 
-function pureBuiltinShellOperation(command: string): string | null {
+export function pureBuiltinShellOperation(command: string): string | null {
   const source = unwrapShellCommand(stripAnsi(command).trim())
   const stdin = omitBuiltinStdin(source)
   if (!stdin.complete || stdin.hasExpansion) return null

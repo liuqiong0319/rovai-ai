@@ -3,12 +3,12 @@ document_type: architecture
 architecture: camp-open-read-path
 authority: desktop-camp-enter-and-progressive-read-boundaries
 status: accepted
-last_updated: 2026-09-28
+last_updated: 2026-10-02
 ---
 
 # Camp Open Read Path 架构
 
-字段与窗口见 [Camp Open Projection v24](../contracts/camp-open-projection-v24.md)与
+字段与窗口见 [Camp Open Projection v25](../contracts/camp-open-projection-v25.md)与
 [Camp Conversation Find v1](../contracts/camp-conversation-find-v1.md)。本架构把“进入会话”、
 “继续阅读”、“查找完整当前会话”和“检查运行详情”分成用途明确的接口，同时保持 SQLite Read Side
 为唯一权威。
@@ -41,6 +41,9 @@ Open 仅读取当前 Camp 的业务表。它及其嵌套 loader、CTE、view 不
 `load_open_messages()` 复用正文、附件和 presentation hydration，但不查询 publication event sequence。
 附件 hydration 对 source refs、Managed v2 和 legacy rows 统一返回无路径 View 与
 `availability = unknown`；Open、earlier、around、thread 和 timeline 不为可用性访问文件系统。
+消息模型信息按当前返回窗口的消息 ID 一次性关联已有 source Run 冻结配置，检查 Thread 与作者身份；
+只投影 adapter、model、effort，不复制持久数据，也不依赖独立的 96 Run 窗口。分页与 around 使用相同 hydration，
+缺失记录不回退到当前 AgentProfile，且不扩大消息窗口或访问事件／证据历史。
 `throughGlobalSequence` 仍从 `event_sequence` singleton 读取，不通过事件表求最大值。移除 timeline 与其
 exact count 后，打开成本不随其他 Camp 的事件历史增长；执行详情改由独立窗口读取，完整历史仍可按需访问。
 
@@ -190,6 +193,25 @@ Memory 仍分别拥有读取与错误状态，但冷启动可见反馈共用不�
 
 - [Core 受管内容不变量](foundational-invariants.md#core-managed-content)
 - [协作与执行准入不变量](foundational-invariants.md#collaboration-admission)
-- [Camp Open Projection v24](../contracts/camp-open-projection-v24.md)
+- [Camp Open Projection v25](../contracts/camp-open-projection-v25.md)
 - [Camp Conversation Find v1](../contracts/camp-conversation-find-v1.md)
 - [Desktop Navigation Refresh](desktop-navigation-refresh.md)
+
+## 队员创建回执
+
+Snapshot/Open 在同一读事务内按当前 Thread 索引读取 `member_creation` 的静态身份快照。它不读取当前队员状态、
+不回放工具 Evidence 或 `event_log`，不扩大消息/Run 窗口。`thread.memberCreated` 只提示重读当前会话；
+重开以表为准。卡片链接交给现有队员页处理实时状态。字段与原子边界见
+[Member Creation Flow v1](../contracts/member-creation-flow-v1.md)。
+
+## Run 主线与展开组读取
+
+执行详情沿用已有 page/changes 派发与 Thread/Run 归属验证。Core 的 execution_window blocks 模块从既有
+Evidence/Canonical operation index 在读取事务中计算块边界、完整组计数与代表项；无新增表或后台投影维护。
+Renderer 的 ExecutionWindow 拥有主线块游标，ExecutionGroupWindow 拥有单组子窗口，公开输出仍由既有
+content cache 与精确详情请求拥有。两个窗口同用 Run 原生滚动容器，缓存、展开、内容和 DOM 窗口分别有界。
+
+薄索引保留全 Run 元数据扫描与有序候选索引成本，折叠组传输量与子项数脱钩；不把这项优化声称为常数时间数据库查询。初次短内容
+有界自动补齐，失败原位恢复，历史阅读锚点优先于后台更新。协议和预算见
+[Run Process Detail Surface v43](../contracts/run-process-detail-surface-v43.md)，取舍见
+[V1.72-D10](../versions/v1.72/decisions.md#v1-72-d10)。

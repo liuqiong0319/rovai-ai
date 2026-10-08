@@ -60,13 +60,16 @@ describe('v0.29 member sidebar', () => {
     expect(markup).toContain('id="member-sidebar-filter"')
     expect(markup).not.toContain('member-context-return')
     expect(markup).toContain('placeholder="搜索队员"')
-    expect(markup).toContain('沐瓦，Codex CLI，可用；打开运行配置')
+    expect(markup).toContain('沐瓦，Codex CLI；打开运行配置')
+    expect(markup).toContain('title="Codex CLI"')
     expect(markup).toContain('runtime-available')
     expect(markup).toContain('member-runtime-glyph')
     expect(markup).toContain(renderToStaticMarkup(createElement('img', {
       src: PRODUCT_RUNTIME_LOGOS['codex-cli'], alt: '', draggable: false
     })))
-    expect(markup).toContain('aria-label="折叠队员名册"')
+    expect(markup).toContain('aria-label="添加队员"')
+    expect(markup).toContain('aria-label="选择添加方式"')
+    expect(markup).not.toContain('aria-label="折叠队员名册"')
     expect(markup).not.toContain('secret-match')
   })
 

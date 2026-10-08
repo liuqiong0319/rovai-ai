@@ -3,6 +3,7 @@ import type {
   AdapterInstallation,
   AdapterPermissionConfig,
   AgentProfile,
+  AgentProfileIdentityInput,
   CoreMethod,
   InterfaceLanguage,
   OnboardingApi,
@@ -14,9 +15,10 @@ import {
   runtimeEditorInstallation,
   runtimeModelSelectionAvailable
 } from './MemberRuntimeParameters'
-import { builtinMemberPresetsForLanguage } from './member-presets'
+import { builtinMemberPresetsForLanguage, type BuiltinMemberPreset } from './member-presets'
+import { FIRST_RUN_CAMP_TITLE } from './camp-title'
 
-export const FIRST_RUN_CAMP_TITLE = '初次集结'
+export { FIRST_RUN_CAMP_TITLE } from './camp-title'
 
 type InProgressOnboarding = Extract<OnboardingSnapshot, { status: 'in_progress' }>
 type CompletedOnboarding = Extract<OnboardingSnapshot, { status: 'completed' }>
@@ -27,7 +29,9 @@ export interface OnboardingProvisioningApi {
     | 'beginProvisioning'
     | 'recordProvisionedMember'
     | 'recordProvisionedRuntime'
-    | 'recordProvisionedCamp'
+    | 'prepareRuntimeCopies'
+    | 'recordRuntimeCopy'
+    | 'recordProvisionedThread'
     | 'complete'
   >
   desktopSession: {
@@ -38,7 +42,7 @@ export interface OnboardingProvisioningApi {
 export interface OnboardingProvisioningResult {
   snapshot: CompletedOnboarding
   memberAgentId: string
-  quickChatCampId: string
+  quickChatThreadId: string
 }
 
 export async function provisionFirstRun(
@@ -54,10 +58,12 @@ export async function provisionFirstRun(
   if (!initialSnapshot.runtimeSelection?.model) {
     throw new Error(uiAttribute('请先完成智能体与模型配置。'))
   }
-  const preset = builtinMemberPresetsForLanguage(language).find(
+  const presets = builtinMemberPresetsForLanguage(language)
+  const preset = presets.find(
     (candidate) => candidate.role === initialSnapshot.selectedMemberRole
   )
   if (!preset) throw new Error(uiAttribute('所选队员预设已不可用。'))
+  const identity = presetIdentity(preset)
 
   let runtimePermissions: AdapterPermissionConfig
   if (initialSnapshot.provisioning) {
@@ -100,16 +106,32 @@ export async function provisionFirstRun(
     ) ?? null
     let memberAgentId = retained?.agentId ?? null
     let version = retained?.version ?? null
+    const seedPresets = language === 'en' ? builtinMemberPresetsForLanguage('zh-CN') : []
+    // Core seeds Chinese profiles before onboarding. Initialize only untouched,
+    // unconfigured seed text; customized or configured identities remain user data.
+    for (const seedPreset of seedPresets) {
+      const member = existingMembers.find((candidate) => candidate.avatarRef === seedPreset.avatarRef
+        && candidate.presence !== 'removed' && candidate.removedAt === null)
+      if (!member || member.runtimeConfiguration !== null || !hasPresetIdentity(member, seedPreset)) continue
+      const englishPreset = presets.find((candidate) => candidate.role === seedPreset.role)!
+      const result = await api.request<StoredCommandResult>('members.update', {
+        commandId: member.agentId === memberAgentId
+          ? current.provisioning.memberCommandId
+          : `${current.provisioning.memberCommandId}:seed:${member.agentId}`,
+        command: { ...presetIdentity(englishPreset), agentId: member.agentId, expectedVersion: member.version }
+      })
+      assertApplied(result, uiAttribute('保存队员信息'))
+      const updatedVersion = positiveVersion(result.payload.version)
+      if (updatedVersion === null) {
+        throw new Error(uiAttribute('已收到保存回执，但无法确认最新版本，请重新载入。'))
+      }
+      if (member.agentId === memberAgentId) version = updatedVersion
+    }
     if (!memberAgentId || version === null) {
       const result = await api.request<StoredCommandResult>('members.create', {
         commandId: current.provisioning.memberCommandId,
         command: {
-          displayName: preset.displayName,
-          teamRole: preset.teamRole,
-          professionalResponsibilities: preset.professionalResponsibilities,
-          personalityTraits: preset.personalityTraits,
-          workingPrinciples: preset.workingPrinciples,
-          growthTopic: preset.growthTopic,
+          ...identity,
           avatarRef: preset.avatarRef
         }
       })
@@ -156,8 +178,57 @@ export async function provisionFirstRun(
     onCheckpoint(current)
   }
 
-  if (!current.provisioning.quickChatCampId) {
-    const result = await api.request<StoredCommandResult>('camps.create', {
+  if (current.provisioning.runtimeCopies === null) {
+    // Read after identity initialization so English seeds use their current versions.
+    const members = await api.request<AgentProfile[]>('members.list')
+    const targets = presets.flatMap((seed) => {
+      const member = members.find((candidate) => candidate.avatarRef === seed.avatarRef
+        && candidate.presence !== 'removed' && candidate.removedAt === null)
+      return member && member.agentId !== memberAgentId && member.runtimeConfiguration === null
+        ? [{ agentId: member.agentId, expectedVersion: member.version }]
+        : []
+    })
+    current = requireProvisioningSnapshot(await api.onboarding.prepareRuntimeCopies(targets))
+    onCheckpoint(current)
+  }
+
+  for (const target of current.provisioning.runtimeCopies!) {
+    if (target.status !== 'pending') continue
+    const selection = current.runtimeSelection!
+    // Replay the exact durable command after an unknown outcome. Never refresh
+    // expectedVersion: a later user edit must win over this initial default.
+    const result = await api.request<StoredCommandResult>('members.runtime.set', {
+      commandId: target.commandId,
+      command: {
+        agentId: target.agentId,
+        expectedVersion: target.expectedVersion,
+        adapterKind: selection.adapterKind,
+        model: selection.model,
+        permissions: current.provisioning.runtimePermissions
+      }
+    })
+    const changed = result.status === 'rejected' && [
+      'agent_profile.version_conflict', 'version_conflict',
+      'agent_profile.removed', 'agent_profile.not_found'
+    ].includes(result.code)
+    if (result.status !== 'rejected') {
+      assertApplied(result, uiAttribute('保存队员运行配置'))
+      if (result.payload.version !== target.expectedVersion + 1) {
+        throw new Error(uiAttribute('运行配置已保存，但返回的检查点不完整。'))
+      }
+    }
+    current = requireProvisioningSnapshot(await api.onboarding.recordRuntimeCopy(
+      target.agentId, target.commandId,
+      changed ? 'skipped' : result.status === 'rejected' ? 'retry' : 'applied'
+    ))
+    onCheckpoint(current)
+    // Rejected commands are durably replayed by Core. Rotate only a known
+    // rejection before exposing retry; transport failures retain the old ID.
+    if (!changed) assertApplied(result, uiAttribute('保存队员运行配置'))
+  }
+
+  if (!current.provisioning.quickChatThreadId) {
+    const result = await api.request<StoredCommandResult>('threads.create', {
       commandId: current.provisioning.campCommandId,
       name: FIRST_RUN_CAMP_TITLE,
       workspace: null,
@@ -167,26 +238,47 @@ export async function provisionFirstRun(
       activationState: 'active'
     })
     assertApplied(result, uiAttribute('创建首次快速对话'))
-    const campId = result.resultEntity?.entityId ?? stringField(result.payload, 'campId')
-    if (!campId) throw new Error(uiAttribute('快速对话已创建，但返回的 Camp ID 不完整。'))
+    const threadId = result.resultEntity?.entityId ?? stringField(result.payload, 'threadId')
+    if (!threadId) throw new Error(uiAttribute('快速对话已创建，但返回的 Thread ID 不完整。'))
     current = requireProvisioningSnapshot(
-      await api.onboarding.recordProvisionedCamp(campId)
+      await api.onboarding.recordProvisionedThread(threadId)
     )
     onCheckpoint(current)
   }
 
-  const quickChatCampId = current.provisioning.quickChatCampId
-  if (!quickChatCampId) throw new Error(uiAttribute('快速对话检查点不完整。'))
+  const quickChatThreadId = current.provisioning.quickChatThreadId
+  if (!quickChatThreadId) throw new Error(uiAttribute('快速对话检查点不完整。'))
 
   // The fourth page is optional. Persist its real Core location before marking
   // the mandatory training complete so a restart always has a durable place to resume.
-  await api.desktopSession.commitRestorableLocation({ kind: 'camp', campId: quickChatCampId })
+  await api.desktopSession.commitRestorableLocation({ kind: 'camp', threadId: quickChatThreadId })
   const completed = await api.onboarding.complete()
   if (completed.status !== 'completed' || completed.origin !== 'onboarding') {
     throw new Error(uiAttribute('首次引导完成状态不完整。'))
   }
   onCheckpoint(completed)
-  return { snapshot: completed, memberAgentId, quickChatCampId }
+  return { snapshot: completed, memberAgentId, quickChatThreadId }
+}
+
+function presetIdentity(preset: BuiltinMemberPreset): AgentProfileIdentityInput {
+  return {
+    displayName: preset.displayName,
+    teamRole: preset.teamRole,
+    professionalResponsibilities: preset.professionalResponsibilities,
+    personalityTraits: preset.personalityTraits,
+    workingPrinciples: preset.workingPrinciples,
+    growthTopic: preset.growthTopic
+  }
+}
+
+function hasPresetIdentity(member: AgentProfile, preset: BuiltinMemberPreset): boolean {
+  return member.displayName === preset.displayName
+    && member.teamRole === preset.teamRole
+    && member.professionalResponsibilities === preset.professionalResponsibilities
+    && member.workingPrinciples === preset.workingPrinciples
+    && member.growthTopic === preset.growthTopic
+    && member.personalityTraits.length === preset.personalityTraits.length
+    && member.personalityTraits.every((trait, index) => trait === preset.personalityTraits[index])
 }
 
 function requireProvisioningSnapshot(snapshot: OnboardingSnapshot): InProgressOnboarding & {
@@ -203,7 +295,7 @@ function requireProvisioningSnapshot(snapshot: OnboardingSnapshot): InProgressOn
 function assertApplied(result: StoredCommandResult, action: string): void {
   if (result.status === 'applied') return
   const message = stringField(result.payload, 'message')
-  throw new Error(message ?? `${action}未完成：${result.code}`)
+  throw new Error(message ?? uiAttribute('{0}未完成：{1}', action, result.code))
 }
 
 function stringField(value: Record<string, unknown>, key: string): string | null {

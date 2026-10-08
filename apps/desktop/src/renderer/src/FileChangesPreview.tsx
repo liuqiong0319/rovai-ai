@@ -1,4 +1,4 @@
-import { useCampClient } from './camp-client'
+import { useThreadClient } from './camp-client'
 import { FileFindChangesAdapter } from './FileFindChangesAdapter'
 import { ChangedFileSelect } from './ChangedFileSelect'
 import { fileChangeFindLineId } from './file-find-changes'
@@ -12,8 +12,8 @@ import { UiText, uiAttribute } from './interface-language'
 type AgentRunFileChangesDetailStatus = 'loading' | 'ready' | 'error'
 
 export function FileChangesPreview({ tab, visible }: { tab: FileChangesPreviewTabModel; visible: boolean }): JSX.Element {
-  const client = useCampClient()
-  const { campId, changes, selectedEvidenceFileId } = tab
+  const client = useThreadClient()
+  const { threadId, changes, selectedEvidenceFileId } = tab
   const filePreview = useFilePreview()
   const detail = tab.detail ?? null
   const detailStatus = tab.detailStatus ?? 'loading'
@@ -21,7 +21,7 @@ export function FileChangesPreview({ tab, visible }: { tab: FileChangesPreviewTa
   const [openCurrentError, setOpenCurrentError] = useState<string | null>(null)
   useEffect(() => setOpenCurrentError(null), [selectedEvidenceFileId])
   const readDetail = () => client.request<AgentRunFileChangesDetailView>('agentRunFileChanges.get', {
-    campId, agentRunId: changes.agentRunId, executionEpoch: changes.executionEpoch
+    threadId, agentRunId: changes.agentRunId, executionEpoch: changes.executionEpoch
   })
   useEffect(() => {
     if (visible && !tab.detail && !tab.detailStatus) void filePreview.loadChanges(tab.id, readDetail)
@@ -36,7 +36,7 @@ export function FileChangesPreview({ tab, visible }: { tab: FileChangesPreviewTa
     setOpenCurrentError(null)
     const outcome = await filePreview.open({
       kind: 'run_evidence',
-      campId,
+      threadId,
       agentRunId: changes.agentRunId,
       executionEpoch: changes.executionEpoch,
       evidenceFileId: file.evidenceFileId,
@@ -189,7 +189,9 @@ export function AgentRunFileChangesReviewSurface({
                       <span aria-hidden="true">
                         {selectedFile.additions !== undefined && selectedFile.deletions !== undefined
                           ? <><i className="addition">+{selectedFile.additions}</i><i className="deletion">−{selectedFile.deletions}</i></>
-                          : uiAttribute("{0} 次修改", String(selectedFile.operationCount))}
+                          : selectedFile.operationCount === 1
+                            ? uiAttribute('1 次修改')
+                            : uiAttribute('{0} 次修改', selectedFile.operationCount)}
                       </span>
                     </span>
                     <button

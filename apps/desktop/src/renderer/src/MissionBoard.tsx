@@ -1,14 +1,14 @@
 import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode, type Ref } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import * as Menu from '@radix-ui/react-dropdown-menu'
-import type { AgentProfile, CampOpenProjection, MissionDelivery, MissionRecord, MissionStatus, MissionUpdate, MissionWorkspace, ProjectNavigationGroup } from '@contracts'
-import { useCampClient, type CampClient } from './camp-client'
+import type { AgentProfile, ThreadOpenProjection, MissionDelivery, MissionRecord, MissionStatus, MissionUpdate, MissionWorkspace, ProjectNavigationGroup } from '@contracts'
+import { useThreadClient, type ThreadClient } from './camp-client'
 import { newCommandId } from '../../shared/command-id'
 import { DialogControlIcon } from './AppDialog'
 import { NavigationIcon } from './NavigationIcon'
 import { MobilePageHeader, useMobileLayout } from './MobileLayout'
 import { MissionIcon } from './MissionIcon'
-import { Avatar, CompactDialog, Icon, LabelsEditor, MissionAvatars, MissionContextMenu, MissionFilter, MissionPeopleProvider, MissionPopover, MissionRoster, MissionTags, StatusIcon, FilterStateIcon, TagColorDot, statuses, type ContextPosition } from './MissionControls'
+import { Avatar, CompactDialog, Icon, LabelsEditor, MissionAvatars, MissionContextMenu, MissionFilter, MissionPeopleProvider, MissionPopover, MissionRoster, MissionTags, StatusIcon, FilterStateIcon, TagColorDot, useMissionStatuses, type ContextPosition } from './MissionControls'
 import { RunningText } from './RunningText'
 import { MissionCommandRejected, missionCommand, missionError } from './useMissions'
 import { MemberAvatar } from './MemberAvatar'
@@ -27,7 +27,7 @@ import {
   type MissionWritingPlaneHandle
 } from './MissionDefinitionEditor'
 import { displayProjectPath } from '../../shared/project-display-name'
-import { UiText, uiAttribute } from './interface-language'
+import { UiText, getInterfaceLanguage, uiAttribute } from './interface-language'
 
 type MissionActions = {
   edit(mission: MissionRecord): void
@@ -54,21 +54,22 @@ export function missionProject(m: MissionRecord, projects: ProjectNavigationGrou
 }
 export function missionDate(value: string): string {
   const date = new Date(value), today = new Date(), yesterday = new Date()
+  const locale = getInterfaceLanguage() === 'en' ? 'en-US' : 'zh-CN'
   yesterday.setDate(today.getDate() - 1)
-  if (date.toDateString() === today.toDateString()) return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+  if (date.toDateString() === today.toDateString()) return date.toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
   if (date.toDateString() === yesterday.toDateString()) return uiAttribute("昨天")
-  return date.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric', ...(date.getFullYear() !== today.getFullYear() ? { year: 'numeric' } as const : {}) })
+  return date.toLocaleDateString(locale, { month: 'numeric', day: 'numeric', ...(date.getFullYear() !== today.getFullYear() ? { year: 'numeric' } as const : {}) })
 }
 
-function openMissionCamp(client: Pick<CampClient, 'request'>, campId: string): Promise<CampOpenProjection> {
-  return client.request<CampOpenProjection>('camps.open', { traceId: newCommandId(), campId })
+function openMissionThread(client: Pick<ThreadClient, 'request'>, threadId: string): Promise<ThreadOpenProjection> {
+  return client.request<ThreadOpenProjection>('threads.open', { traceId: newCommandId(), threadId })
 }
 
 /** Shared overlays keep card actions identical in the board, drawer and full conversation. */
 export function MissionInteractionProvider({ missions, projects, agents, onChanged, onWorkspaceCleaned, onDeleted, onOpen, onError, children }: {
-  missions: MissionRecord[]; projects: ProjectNavigationGroup[]; agents: AgentProfile[]; onChanged(campId: string): Promise<void>; onWorkspaceCleaned(campId: string): Promise<void>; onDeleted(campId: string): Promise<void>; onOpen(mission: MissionRecord): void; onError(message: string, action?: { label: string; onSelect(): void }): void; children: ReactNode
+  missions: MissionRecord[]; projects: ProjectNavigationGroup[]; agents: AgentProfile[]; onChanged(threadId: string): Promise<void>; onWorkspaceCleaned(threadId: string): Promise<void>; onDeleted(threadId: string): Promise<void>; onOpen(mission: MissionRecord): void; onError(message: string, action?: { label: string; onSelect(): void }): void; children: ReactNode
 }) {
-  const client = useCampClient()
+  const client = useThreadClient()
   const [position, setPosition] = useState<(ContextPosition & { kind: 'menu' | 'tags' | 'members' }) | null>(null)
   const [editing, setEditing] = useState<MissionRecord | null>(null)
   const [cleaning, setCleaning] = useState<MissionRecord | null>(null)
@@ -93,10 +94,10 @@ export function MissionInteractionProvider({ missions, projects, agents, onChang
   async function change(m: MissionRecord, kind: 'status' | 'update', fields: object) {
     try {
       await missionCommand(client, kind === 'status' ? 'missions.status' : 'missions.update', { missionId: m.missionId, ...fields })
-      await onChanged(m.campId)
+      await onChanged(m.threadId)
     } catch (error) {
       if (error instanceof MissionCommandRejected && error.result.code === 'mission.details_version_conflict') {
-        try { await onChanged(m.campId) } catch { /* The conflict payload still carries the authoritative fields. */ }
+        try { await onChanged(m.threadId) } catch { /* The conflict payload still carries the authoritative fields. */ }
       }
       throw error
     }
@@ -110,7 +111,7 @@ export function MissionInteractionProvider({ missions, projects, agents, onChang
       await missionCommand(client, 'missions.start', { missionId: m.missionId }, commandId)
       setAcceptedStarts(current => new Set(current).add(m.missionId))
       starts.current.delete(m.missionId)
-      await onChanged(m.campId)
+      await onChanged(m.threadId)
     }
     catch (error) { if (error instanceof MissionCommandRejected) starts.current.delete(m.missionId); throw error }
     finally { setBusyId(null) }
@@ -121,7 +122,7 @@ export function MissionInteractionProvider({ missions, projects, agents, onChang
     try {
       await missionCommand(client, 'missions.workspace.cleanup', { missionId: m.missionId })
       setCleanupFeedbacks(current => ({ ...current, [m.missionId]: 'cleaning' }))
-      void onWorkspaceCleaned(m.campId).catch(error => onError(uiAttribute("使命 Worktree 清理已开始，但信息刷新失败：{0}", String(missionError(error)))))
+      void onWorkspaceCleaned(m.threadId).catch(error => onError(uiAttribute("使命 Worktree 清理已开始，但信息刷新失败：{0}", String(missionError(error)))))
     } finally {
       cleanupRequests.current.delete(m.missionId)
     }
@@ -185,9 +186,9 @@ export function MissionInteractionProvider({ missions, projects, agents, onChang
       onEdit={() => { if (selected) setEditing(selected); setPosition(null) }}
       onStatus={status => { if (selected) actions.status(selected, status) }}
       onLead={id => { if (selected) report((async () => {
-        const snapshot = await openMissionCamp(client, selected.campId)
-        await missionCommand(client, 'camps.changeDefaultLead', { campId: selected.campId, successorAgentId: id, expectedVersion: snapshot.camp.version })
-        await onChanged(selected.campId)
+        const snapshot = await openMissionThread(client, selected.threadId)
+        await missionCommand(client, 'threads.changeDefaultLead', { threadId: selected.threadId, successorAgentId: id, expectedVersion: snapshot.thread.version })
+        await onChanged(selected.threadId)
       })()) }}
       onSaveTags={tags => selected ? change(selected, 'update', { tags }) : Promise.resolve()}
       onCleanup={() => { if (selected) setCleaning(selected); setPosition(null) }}
@@ -195,14 +196,14 @@ export function MissionInteractionProvider({ missions, projects, agents, onChang
     {position && position.kind !== 'menu' && selected && <MissionPopover position={position} title={position.kind === 'tags' ? uiAttribute("编辑标签") : uiAttribute("使命队员")} onClose={() => setPosition(null)} className={position.kind === 'tags' ? 'mission-label-popover' : 'mission-members-popover'}>
       {position.kind === 'tags' ? <LabelsEditor key={selected.missionId} m={selected} catalog={catalog} onSave={tags => change(selected, 'update', { tags })}/> : <MissionRoster m={selected}/>}
     </MissionPopover>}
-    {editing && <MissionEdit key={editing.missionId} mission={editing} projects={projects} agents={agents} catalog={catalog} onClose={() => setEditing(null)} onSaved={() => onChanged(editing.campId)} onSave={patch => change(editing, 'update', patch)}/>}
+    {editing && <MissionEdit key={editing.missionId} mission={editing} projects={projects} agents={agents} catalog={catalog} onClose={() => setEditing(null)} onSaved={() => onChanged(editing.threadId)} onSave={patch => change(editing, 'update', patch)}/>}
     {cleaning && (
       <MissionWorkspaceCleanup key={cleaning.missionId} mission={cleaning} onClose={() => setCleaning(null)} onRequested={async () => { await cleanup(cleaning); setCleaning(null) }}/>
     )}
     {deleting && <MissionDelete key={deleting.missionId} mission={deleting} onClose={() => setDeleting(null)} onDelete={async workspaceDisposition => {
-      const snapshot = await openMissionCamp(client, deleting.campId)
-      await missionCommand(client, 'camps.delete', { campId: deleting.campId, expectedVersion: snapshot.camp.version, force: true, workspaceDisposition })
-      await onDeleted(deleting.campId); setDeleting(null)
+      const snapshot = await openMissionThread(client, deleting.threadId)
+      await missionCommand(client, 'threads.delete', { threadId: deleting.threadId, expectedVersion: snapshot.thread.version, force: true, workspaceDisposition })
+      await onDeleted(deleting.threadId); setDeleting(null)
     }}/>}
   </Actions.Provider></MissionPeopleProvider>
 }
@@ -216,7 +217,7 @@ function MissionEdit({ mission, projects, agents, catalog, onSave, onSaved, onCl
   onSaved(): Promise<void>
   onClose(): void
 }) {
-  const client = useCampClient()
+  const client = useThreadClient()
   const [baseline, setBaseline] = useState({ title: mission.title, description: mission.description, tags: mission.tags, attachments: mission.attachments ?? [], version: mission.detailsVersion })
   const [title, setTitle] = useState(mission.title)
   const [description, setDescription] = useState(mission.description)
@@ -286,7 +287,7 @@ function MissionEdit({ mission, projects, agents, catalog, onSave, onSaved, onCl
         <Dialog.Description id="mission-edit-description" className="sr-only"><UiText zh={"编辑使命名称、描述、标签和附件。项目、队员与队长在创建后不可更改。"} /></Dialog.Description>
         <form className="compact-form" onSubmit={event => { event.preventDefault(); void save() }}>
           <div className="compact-body mission-editor-body">
-            <MissionWritingPlane ref={editorRef} titleInputRef={titleInputRef} title={title} description={description} attachments={attachments} disabled={busy} attachmentsDisabled={!client.missionAttachments} titleError={titleError || undefined} descriptionError={descriptionError || undefined} mission={{campId: mission.campId, missionId: mission.missionId}} onTitleChange={setTitle} onDescriptionChange={setDescription} onAttachmentsChange={setAttachments} onNotify={setError}/>
+            <MissionWritingPlane ref={editorRef} titleInputRef={titleInputRef} title={title} description={description} attachments={attachments} disabled={busy} attachmentsDisabled={!client.missionAttachments} titleError={titleError || undefined} descriptionError={descriptionError || undefined} mission={{threadId: mission.threadId, missionId: mission.missionId}} onTitleChange={setTitle} onDescriptionChange={setDescription} onAttachmentsChange={setAttachments} onNotify={setError}/>
             <div className="mission-editor-properties" aria-label={uiAttribute("使命属性")}>
               <MissionPropertyChip icon={<ProjectGlyph/>} locked className="mission-editor-project-property" title={uiAttribute("编辑使命时不能更改项目")} aria-label={uiAttribute("项目：{0}，编辑使命时不能更改", String(missionProject(mission, projects)))}>{missionProject(mission, projects)}</MissionPropertyChip>
               <MissionPropertyChip icon={<TeamGlyph/>} locked className="mission-editor-team-property mission-editor-team-locked" title={uiAttribute("编辑使命时不能更改队员或队长")} aria-label={uiAttribute("队员与队长：{0} 位队员，{1}，编辑使命时不能更改", String(members.length), String(lead ? uiAttribute("队长 {0}", String(lead.displayName)) : uiAttribute("未设置队长")))}>
@@ -303,7 +304,7 @@ function MissionEdit({ mission, projects, agents, catalog, onSave, onSaved, onCl
   </Dialog.Root>
 }
 function MissionWorkspaceCleanup({ mission, onRequested, onClose }: { mission: MissionRecord; onRequested(): Promise<void>; onClose(): void }) {
-  const client = useCampClient(), [delivery, setDelivery] = useState<MissionDelivery | null>(null), [retry, setRetry] = useState(0), [busy, setBusy] = useState(false), [error, setError] = useState('')
+  const client = useThreadClient(), [delivery, setDelivery] = useState<MissionDelivery | null>(null), [retry, setRetry] = useState(0), [busy, setBusy] = useState(false), [error, setError] = useState('')
   useEffect(() => { let current = true; setError(''); void client.request<MissionDelivery>('missions.delivery', { missionId: mission.missionId }).then(data => { if (current) setDelivery(data) }).catch(error => { if (current) setError(missionError(error)) }); return () => { current = false } }, [client, mission.missionId, retry])
   async function cleanup() {
     setBusy(true); setError('')
@@ -320,7 +321,7 @@ function MissionWorkspaceCleanup({ mission, onRequested, onClose }: { mission: M
 }
 
 function MissionDelete({ mission, onDelete, onClose }: { mission: MissionRecord; onDelete(workspaceDisposition: 'retain' | 'cleanup'): Promise<void>; onClose(): void }) {
-  const client = useCampClient(), [delivery, setDelivery] = useState<MissionDelivery | null>(null), [retry, setRetry] = useState(0), [busy, setBusy] = useState(false), [error, setError] = useState('')
+  const client = useThreadClient(), [delivery, setDelivery] = useState<MissionDelivery | null>(null), [retry, setRetry] = useState(0), [busy, setBusy] = useState(false), [error, setError] = useState('')
   const [cleanupWorkspace, setCleanupWorkspace] = useState(false)
   useEffect(() => { let current = true; setError(''); void client.request<MissionDelivery>('missions.delivery', { missionId: mission.missionId }).then(data => { if (current) setDelivery(data) }).catch(error => { if (current) setError(missionError(error)) }); return () => { current = false } }, [client, mission.missionId, retry])
   async function remove() { setBusy(true); setError(''); try { await onDelete(cleanupWorkspace ? 'cleanup' : 'retain') } catch (error) { setError(missionError(error)) } finally { setBusy(false) } }
@@ -335,6 +336,7 @@ export function MissionBoard({ missions, projects, loading, error, selectedId, h
   missions: MissionRecord[]; projects: ProjectNavigationGroup[]; loading: boolean; error: string | null; selectedId?: string; hidden?: boolean; onRefresh(): Promise<void>; onNew(): void; onOpen(m: MissionRecord): void; onOpenMenu?(trigger: HTMLButtonElement): void; menuOpen?: boolean; menuTriggerRef?: Ref<HTMLButtonElement>
 }) {
   const actions = useMissionActions()
+  const statuses = useMissionStatuses()
   const mobile = useMobileLayout()
   const [searchOpen, setSearchOpen] = useState(false)
   const mobileOffsets = useRef<Partial<Record<MissionStatus, number>>>({})
@@ -500,7 +502,7 @@ export function MissionBoard({ missions, projects, loading, error, selectedId, h
       {mobile && <button type="button" className="mobile-context-trigger" aria-label={uiAttribute("{0}的操作", String(m.title))} onClick={event => actions.menu(m, event)}><UiText zh={"操作"} /></button>}
       <button className="mission-card-open" onClick={() => onOpen(m)}><h3>{m.title}</h3></button>
       <div className="mission-project-tags"><span className="mission-card-project" title={displayProjectPath(m.projectPath)}><NavigationIcon name="folder-open"/>{missionProject(m, projects)}</span><MissionTags tags={m.tags}/></div>
-      <div className="mission-card-footer"><MissionAvatars m={m} compact onClick={e => actions.roster(m, e)}/>{m.hasUnread && <span className="mission-unread-message" role="img" aria-label={uiAttribute("有未读回复")} title={uiAttribute("有未读回复；与执行状态独立")}><span className="mission-unread-dot" aria-hidden="true"/><span aria-hidden="true"><UiText zh={"未读"} /></span></span>}<time dateTime={m.updatedAt} title={new Date(m.updatedAt).toLocaleString()}>{missionDate(m.updatedAt)}</time></div>
+      <div className="mission-card-footer"><MissionAvatars m={m} compact onClick={e => actions.roster(m, e)}/>{m.hasUnread && <span className="mission-unread-message" role="img" aria-label={uiAttribute("有未读回复")} title={uiAttribute("有未读回复；与执行状态独立")}><span className="mission-unread-dot" aria-hidden="true"/><span aria-hidden="true"><UiText zh={"未读"} /></span></span>}<time dateTime={m.updatedAt} title={new Date(m.updatedAt).toLocaleString(getInterfaceLanguage() === 'en' ? 'en-US' : 'zh-CN')}>{missionDate(m.updatedAt)}</time></div>
       {cleanupFeedback && (
         <MissionCleanupCardStatus mission={m} state={cleanupFeedback} onOpen={() => onOpen(m)}/>
       )}
@@ -616,7 +618,7 @@ function MissionRunning({ mission, pageHidden }: { mission: MissionRecord; pageH
 
 /** Deleted-Mission cleanup recovery; retained workspaces never enter this route. */
 function MissionCleanupNotice() {
-  const client = useCampClient(), { notifyError } = useMissionActions(), [rows, setRows] = useState<MissionWorkspace[]>([]), [open, setOpen] = useState(false), [error, setError] = useState(''), [busy, setBusy] = useState<string | null>(null)
+  const client = useThreadClient(), { notifyError } = useMissionActions(), [rows, setRows] = useState<MissionWorkspace[]>([]), [open, setOpen] = useState(false), [error, setError] = useState(''), [busy, setBusy] = useState<string | null>(null)
   const previousStates = useRef<Map<string, MissionWorkspace['state']> | null>(null)
   useEffect(() => {
     let current = true, sequence = 0
@@ -660,6 +662,7 @@ function MissionCleanupNotice() {
 
 export function MissionIntro({ mission: m, projects }: { mission: MissionRecord; projects: ProjectNavigationGroup[] }) {
   const actions = useMissionActions(), [expanded, setExpanded] = useState(false), [canExpand, setCanExpand] = useState(false), [attachmentError, setAttachmentError] = useState('')
+  const statuses = useMissionStatuses()
   const description = useRef<HTMLParagraphElement>(null)
   const starting = actions.busyId === m.missionId
   useLayoutEffect(() => {
@@ -680,7 +683,7 @@ export function MissionIntro({ mission: m, projects }: { mission: MissionRecord;
       <h2>{m.title}</h2>{m.description && <p ref={description} className={`mission-description${expanded ? ' expanded' : ''}`}>{m.description}</p>}
       {canExpand && <button className="mission-description-toggle" aria-expanded={expanded} onClick={() => setExpanded(v => !v)}>{expanded ? uiAttribute("收起描述") : uiAttribute("展开描述")}<Icon name="chevron"/></button>}
       {!!m.attachments.length && <ComposerAttachmentStrip ariaLabel={uiAttribute("使命附件，使用左右方向键浏览")}>
-        {m.attachments.map(attachment => <AttachmentCard key={attachment.id} attachment={attachment} locator={{owner:'mission', campId:m.campId, missionId:m.missionId, attachmentRefId:attachment.id}} presentation="composer" onNotify={setAttachmentError}/>) }
+        {m.attachments.map(attachment => <AttachmentCard key={attachment.id} attachment={attachment} locator={{owner:'mission', threadId:m.threadId, missionId:m.missionId, attachmentRefId:attachment.id}} presentation="composer" onNotify={setAttachmentError}/>) }
       </ComposerAttachmentStrip>}
       {attachmentError && <p className="compact-inline-error mission-intro-attachment-error" role="alert">{attachmentError}</p>}
       <div className="mission-project-tags"><span className="mission-card-project" title={displayProjectPath(m.projectPath)}><NavigationIcon name="folder-open"/>{missionProject(m, projects)}</span><MissionTags tags={m.tags}/></div>

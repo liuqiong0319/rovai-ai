@@ -202,6 +202,9 @@ impl ExecutionEvidenceService {
                 | "agent.reasoning.summary.block"
                 | "agent.thought.delta"
                 | "agent.thought.block"
+                | "agent.thought.started"
+                | "agent.thought.completed"
+                | "agent.thinking.title"
                 | "agent.text.delta"
                 | "agent.text.completed"
                 | "agent.text.boundary"
@@ -2468,7 +2471,13 @@ fn normalize_public_payload(event_type: &str, payload: &Value) -> Value {
                 .get("observedServiceTier")
                 .and_then(Value::as_str)
                 .filter(|tier| matches!(*tier, "priority" | "fast" | "default" | "standard"));
-            serde_json::json!({ "state": state, "observedServiceTier": tier })
+            let disabled_reason = payload
+                .get("disabledReason")
+                .and_then(Value::as_str)
+                .and_then(|reason| {
+                    crate::runtime_failure::sanitize_public_runtime_error(reason, &[])
+                });
+            serde_json::json!({ "state": state, "observedServiceTier": tier, "disabledReason": disabled_reason })
         }
         RUNTIME_COMPACTION_DISPLAY_EVENT => serde_json::json!({
             "schemaVersion": payload.get("schemaVersion"),
@@ -3358,8 +3367,8 @@ mod tests {
     use crate::test_support::absolute_test_path;
     use crate::{
         collaboration::{
-            AddCampMemberCommand, CollaborationService, CreateCampCommand, ExecutionRequest,
-            TestCampMessageAddress, TestCampMessageCommand,
+            AddThreadMemberCommand, CollaborationService, CreateThreadCommand, ExecutionRequest,
+            TestThreadMessageAddress, TestThreadMessageCommand,
         },
         command::{ActorRef, CommandEnvelope},
         context::{
@@ -4793,11 +4802,14 @@ mod tests {
                     camp_id: None,
                     expected_versions: Vec::new(),
                     execution_epoch: None,
-                    payload: CreateCampCommand::for_test(workspace.display().to_string()),
+                    payload: CreateThreadCommand::for_test(workspace.display().to_string()),
                 },
             )
             .unwrap();
-        let camp_id = camp.result.payload["campId"].as_str().unwrap().to_string();
+        let camp_id = camp.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_string();
         collaboration
             .add_camp_member(
                 &mut database,
@@ -4809,7 +4821,7 @@ mod tests {
                     camp_id: Some(camp_id.clone()),
                     expected_versions: Vec::new(),
                     execution_epoch: None,
-                    payload: AddCampMemberCommand {
+                    payload: AddThreadMemberCommand {
                         camp_id: camp_id.clone(),
                         agent_id: "agent_2".to_string(),
                         expected_membership_generation: 1,
@@ -4830,12 +4842,12 @@ mod tests {
                     camp_id: Some(camp_id.clone()),
                     expected_versions: Vec::new(),
                     execution_epoch: None,
-                    payload: TestCampMessageCommand {
+                    payload: TestThreadMessageCommand {
                         camp_id: camp_id.clone(),
                         draft_revision: None,
                         body: "Run with private execution evidence".to_string(),
                         prepared_attachment_ids: Vec::new(),
-                        address: TestCampMessageAddress::Explicit {
+                        address: TestThreadMessageAddress::Explicit {
                             agent_ids: vec!["agent_2".to_string()],
                         },
                         reply_to_camp_message_id: None,
@@ -5179,6 +5191,7 @@ mod tests {
                     &json!({
                         "state": state,
                         "observedServiceTier": tier,
+                        "disabledReason": "native reason; api_key=private-secret",
                         "rawDetail": "private-token",
                     }),
                 )
@@ -5188,10 +5201,24 @@ mod tests {
             assert_eq!(observed.execution_epoch, execution_epoch);
             assert_eq!(observed.payload["state"], state);
             assert_eq!(observed.payload["observedServiceTier"], expected_tier);
+            assert_eq!(
+                observed.payload["disabledReason"],
+                "native reason; api_key=[redacted]"
+            );
             assert!(observed.payload.get("rawDetail").is_none());
             assert!(
                 observed.canonical.is_none(),
                 "Fast metadata is not a tool activity"
+            );
+            let window =
+                crate::execution_window::read_page(&mut database, &camp_id, &run_id, None, 1)
+                    .unwrap();
+            assert_eq!(window.evidence.len(), 1);
+            assert_eq!(window.evidence[0].id, observed.id);
+            assert_eq!(window.evidence[0].payload["state"], state);
+            assert_eq!(
+                window.evidence[0].payload["disabledReason"], "native reason; api_key=[redacted]",
+                "the logical execution window must expose the sanitized native feedback"
             );
         }
 
@@ -5512,7 +5539,7 @@ mod tests {
                     expected_versions: Vec::new(),
                     execution_epoch: None,
                     payload: CancelAgentRunCommand {
-                        camp_id,
+                        camp_id: camp_id.clone(),
                         agent_run_id: run_id.clone(),
                         expected_version: run_version,
                     },
@@ -5780,6 +5807,59 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+
+        // Historical collection results retain their original bytes and receipt. Current
+        // CLI responses still require addressing; reading stored Evidence is a separate path.
+        for (mode, body_size) in [
+            ("timeline", 10),
+            ("reply_chain", INLINE_PAYLOAD_LIMIT_BYTES),
+        ] {
+            let mut result = json!({
+                "threadId": camp_id, "mode": mode, "direction": "before",
+                "items": [{"messageId":"old-message", "sequence":1,
+                    "authorType":"user", "authorId":"local_user", "anchorMessageId":null,
+                    "createdAt":"2026-09-01T00:00:00Z", "body":"旧".repeat(body_size),
+                    "attachmentCount":0}], "hasMore":false, "nextCursor":null
+            });
+            if mode == "reply_chain" {
+                result["anchorMessageId"] = json!("old-message");
+                result["replyChainRootMessageId"] = json!("old-message");
+            }
+            let envelope = BuiltinToolInvocationEnvelope::success(
+                "thread.read",
+                "7b5db24c-4a43-4cab-9217-d982b08f7691",
+                result,
+            )
+            .unwrap();
+            assert!(project_envelope(envelope.clone()).is_err());
+            let historical = serde_json::to_value(envelope).unwrap();
+            let bytes = serde_json::to_vec(&historical).unwrap();
+            let digest = crate::command::canonical_json_digest(&historical).unwrap();
+            let stored =
+                prepare_lifecycle_part(&mut database, &blob_store, &historical, false).unwrap();
+            if let Some(blob_id) = &stored.blob_id {
+                assert_eq!(blob_store.read_bytes(&database, blob_id).unwrap(), bytes);
+            }
+            let loaded = load_lifecycle_part(
+                &database,
+                &blob_store,
+                stored.preview_json,
+                stored.blob_id,
+                stored.byte_count,
+                stored.state,
+            )
+            .unwrap()
+            .value;
+            assert_eq!(serde_json::to_vec(&loaded).unwrap(), bytes);
+            assert_eq!(
+                crate::command::canonical_json_digest(&loaded).unwrap(),
+                digest
+            );
+            serde_json::from_value::<BuiltinToolInvocationEnvelope>(loaded)
+                .unwrap()
+                .validate()
+                .unwrap();
+        }
 
         drop(database);
         std::fs::remove_dir_all(directory).unwrap();

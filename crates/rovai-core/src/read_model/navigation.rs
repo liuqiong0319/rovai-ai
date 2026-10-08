@@ -6,6 +6,7 @@ const VISIBLE: &str = r#"
     camp.deletion_operation_id IS NULL
     AND NOT EXISTS(SELECT 1 FROM mission WHERE mission.camp_id = camp.id)
     AND (camp.activation_state = 'active'
+      OR EXISTS(SELECT 1 FROM pending_camp_draft_presence d WHERE d.camp_id = camp.id AND d.client_id = ?1)
       OR EXISTS(SELECT 1 FROM camp_composer_draft d WHERE d.camp_id = camp.id AND d.client_id = ?1
                 AND (length(trim(d.body)) > 0 OR d.source_attachments_json <> '[]'))
       OR EXISTS(SELECT 1 FROM prepared_attachment WHERE camp_id = camp.id AND client_id = ?1))
@@ -19,7 +20,7 @@ fn load_rows(
     selection: &str,
     offset: usize,
     limit: usize,
-) -> Result<Vec<NavigationCampItem>> {
+) -> Result<Vec<NavigationThreadItem>> {
     let sql = format!(
         r#"
         SELECT camp.id, camp.title, camp.project_binding_kind, camp.project_path,
@@ -52,7 +53,7 @@ fn load_rows(
             let completion: i64 = row.get(8)?;
             let seen: i64 = row.get(9)?;
             let loading: bool = row.get(10)?;
-            Ok(NavigationCampItem {
+            Ok(NavigationThreadItem {
                 id: row.get(0)?,
                 title: row.get(1)?,
                 channel_source: camp_channel_source_from_row(row, 13)?,
@@ -90,7 +91,7 @@ pub(super) fn load_navigation_rows(
     tx: &Transaction<'_>,
     client: &crate::draft_client::DraftClient,
     ids: &[String],
-) -> Result<Vec<NavigationCampItem>> {
+) -> Result<Vec<NavigationThreadItem>> {
     load_rows(
         tx,
         client,
@@ -119,7 +120,7 @@ pub(super) fn load_navigation_group(
     key: &str,
     offset: usize,
     limit: usize,
-) -> Result<Vec<NavigationCampItem>> {
+) -> Result<Vec<NavigationThreadItem>> {
     load_rows(tx, client, &format!("{GROUP_KEY} = ?2"), key, offset, limit)
 }
 
@@ -128,7 +129,7 @@ pub(super) fn load_navigation_groups(
     client: &crate::draft_client::DraftClient,
     limits: &BTreeMap<String, usize>,
     keys: Option<&[String]>,
-) -> Result<(NavigationCampGroup, Vec<ProjectNavigationGroup>)> {
+) -> Result<(NavigationThreadGroup, Vec<ProjectNavigationGroup>)> {
     // Only directory/count metadata spans the requested groups. Full Camp rows, run
     // markers and channel/lead details are read for each indexed prefix, never all rows.
     let filter = if keys.is_some() {
@@ -145,7 +146,7 @@ pub(super) fn load_navigation_groups(
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize)),
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut quick_chat = NavigationCampGroup {
+    let mut quick_chat = NavigationThreadGroup {
         total_count: 0,
         recent_camps: vec![],
     };
@@ -158,7 +159,7 @@ pub(super) fn load_navigation_groups(
             .max(NAVIGATION_RECENT_CAMP_LIMIT);
         let camps = load_navigation_group(tx, client, &key, 0, limit)?;
         if key == "quick-chat" {
-            quick_chat = NavigationCampGroup {
+            quick_chat = NavigationThreadGroup {
                 total_count,
                 recent_camps: camps,
             };

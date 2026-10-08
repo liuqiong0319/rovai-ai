@@ -1,9 +1,10 @@
+import { WindowCloseDialog } from './WindowCloseSettings'
 import { useEffect, useRef, useState } from 'react'
 import type { CoreEvent, DesktopStartupSnapshot, SupervisorSnapshot, AppearanceSnapshot } from '@contracts'
 import { CurrentUserProfileProvider } from './CurrentUserProfile'
 import { CoreSubsystemNotice } from './CoreSubsystemNotice'
-import { CampClientProvider } from './camp-client'
-import { desktopCampClient } from './desktop-camp-client'
+import { ThreadClientProvider } from './camp-client'
+import { desktopThreadClient } from './desktop-camp-client'
 import { desktopBusinessEnvironment } from './desktop-business-environment'
 import { initializeInterfaceLanguage, useInterfaceLanguage } from './interface-language'
 import { applyAppearanceSnapshot } from './theme'
@@ -146,13 +147,13 @@ export function App(): React.JSX.Element {
   } else {
     workspace = (
       <div className="authoritative-workspace">
-        <CampClientProvider client={desktopCampClient}><CurrentUserProfileProvider api={window.rovai.currentUserProfile}>
+        <ThreadClientProvider client={desktopThreadClient}><CurrentUserProfileProvider api={window.rovai.currentUserProfile}>
           <BusinessApp environment={desktopBusinessEnvironment}
             initialStartupSnapshot={startupSnapshot}
             startupStartedAtMs={startupStartedAt.current}
             startupFeedbackDelayElapsed={startupFeedbackDelayElapsed}
           />
-        </CurrentUserProfileProvider></CampClientProvider>
+        </CurrentUserProfileProvider></ThreadClientProvider>
         <CoreSubsystemNotice subsystems={presentationSupervisor?.coreSubsystems ?? []} />
       </div>
     )
@@ -161,6 +162,7 @@ export function App(): React.JSX.Element {
   return (
     <>
       {workspace}
+      {window.rovai.windowClose && <WindowCloseDialog api={window.rovai.windowClose} />}
       {shuttingDown && <ControlledShutdownOverlay visible={shutdownFeedbackVisible} />}
     </>
   )

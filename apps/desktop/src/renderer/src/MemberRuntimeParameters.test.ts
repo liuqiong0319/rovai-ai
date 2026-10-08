@@ -13,9 +13,12 @@ import {
   MemberRuntimeParameters,
   draftFromDefaults,
   displayableInstallationModels,
+  explicitSelection,
   liveCatalogIsAtLeastAsRecent,
+  modelCatalogCanValidateOptions,
   modelCatalogStatusCopy,
   runtimeDraftForMember,
+  runtimeModelSelectionAvailable,
   runtimeEditorInstallation
 } from './MemberRuntimeParameters'
 
@@ -74,6 +77,55 @@ describe('runtime model catalog source', () => {
     expect(liveCatalogIsAtLeastAsRecent(unavailable, cached.cache)).toBe(false)
     expect(liveCatalogIsAtLeastAsRecent(refreshed, unavailableCache)).toBe(true)
     expect(liveCatalogIsAtLeastAsRecent(unavailable, unavailableCache)).toBe(true)
+  })
+
+  it('does not let a local status validate an observation Core has expired', () => {
+    const expiredCache = { ...cached.cache, status: 'expired' as const }
+    expect(liveCatalogIsAtLeastAsRecent(cached, expiredCache)).toBe(true)
+    expect(modelCatalogCanValidateOptions(expiredCache, cached)).toBe(false)
+    expect(modelCatalogCanValidateOptions(expiredCache, { ...cached, cache: { ...cached.cache, status: 'fresh' } })).toBe(false)
+    expect(modelCatalogCanValidateOptions(expiredCache, refreshed)).toBe(true)
+    expect(modelCatalogCanValidateOptions(cached.cache, refreshed)).toBe(true)
+    expect(modelCatalogCanValidateOptions(refreshed.cache, cached)).toBe(true)
+  })
+})
+
+describe('explicit model changes', () => {
+  const installation = runtimeInstallation('codex-cli')
+  const model = {
+    ...installation.snapshot!.models[0],
+    id: 'runtime/next',
+    options: [{
+      ...installation.snapshot!.models[0].options[0],
+      values: [{ value: 'low', label: 'Low' }, { value: 'high', label: 'High' }],
+      defaultValue: 'low'
+    }]
+  }
+
+  it('carries only explicit key and value pairs supported by the new model', () => {
+    expect(explicitSelection(model, {
+      mode: 'explicit', modelId: 'runtime/model', options: { reasoning_effort: 'high' }
+    }, true)).toEqual({ mode: 'explicit', modelId: 'runtime/next', options: { reasoning_effort: 'high' } })
+    expect(explicitSelection(model, {
+      mode: 'explicit', modelId: 'runtime/model', options: { reasoning_effort: 'xhigh' }
+    }, true)).toEqual({ mode: 'explicit', modelId: 'runtime/next', options: {} })
+    expect(explicitSelection({ ...model, options: [] }, {
+      mode: 'explicit', modelId: 'runtime/model', options: { reasoning_effort: 'high' }
+    }, true)).toEqual({ mode: 'explicit', modelId: 'runtime/next', options: {} })
+    expect(explicitSelection(model, {
+      mode: 'explicit', modelId: 'runtime/model', options: { effort: 'high' }
+    }, true)).toEqual({ mode: 'explicit', modelId: 'runtime/next', options: {} })
+    expect(explicitSelection(model, { mode: 'runtime_default' }, true)).toEqual({
+      mode: 'explicit', modelId: 'runtime/next', options: {}
+    })
+  })
+
+  it('retains an explicit value while an expired historical catalog cannot verify the new model', () => {
+    expect(explicitSelection({ ...model, options: [] }, {
+      mode: 'explicit', modelId: 'runtime/model', options: { reasoning_effort: 'high' }
+    }, false)).toEqual({
+      mode: 'explicit', modelId: 'runtime/next', options: { reasoning_effort: 'high' }
+    })
   })
 })
 
@@ -195,22 +247,28 @@ describe('member runtime parameters', () => {
       revalidateAfter: null,
       expiresAt: null
     }
+    const saved = {
+      mode: 'explicit' as const,
+      modelId: 'claude-opus-5',
+      options: { effort: 'future-level' }
+    }
+    const draft = draftFromDefaults({
+      ...installation.memberRuntimeDefaults!, model: saved
+    })
+    expect(draft.model).toEqual(saved)
+    expect(runtimeModelSelectionAvailable(installation, draft.model)).toBe(true)
+    expect(runtimeModelSelectionAvailable(installation, { mode: 'runtime_default' })).toBe(true)
     const markup = renderToStaticMarkup(createElement(MemberRuntimeParameters, {
       adapterKind,
       installation,
-      draft: {
-        model: {
-          mode: 'explicit',
-          modelId: 'claude-opus-5',
-          options: {}
-        },
-        permissions: installation.memberRuntimeDefaults!.permissions
-      },
+      draft,
       disabled: false,
       onChange: () => undefined
     }))
 
     expect(markup).toContain('模型，claude-opus-5')
+    if (adapterKind === 'claude-code-cli') expect(markup).toContain('future-level')
+    expect(draft.model).toEqual(saved)
     expect(markup).not.toContain('已失效')
   })
 
@@ -266,7 +324,7 @@ describe('member runtime parameters', () => {
     }))
 
     expect(markup).toContain(label)
-    expect(markup).toContain(`aria-label="${label}，${value}"`)
+    expect(markup).toContain(`aria-label="${label}，${value}，推荐"`)
   })
 
   it('does not present an approval mode for native Pi tool execution', () => {

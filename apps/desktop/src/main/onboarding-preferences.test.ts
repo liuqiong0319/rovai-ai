@@ -52,14 +52,18 @@ describe('onboarding preferences', () => {
     const store = await OnboardingStore.load(filePath)
     const completed = await store.initialize(true)
     expect(completed).toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: 3,
       status: 'completed',
       origin: 'existing_installation',
       selectedMemberRole: null,
       memberAgentId: null,
-      quickChatCampId: null
+      quickChatThreadId: null
     })
     expect(await store.initialize(false)).toEqual(completed)
+    const legacy = { ...completed, quickChatCampId: null } as Record<string, unknown>
+    delete legacy.quickChatThreadId
+    expect(parseOnboardingSnapshot(legacy)).toEqual(completed)
+    expect(parseOnboardingSnapshot({ ...legacy, quickChatThreadId: null })).toBeNull()
   })
 
   it('persists every required page and restores the Runtime draft', async () => {
@@ -153,7 +157,7 @@ describe('onboarding preferences', () => {
         memberAgentId: null,
         memberVersionBeforeRuntime: null,
         memberVersionAfterRuntime: null,
-        quickChatCampId: null
+        quickChatThreadId: null
       }
     })
     const replay = await store.beginProvisioning({
@@ -164,14 +168,18 @@ describe('onboarding preferences', () => {
 
     await store.recordProvisionedMember('agent-1', 1)
     await store.recordProvisionedRuntime(2)
-    await store.recordProvisionedCamp(CAMP_ID)
+    await store.prepareRuntimeCopies([])
+    await store.recordProvisionedThread(CAMP_ID)
+    const checkpoint = store.get()
+    const legacyCheckpoint = JSON.parse(JSON.stringify(checkpoint).replace('quickChatThreadId', 'quickChatCampId'))
+    expect(parseOnboardingSnapshot(legacyCheckpoint)).toEqual(checkpoint)
     const completed = await store.complete()
     expect(completed).toMatchObject({
       status: 'completed',
       origin: 'onboarding',
       selectedMemberRole: 'mianzhi',
       memberAgentId: 'agent-1',
-      quickChatCampId: CAMP_ID
+      quickChatThreadId: CAMP_ID
     })
     if (process.platform !== 'win32') {
       expect((await stat(filePath)).mode & 0o777).toBe(0o600)
@@ -189,12 +197,12 @@ describe('onboarding preferences', () => {
 
     const completed = await store.deferRuntimeSetup()
     expect(completed).toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: 3,
       status: 'completed',
       origin: 'runtime_deferred',
       selectedMemberRole: null,
       memberAgentId: null,
-      quickChatCampId: null
+      quickChatThreadId: null
     })
     expect(JSON.parse(await readFile(filePath, 'utf8'))).toEqual(completed)
 
@@ -262,26 +270,26 @@ describe('onboarding preferences', () => {
       provisioning: null
     })).toBeNull()
     expect(parseOnboardingSnapshot({
-      schemaVersion: 2,
+      schemaVersion: 3,
       status: 'completed',
       origin: 'onboarding',
       completedAt: 'not-a-date',
       selectedMemberRole: 'luoke',
       memberAgentId: 'agent-1',
-      quickChatCampId: 'camp-1'
+      quickChatThreadId: 'camp-1'
     })).toBeNull()
     expect(parseOnboardingSnapshot({
-      schemaVersion: 2,
+      schemaVersion: 3,
       status: 'completed',
       origin: 'runtime_deferred',
       completedAt: '2026-08-23T00:00:00.000Z',
       selectedMemberRole: 'luoke',
       memberAgentId: null,
-      quickChatCampId: null
+      quickChatThreadId: null
     })).toBeNull()
   })
 
-  it('normalizes valid schema v1 snapshots to schema v2', () => {
+  it('normalizes valid schema v1 snapshots to schema v3', () => {
     expect(parseOnboardingSnapshot({
       schemaVersion: 1,
       status: 'completed',
@@ -289,15 +297,15 @@ describe('onboarding preferences', () => {
       completedAt: '2026-08-23T00:00:00.000Z',
       selectedMemberRole: null,
       memberAgentId: null,
-      quickChatCampId: null
+      quickChatThreadId: null
     })).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 3,
       status: 'completed',
       origin: 'existing_installation',
       completedAt: '2026-08-23T00:00:00.000Z',
       selectedMemberRole: null,
       memberAgentId: null,
-      quickChatCampId: null
+      quickChatThreadId: null
     })
   })
 })

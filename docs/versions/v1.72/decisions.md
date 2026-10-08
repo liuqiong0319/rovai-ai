@@ -3,10 +3,38 @@ document_type: version-decisions
 version: v1.72
 authority: decision-rationale
 lifecycle: current
-last_updated: 2026-09-28
+last_updated: 2026-10-05
 ---
 
 # v1.72 版本决定
+
+<a id="v1-72-d06"></a>
+## V1.72-D06：Claude Code 打印模式通过原生双向控制协议接入审批
+
+- 状态：accepted
+- 日期：2026-09-30
+- 当前权威：[Runtime Launch and Verification v48](../../contracts/runtime-launch-and-verification-v48.md) 与 [Built-in Tool Runtime](../../architecture/builtin-tool-runtime.md#claude-code-权限审批回调)
+
+### 背景
+
+打印模式缺少审批宿主时，原生权限规则要求询问的调用会被拒绝。Rovai 应当展示 Claude 发出的
+真实权限请求，并把用户决定回填。此前 PR 的 command Hook 需要按完整输入匹配工具身份，
+重复或并发调用存在歧义，累计观察缓存又使后续工具失去关联机会。
+
+### 选择
+
+保留打印模式和结构化输出，采用 stream-json 输入、stdio permission prompt 和原生控制消息。
+原生 request_id 回复审批，tool_use_id 结算工具结果，进程所有权绑定 Run/epoch/Session。
+初始化成功才发送任务；审批等待与持续读流独立，stdin 统一串行写入。结束由原生会话状态、
+结果与待处理请求共同判断，带有界异常清理。Action/Approval、用户选项和 Dock 复用现有实现。
+
+### 后果与替代方案
+
+删除本 PR 注入的审批 command Hook、专用 IPC、完整工具输入匹配和累计缓存。仅保留待处理
+控制请求；用户 Hook、Fast settings 与业务 `rovai send` lease 不受该替换影响。
+原生 allow/ask/deny 配置保持冻结，不为修复审批增加 bypass 或全局 allow。
+未采用非打印模式，因为它需要终端交互与输出协议改造；未保留 Hook 回退，因为第二条审批入口
+会重新引入身份歧义。缺少可靠原生工具 ID 的版本明确拒绝并报告不兼容。
 
 <a id="v1-72-d01"></a>
 ## V1.72-D01：Lark 作为独立 provider，克隆表族并参数化飞书实现
@@ -146,3 +174,184 @@ Principal 希望在公开 Camp 正文中直接 `@` 队外成员，同时保留�
 队员仍在 Camp，重试需按最新名册重新判定。未采用扩展 Core 发送命令并在一笔事务中写入成员关系与消息：
 这会改变现有发送、成员权限和幂等合同，超出本次交互目标。Pending Camp 首条输入没有先加成员的命令资格，
 继续使用原激活路径。
+
+<a id="v1-72-d07"></a>
+## V1.72-D07：Thread 是公开命名，兼容入口与冻结 Session 身份保持
+
+- 状态：accepted
+- 日期：2026-10-01
+- 当前权威：[Thread Naming v1](../../contracts/thread-naming-v1.md)、[ContextManifest v32](../../contracts/context-manifest-evidence-v32.md)、[Built-in Tool Transport v33](../../contracts/builtin-tool-transport-v33.md)
+
+### 背景与选择
+
+用户要求用简短标准名称替换 Camp，同时旧会话可 resume，新会话使用新 Bootstrap，升级即可获得新版 Skill。采用 Thread／threadId；reply chain 单独命名；内部 Conversation 保持私有。兼容入口只归一化已知别名，幂等身份保留旧表示；Bootstrap 按 Binding 使用已有冻结证据，Skill 复用现有原路径同步。
+
+### 后果与替代方案
+
+不采用 Conversation 作为公开名称，不重命名 SQL 或路径、不重写旧上下文，不以换 Session 规避兼容。上下文与工具新版本单独留证，旧版严格恢复。Migration 178 仅扩展新格式准入，保留失败回滚。完整前后对照及升级矩阵见[确认稿 r2](model-context-change-thread-rename.md)。
+
+<a id="v1-72-d08"></a>
+## V1.72-D08：User 为主称呼，旧 Session 继续读取冻结 Bootstrap
+
+- 状态：accepted
+- 日期：2026-10-02
+- 当前权威：[User Naming v1](../../contracts/user-naming-v1.md)、[Built-in Tool Transport v34](../../contracts/builtin-tool-transport-v34.md)
+
+### 背景与选择
+
+Principal 对普通用户不直观，且现有指令同时用 User 和 Principal 指人类。用户确认 r2，要求简洁并保持旧会话可 resume。
+使用 User、`--to-user` 与 `@User`，旧写法进入相同身份处理。公开 Bootstrap 生成收敛为一个模板，已有冻结证据优先；
+新旧动态投影用已有 audience 与 A2A schema 区分。Skill 沿用安装包原路径同步。
+
+### 后果与替代方案
+
+不以轮换 Session 或重写旧摘要解决命名差异，也不增加兼容管理层、远程 Skill 服务或每轮迁移说明。
+相比保留两份公开模板，统一生成减少重复指令，同时允许既有准入下未生成 Bootstrap 的旧执行继续恢复。
+已有会话可能同时看到旧 Bootstrap 与新 Skill，旧别名确保仍可执行；具体证据与验证见[确认稿 r2](model-context-change-principal-user.md)。
+
+<a id="v1-72-d09"></a>
+## V1.72-D09：AI 创建队员使用普通草稿会话与独立静态入队回执
+
+- 状态：accepted
+- 日期：2026-10-02
+- 当前权威：[Member Creation Flow v1](../../contracts/member-creation-flow-v1.md)、[Pending Camp Activation v3](../../contracts/pending-camp-activation-v3.md)、[Camp Open Projection v25](../../contracts/camp-open-projection-v25.md)、[Camp Activation](../../architecture/camp-activation-lifecycle.md#ai-队员创建)
+
+### 背景与选择
+
+Principal 要求 AI 成为默认入口，同时保持标准会话和已有队员设置。成功卡片只确认曾经创建，不承担当前配置状态。
+创建回执与 Profile 使用同一事务、独立业务表和创建时快照；最近协助者偏好只在首次成功时更新。输入前不显示侧栏，
+输入后由窗口内 map 保存草稿，首条发送仍走普通激活事务。
+
+### 后果与替代方案
+
+不采用工具日志重放生成卡片，避免普通 Open 扫描 Evidence；不另发系统消息，避免改变公屏和模型输入。
+不持久化新草稿或在卡片订阅 Profile，接受刷新丢失草稿、历史卡片不反映当前状态的边界。资料删除与离队交给目标页。
+新增 Migration 180 与 schema 130；历史创建不补卡。
+
+<a id="v1-72-d10"></a>
+## V1.72-D10：Run 主线按完整内容块分页，展开组独立读取
+
+- 状态：accepted
+- 日期：2026-10-02
+- 当前权威：[Run Process Detail Surface v43](../../contracts/run-process-detail-surface-v43.md)、[Camp Open Read Path](../../architecture/camp-open-read-path.md#run-主线与展开组读取)与[会话工作区](../../ui/components/conversation-workspace.md)
+
+### 背景与选择
+
+用户观察到少量可见内容已经分页，且必须点击才能继续。原窗口按逻辑操作分页后再折叠，长 command 组占满页数，
+短摘要却不产生可滚动区域。采用读取时计算内容块与完整组摘要，主线和展开组各有游标；首次不足视口时有界补读。
+新选择器沿用既有请求与权限，旧 schema 2 读取保留。
+
+### 后果与替代方案
+
+不采用仅扩大原页大小：大组依然可能填满一页并增加传输；不建立持久化分组表：它需要维护实时补齐、版本化展示
+分类及历史回填。读取时薄索引保留全 Run 元数据扫描和有序候选索引，换取无需迁移和有界传输。组身份沿稳定首 sequence，
+旧子项变化用独立 changeSequence 更新，避免把 UI 分组变成新的执行事实或嵌套滚动层。
+
+<a id="v1-72-d11"></a>
+## V1.72-D11：一键草稿的内容本机保存，Core 只保留客户端存在标记
+
+- 状态：accepted
+- 日期：2026-10-03
+- 当前权威：[Pending Camp Activation v4](../../contracts/pending-camp-activation-v4.md)、[Composer Draft v16](../../contracts/camp-composer-draft-v16.md)、[Camp Activation](../../architecture/camp-activation-lifecycle.md)
+
+### 背景与选择
+
+User 要求恢复一键新对话在消息模型重构前的草稿行为，并明确撤回“每项目一份”的限制。现有 Active Composer
+已经按 Thread 本机保存；单独恢复 Pending 本机内容仍会被 Core 启动清理删掉身份，也无法列入导航。因此沿用本机
+内容权威，只新增经 Host 认证的客户端 presence，让 Core 拥有导航和保留判断；每次新建保持独立身份。
+
+### 后果与替代方案
+
+新增小型表和事务内激活清理，需要一次加性迁移。保存要先写本机再确认 presence，失败保留编辑并阻止离开；
+跨客户端只能隔离导航，不提供内容同步或冲突合并。拒绝重建旧 Core Draft、revision 和编辑租约体系：它会逆转
+已完成的公开消息边界重构并引入不必要的多客户端协调。仅保留 Renderer map 也无法满足刷新和重启恢复。
+AI 创建队员的专项窗口内生命周期继续由 D09 对应合同约束。
+
+<a id="v1-72-d12"></a>
+## V1.72-D12：安装发现与真实启动验证解耦
+
+- 状态：accepted
+- 日期：2026-10-05
+- 当前权威：[Runtime Launch v48](../../contracts/runtime-launch-and-verification-v48.md)、[Runtime 边界](../../architecture/runtime-catalog-boundaries.md)、[Camp Member Fast v2](../../contracts/camp-member-fast-v2.md)
+
+### 背景
+
+版本展示和历史探测状态进入配置冻结、队列及派发门禁，CLI 实际可启动时也可能等待手动检测。
+独立 Probe 成功并不能保证下一进程可执行，却增加冷启动成本和两个状态来源。
+
+### 选择
+
+发现只保存安装入口及安全身份；协议、模型与权限在实际执行 Host 的正文屏障内验证。
+保留 Adapter 无法在正文前握手时的最小特例及主动诊断，不以历史健康结果授权运行。
+
+### 后果与替代方案
+
+保留现有字段和快照便于诊断，无 schema 迁移；旧 Ready 不再是调度通行证。
+取消必须覆盖初始化等待，配置失败也须产生可见 Run，模型选择延迟到真实 Host 确认。
+未选择 LKG、额外健康快照、重试调度或后台轮询，因为它们保留双重准入并增加状态复杂度；
+也不直接删除门禁后发送正文，实际初始化验证必须先于输入。
+
+
+<a id="v1-72-d13"></a>
+## V1.72-D13：Fast 偏好直接交给真实 Runtime
+
+- 状态：accepted
+- 日期：2026-10-06
+- 当前权威：[Camp Member Fast v3](../../contracts/camp-member-fast-v3.md)、[Runtime 边界](../../architecture/runtime-catalog-boundaries.md#camp-队员-fast-边界)
+
+### 背景与选择
+
+可选速度偏好依赖资格预测，增加子进程并可能把明确关闭值丢弃、意外继承原生 Fast 默认。
+沿用现有三态存储、绑定代次及冻结，删除资格授权；关闭语义由支持路径的明确参数和开发回归保证，
+不以每次运行观察确认或历史成功为条件。真实反馈只描述当前 Run，不反写偏好。
+
+### 后果与替代方案
+
+旧资格列无需立即迁移；不可靠的原生默认保持未知，部分 Runtime 会拒绝或忽略可选设置。
+明确拒绝按原错误处理，不做兼容重启或重放。未选择恢复自动资格检查、扩展能力缓存或维护旧版参数回退，
+因为它们继续混淆用户意图与实际生效，并可能扩大费用范围或污染后续 Turn。
+
+<a id="v1-72-d14"></a>
+## V1.72-D14：连接编辑以原生来源为权威，不另建 Key 副本
+
+- 状态：superseded
+- 日期：2026-10-04
+- 后续撤销：User 于 2026-10-07 取消连接编辑；原生配置不改写，执行只读兼容与脱敏保留。
+- 当前权威：[Runtime Launch v52](../../contracts/runtime-launch-and-verification-v52.md)、[Runtime Catalog](../../architecture/runtime-catalog-boundaries.md#claude-code-与-codex-原生配置)与[启动设置 UI](../../ui/components/app-shell-navigation.md#原生连接设置)
+
+### 背景与选择
+
+用户要求已经可用的 CLI 配置直接复用，并明确取消自动复制 Key 到 Rovai 私存。采用 Claude Code 与 Codex
+原生配置的字段编辑；连接方式独立记录，官方登录继续归 CLI 管理。配置身份参与既有执行兼容性判断，
+凭据只保留来源和摘要，不建立第二套有效连接或凭据同步体系。
+
+### 后果与替代方案
+
+编辑共享文件可能影响外部 CLI，必须在设置页说明；无法无损切换的原生版本／来源组合须明确报错。
+保留凭据副本可使旧快照更易重放，却会创造迁移、同步和清理责任，故拒绝该方案。复制整个 Home 会影响
+Skills、MCP 和会话，亦不采用。字段级合并及原生文件原子写入是必要边界，不扩成通用供应商平台。
+
+<a id="v1-72-d15"></a>
+## V1.72-D15：保存切换原生连接，撤回双路径保留与启动覆盖
+
+- 状态：superseded
+- 日期：2026-10-04
+- 后续撤销：User 于 2026-10-07 取消连接编辑；原生配置不改写，执行只读兼容与脱敏保留。
+- 当前权威：[Runtime Launch v52](../../contracts/runtime-launch-and-verification-v52.md)、[Runtime Catalog](../../architecture/runtime-catalog-boundaries.md#claude-code-与-codex-原生配置)与[启动设置 UI](../../ui/components/app-shell-navigation.md#原生连接设置)
+
+### 背景与选择
+
+D14 的原生来源权威继续保留；用户进一步撤回“保存官方后仍须保留另一套 API”的承诺。选择只在用户保存时
+修改原生配置，未保存的完整表单与新 Key 仅留在编辑会话内。正常执行交给 CLI 自己读取连接和认证，不再持久化
+独立模式或启动时重建 provider、临时文件与认证屏蔽。已有队员参数、权限、协作及恢复兼容性继续沿用。
+原生托管存储可能保存 API Key，不能把不透明凭据直接当作官方账号。设置时复用原生账号类型读取，未知保持未知；观察与文件基线分离，保存不等待账号状态；
+首屏先返回本地字段，辅助来源／身份／版本读取放到独立的一次补充请求，结果不能覆盖编辑中的草稿。来源限制只约束受影响字段，不能清空整表；未知写入目标不因默认文件存在而被推定有效。
+来源位置缓存按实际入口与配置目录区分，普通环境变量不使其失效；明确换入口／目录后在同一编辑会话补充确认，按真实修改保留草稿，不恢复保存前的同步识别。
+明确保存官方选择时用原生 ChatGPT 登录方式字段排除 API 类型，而不解密、复制或删除钥匙串对象。
+这仍属于保存时编辑原生配置，不恢复执行时的额外认证判断；模型调用与登录刷新继续由 CLI 负责。
+
+### 后果与替代方案
+
+保存官方后，再用 API 可能需要重新填写，这换取了单一原生配置权威和更少的版本／认证兼容分支。OAuth 不删除，
+共享配置影响如实说明；无法写回的已知有效覆盖在保存时报告。拒绝继续保留两条路径及运行时覆盖，也不采用
+启动前写文件、退出后还原的方案，避免并发进程互相改变配置。前端保存前往返切换必须无损，失败保留全部草稿。

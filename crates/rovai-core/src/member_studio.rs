@@ -1,8 +1,8 @@
 use std::path::Path;
 
-use anyhow::Result;
-use rusqlite::{OptionalExtension, params};
-use serde::Deserialize;
+use anyhow::{Context, Result};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -19,7 +19,8 @@ use crate::{
         MemberAvatarImportError, MemberAvatarImportErrorKind, hash_selected_avatar,
         import_managed_member_avatar, remove_managed_member_avatar, validate_avatar_file,
     },
-    team_tool::AuthenticatedTeamToolRun,
+    runtime::resolve_agent_local_path,
+    team_tool::{AuthenticatedTeamToolRun, TeamToolService},
 };
 
 pub const MEMBER_CREATE_TOOL_NAME: &str = "member.create";
@@ -86,19 +87,19 @@ pub struct MemberCreateConfirmOutcome {
 }
 
 #[derive(Debug)]
-pub struct MemberCreateError {
+pub struct MemberOperationError {
     pub code: &'static str,
     pub message: &'static str,
     pub details: Option<Value>,
 }
 
-impl std::fmt::Display for MemberCreateError {
+impl std::fmt::Display for MemberOperationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}: {}", self.code, self.message)
     }
 }
 
-impl std::error::Error for MemberCreateError {}
+impl std::error::Error for MemberOperationError {}
 
 pub fn member_create_input_schema() -> Value {
     json!({
@@ -173,6 +174,32 @@ pub fn member_create_confirm_input_schema() -> Value {
     })
 }
 
+/// Called by Core after authenticating the Run, before create/update import.
+pub fn resolve_member_avatar_input(
+    database: &Database,
+    run: &AuthenticatedTeamToolRun,
+    operation: &str,
+    input: &mut Value,
+) -> Result<()> {
+    if !matches!(
+        operation,
+        MEMBER_CREATE_TOOL_NAME | crate::member_tool::MEMBER_UPDATE_TOOL_NAME
+    ) {
+        return Ok(());
+    }
+    let Some(Value::String(path)) = input.get_mut("avatarFile") else {
+        return Ok(());
+    };
+    let (_, workspace) = TeamToolService::default()
+        .agent_file_ingress_scope(database, &run.agent_run_id, run.execution_epoch)?
+        .context("AgentRun file ingress is unavailable")?;
+    *path = resolve_agent_local_path(Path::new(path), workspace.path())
+        .into_os_string()
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("AgentRun avatar path must be UTF-8"))?;
+    Ok(())
+}
+
 /// Stage A: validate a draft card without persisting any business entity,
 /// persist an immutable server-side preview record, and return the opaque
 /// previewId handle. The confirmation credential is only issued by confirm.
@@ -195,13 +222,13 @@ pub fn preview_member_create(
         &input.working_principles,
         &input.growth_topic,
     )
-    .map_err(|_| MemberCreateError {
+    .map_err(|_| MemberOperationError {
         code: "member.invalid_identity",
         message: "One or more member identity fields are invalid; fix the confirmed card and try again",
         details: None,
     })?;
     if AgentProfileService::default().display_name_exists(database, &input.display_name)? {
-        return Err(MemberCreateError {
+        return Err(MemberOperationError {
             code: "agent_profile.display_name_conflict",
             message: "A member with this display name already exists; fix the card and run member.create.preview again",
             details: None,
@@ -315,7 +342,7 @@ pub fn confirm_member_create(
         params![input.preview_id, now_str, event_id],
     )?;
     if confirmed != 1 {
-        return Err(MemberCreateError {
+        return Err(MemberOperationError {
             code: "member.confirmation_invalid",
             message: "Preview is not in an active state that can be confirmed",
             details: None,
@@ -349,7 +376,7 @@ pub fn confirm_member_create(
     let Some((owner, scope_kind, scope_id, card_digest, source_run_id, creation_key, preview_expires)) =
         preview
     else {
-        return Err(MemberCreateError {
+        return Err(MemberOperationError {
             code: "member.confirmation_invalid",
             message: "Preview record disappeared",
             details: None,
@@ -357,7 +384,7 @@ pub fn confirm_member_create(
         .into());
     };
     if owner != user_id || card_digest != input.card_digest {
-        return Err(MemberCreateError {
+        return Err(MemberOperationError {
             code: "member.card_mismatch",
             message: "Member card changed after preview; run member.create.preview again",
             details: None,
@@ -383,7 +410,7 @@ pub fn confirm_member_create(
         ],
     )?;
     if affected != 1 {
-        return Err(MemberCreateError {
+        return Err(MemberOperationError {
             code: "member.confirmation_already_consumed",
             message: "This preview was already confirmed",
             details: None,
@@ -413,7 +440,7 @@ pub fn confirm_member_create(
         params![credential_id, token_hash, now_str, input.preview_id],
     )?;
     if issued != 1 {
-        return Err(MemberCreateError {
+        return Err(MemberOperationError {
             code: "member.capability_issuance_invalid",
             message: "Confirmed capability could not be issued for this preview",
             details: None,
@@ -452,7 +479,7 @@ pub fn create_member(
         &input.draft.working_principles,
         &input.draft.growth_topic,
     )
-    .map_err(|_| MemberCreateError {
+    .map_err(|_| MemberOperationError {
         code: "member.invalid_identity",
         message: "One or more member identity fields are invalid; fix the confirmed card and try again",
         details: None,
@@ -489,7 +516,7 @@ pub fn create_member(
         )
         .optional()?;
     let Some((stored_digest,)) = pre else {
-        return Err(MemberCreateError {
+        return Err(MemberOperationError {
             code: "member.confirmation_required",
             message: "No confirmed capability is claimable for this preview by this run; run member.create.preview, then confirm, then retry",
             details: None,
@@ -497,7 +524,7 @@ pub fn create_member(
         .into());
     };
     if stored_digest != digest {
-        return Err(MemberCreateError {
+        return Err(MemberOperationError {
             code: "member.card_mismatch",
             message: "Member card changed after confirmation; run member.create.preview again",
             details: None,
@@ -541,10 +568,10 @@ pub fn create_member(
         scope_id: Some(authenticated_run.camp_id.clone()),
     };
     let execution = AgentProfileService::default()
-        .create_confirmed_profile(database, &envelope, &claim)
+        .create_confirmed_profile(database, &envelope, &claim, authenticated_run)
         .map_err(|error| {
             if error.downcast_ref::<CommandGatewayError>().is_some() {
-                anyhow::Error::new(MemberCreateError {
+                anyhow::Error::new(MemberOperationError {
                     code: "member.creation_key_conflict",
                     message: "creationKey was already used with different member details",
                     details: None,
@@ -602,12 +629,84 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Immutable product receipt. This is not a CampMessage or model input.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemberCreationView {
+    pub creation_id: String,
+    #[serde(default)]
+    pub source_agent_run_id: Option<String>,
+    pub agent_id: String,
+    pub display_name: String,
+    pub avatar_ref: Option<String>,
+    pub team_role: String,
+    pub professional_responsibilities: String,
+    pub personality_traits: Vec<String>,
+    pub creator_agent_id: String,
+    pub creator_display_name: String,
+    pub created_at: String,
+}
+
+pub(crate) fn record_member_creation(
+    transaction: &Transaction<'_>,
+    source: &AuthenticatedTeamToolRun,
+    receipt: &MemberCreationView,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO member_creation(creation_id, camp_id, snapshot_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![receipt.creation_id, source.camp_id, serde_json::to_string(receipt)?, receipt.created_at],
+    )?;
+    transaction.execute(
+        "INSERT INTO member_creation_preference(singleton, helper_agent_id) VALUES (1, ?1)
+         ON CONFLICT(singleton) DO UPDATE SET helper_agent_id=excluded.helper_agent_id",
+        [&source.agent_id],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn last_creation_helper(connection: &Connection) -> Result<Option<String>> {
+    Ok(connection
+        .query_row(
+            "SELECT helper_agent_id FROM member_creation_preference WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+pub(crate) fn list_member_creations(
+    connection: &Connection,
+    camp_id: &str,
+) -> Result<Vec<MemberCreationView>> {
+    let mut statement = connection.prepare("SELECT snapshot_json FROM member_creation WHERE camp_id=?1 ORDER BY created_at, creation_id")?;
+    let rows = statement
+        .query_map([camp_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|row| Ok(serde_json::from_str(&row)?))
+        .collect()
+}
+
 fn require_direct_user_trigger(
     database: &Database,
     authenticated_run: &AuthenticatedTeamToolRun,
 ) -> Result<()> {
-    let trigger = database
-        .connection()
+    if has_direct_user_input(database.connection(), authenticated_run)? {
+        return Ok(());
+    }
+    Err(MemberOperationError {
+        code: "member.user_confirmation_required",
+        message: "Create a member only from a direct user-triggered run after showing the final member card and receiving confirmation",
+        details: None,
+    }
+    .into())
+}
+
+pub(crate) fn has_direct_user_input(
+    connection: &Connection,
+    authenticated_run: &AuthenticatedTeamToolRun,
+) -> Result<bool> {
+    let trigger = connection
         .query_row(
             r#"
             SELECT EXISTS(
@@ -630,33 +729,25 @@ fn require_direct_user_trigger(
             |row| row.get::<_, bool>(0),
         )
         .optional()?;
-    if trigger == Some(true) {
-        return Ok(());
-    }
-    Err(MemberCreateError {
-        code: "member.user_confirmation_required",
-        message: "Create a member only from a direct user-triggered run after showing the final member card and receiving confirmation",
-        details: None,
-    }
-    .into())
+    Ok(trigger == Some(true))
 }
 
-fn invalid_creation_key() -> MemberCreateError {
-    MemberCreateError {
+fn invalid_creation_key() -> MemberOperationError {
+    MemberOperationError {
         code: "member.invalid_creation_key",
         message: "creationKey must be a canonical lowercase UUID",
         details: None,
     }
 }
 
-fn map_avatar_error(error: MemberAvatarImportError) -> MemberCreateError {
+fn map_avatar_error(error: MemberAvatarImportError) -> MemberOperationError {
     match error.kind {
-        MemberAvatarImportErrorKind::Invalid => MemberCreateError {
+        MemberAvatarImportErrorKind::Invalid => MemberOperationError {
             code: "member.avatar_invalid",
             message: "The avatar file could not be safely imported; fix the image or retry without --avatar-file",
             details: None,
         },
-        MemberAvatarImportErrorKind::CreationKeyConflict => MemberCreateError {
+        MemberAvatarImportErrorKind::CreationKeyConflict => MemberOperationError {
             code: "member.creation_key_conflict",
             message: "creationKey is already bound to a different avatar",
             details: None,
@@ -676,5 +767,43 @@ mod tests {
             json!(["creationKey", "displayName", "previewId"])
         );
         assert_eq!(schema["properties"]["previewId"]["type"], "string");
+    }
+
+    #[test]
+    fn member_tool_schemas_reject_unknown_or_invalid_fields() {
+        let schema = member_create_input_schema();
+        assert_eq!(schema["properties"]["avatarFile"]["type"], "string");
+        use crate::team_tool_catalog::validate_builtin_tool_input as validate;
+        let base = json!({"agentId":"agent_1","requestId":"51d668e1-6dc7-4f39-80b2-0555f823715a","expectedVersion":1,"teamRole":""});
+        assert!(validate("member.update", &base).is_ok());
+        for (field, value) in [
+            ("teamRole", Value::Null),
+            ("displayName", json!("")),
+            ("expectedVersion", json!(0)),
+            ("requestId", json!("51D668E1-6DC7-4F39-80B2-0555F823715A")),
+            ("runtime", json!({})),
+            ("portraitRef", json!("x")),
+            ("avatarCenterX", json!(0.5)),
+        ] {
+            let mut input = base.clone();
+            input[field] = value;
+            assert!(validate("member.update", &input).is_err(), "{input}");
+        }
+        for patch in [
+            json!({}),
+            json!({"clearAvatar":false}),
+            json!({"clearAvatar":true,"avatarFile":"source.png"}),
+            json!({"clearAvatar":true,"avatarCenterX":0.5,"avatarCenterY":0.5,"avatarSize":0.5}),
+        ] {
+            let mut input = base.clone();
+            input.as_object_mut().unwrap().remove("teamRole");
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(patch.as_object().unwrap().clone());
+            assert!(validate("member.update", &input).is_err(), "{input}");
+        }
+        assert!(validate("member.list", &json!({"agentId":"agent_1"})).is_err());
+        assert!(validate("member.get", &json!({"agentId":"agent_1","runtime":true})).is_err());
     }
 }

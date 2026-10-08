@@ -16,7 +16,8 @@ import {
 } from './lib/runtime-camp-files-root.mjs'
 
 const root = resolve(import.meta.dirname, '..')
-const fixtureRoot = await realpath(await mkdtemp(join(tmpdir(), 'rovai-acp-runtime-smoke-')))
+const fixtureRoot = await realpath(process.env.ROVAI_ACP_SMOKE_FIXTURE_ROOT
+  ?? await mkdtemp(join(tmpdir(), 'rovai-acp-runtime-smoke-')))
 const projectRoot = join(fixtureRoot, 'project')
 const dataDir = join(fixtureRoot, 'data')
 const commandOutputOnly = process.env.ROVAI_ACP_COMMAND_OUTPUT_ONLY === '1'
@@ -25,6 +26,7 @@ const fullCommandOutputMatrix = process.env.ROVAI_ACP_FULL_COMMAND_MATRIX === '1
 const fileOperationMatrix = process.env.ROVAI_ACP_FILE_OPERATION_MATRIX === '1'
 const useProductPermissionDefaults = process.env.ROVAI_ACP_USE_PRODUCT_PERMISSION_DEFAULTS === '1'
 const plainTwoTurn = process.env.ROVAI_ACP_PLAIN_TWO_TURN === '1'
+const metricsOneTurn = process.env.ROVAI_ACP_METRICS_ONE_TURN === '1'
 const cancelRunningTool = process.env.ROVAI_ACP_CANCEL_RUNNING_TOOL === '1'
 const grokCompactionAcceptance = process.env.ROVAI_GROK_COMPACTION_ACCEPTANCE === '1'
 const zcodeCompactionAcceptance = process.env.ROVAI_ZCODE_COMPACTION_ACCEPTANCE === '1'
@@ -285,19 +287,19 @@ try {
           purpose
         })
     const commandResult = sent.commandResult ?? sent
-    const campId = camp?.id ?? commandResult.payload?.campId
-    if (commandResult.status !== 'accepted' || !campId || !commandResult.payload?.campMessageId) {
+    const threadId = camp?.id ?? commandResult.payload?.threadId
+    if (commandResult.status !== 'accepted' || !threadId || !commandResult.payload?.threadMessageId) {
       throw new Error(`AgentRun intake failed: ${JSON.stringify(sent)}`)
     }
     if (!camp) {
-      camp = { id: campId, defaultLeadAgentId: profile.agentId }
+      camp = { id: threadId, defaultLeadAgentId: profile.agentId }
     }
-    const agentRunId = await waitForMessageRun(request, camp.id, commandResult.payload.campMessageId)
+    const agentRunId = await waitForMessageRun(request, camp.id, commandResult.payload.threadMessageId)
     const deadline = Date.now() + 180_000
     let snapshot
     let agentRun
     while (Date.now() < deadline) {
-      snapshot = await request('camps.snapshot', { campId: camp.id })
+      snapshot = await request('camps.snapshot', { threadId: camp.id })
       agentRun = snapshot.agentRuns.find((value) => value.id === agentRunId)
       if (agentRun?.status === 'succeeded') break
       if (agentRun?.status === 'failed' || agentRun?.status === 'cancelled') {
@@ -335,6 +337,13 @@ try {
         throw new Error(`TRAE execution did not persist a Ready snapshot: ${JSON.stringify(verifiedInstallation)}`)
       }
     }
+    const executionMetrics = await request('monitoring.execution', {
+      campId: camp.id,
+      agentRunIds: [agentRunId]
+    })
+    if (executionMetrics.schemaVersion !== 1) {
+      throw new Error(`${specification.adapterKind} returned an unknown execution metrics schema`)
+    }
     results.push({
       adapterKind: specification.adapterKind,
       version: verifiedInstallation.snapshot.reportedVersion,
@@ -342,14 +351,22 @@ try {
       model: start.params.modelId,
       hostInstanceId: start.params.hostInstanceId,
       nativeSessionId: nativeThreadId,
-      output: output.body
+      output: output.body,
+      visibleTextDeltaCount: events.filter((event) => event.method === 'agent.text.delta'
+        && event.params?.agentRunId === agentRunId).length,
+      executionMetrics: {
+        run: executionMetrics.runs.find((entry) => entry.agentRunId === agentRunId) ?? null,
+        session: executionMetrics.sessions.find((entry) => entry.conversationId === agentRun.conversationId) ?? null
+      }
     })
+
+    if (metricsOneTurn) continue
 
     if (fileOperationMatrix) {
       results.at(-1).fileOperations = await runFileOperationMatrix({
         request,
         events,
-        campId: camp.id,
+        threadId: camp.id,
         adapterKind: specification.adapterKind,
         projectRoot
       })
@@ -372,16 +389,16 @@ try {
         }
       )
       const commandResult = commandRequest.commandResult ?? commandRequest
-      if (commandResult.status !== 'accepted' || !commandResult.payload?.campMessageId) {
+      if (commandResult.status !== 'accepted' || !commandResult.payload?.threadMessageId) {
         throw new Error(`ACP command-output AgentRun was not accepted: ${JSON.stringify(commandRequest)}`)
       }
-      const commandRunId = await waitForMessageRun(request, camp.id, commandResult.payload.campMessageId)
+      const commandRunId = await waitForMessageRun(request, camp.id, commandResult.payload.threadMessageId)
       const commandApprovals = new Set()
       const commandDeadline = Date.now() + 180_000
       let commandSnapshot
       let commandRun
       while (Date.now() < commandDeadline) {
-        commandSnapshot = await request('camps.snapshot', { campId: camp.id })
+        commandSnapshot = await request('camps.snapshot', { threadId: camp.id })
         for (const approval of commandSnapshot.approvals.filter((candidate) =>
           candidate.status === 'pending'
             && !commandApprovals.has(candidate.id)
@@ -392,7 +409,7 @@ try {
           if (!option) throw new Error(`ACP command-output request has no exact allow option: ${JSON.stringify(approval)}`)
           const resolution = await request('action.approvals.resolve', {
             commandId: crypto.randomUUID(),
-            campId: camp.id,
+            threadId: camp.id,
             approvalId: approval.id,
             expectedVersion: approval.version,
             optionId: option.optionId,
@@ -464,6 +481,14 @@ try {
         nativeSessionContinued: commandStart.params.nativeThreadId === results.at(-1).nativeSessionId,
         warmHostReused: commandStart.params.hostInstanceId === results.at(-1).hostInstanceId,
         hostInstanceId: commandStart.params.hostInstanceId
+      }
+      const continuedMetrics = await request('monitoring.execution', {
+        campId: camp.id,
+        agentRunIds: [commandRunId]
+      })
+      results.at(-1).commandOutput.executionMetrics = {
+        run: continuedMetrics.runs.find((entry) => entry.agentRunId === commandRunId) ?? null,
+        session: continuedMetrics.sessions.find((entry) => entry.conversationId === commandRun.conversationId) ?? null
       }
       if (plainTwoTurn) {
         verifyBootstrapEvidenceReused(dataDir, agentRunId, commandRunId)
@@ -542,7 +567,7 @@ try {
         results.at(-1).commandOutputMatrix = await runCommandOutputMatrix({
           request,
           events,
-          campId: camp.id,
+          threadId: camp.id,
           adapterKind: specification.adapterKind
         })
       }
@@ -594,7 +619,7 @@ try {
       let writeSnapshot
       let writeRun
       while (Date.now() < writeDeadline) {
-        writeSnapshot = await request('camps.snapshot', { campId: camp.id })
+        writeSnapshot = await request('camps.snapshot', { threadId: camp.id })
         for (const approval of writeSnapshot.approvals.filter((candidate) =>
           candidate.status === 'pending'
             && !resolvedApprovals.has(candidate.id)
@@ -605,7 +630,7 @@ try {
           if (!option) throw new Error(`ACP request has no exact allow option: ${JSON.stringify(approval)}`)
           const resolution = await request('action.approvals.resolve', {
             commandId: crypto.randomUUID(),
-            campId: camp.id,
+            threadId: camp.id,
             approvalId: approval.id,
             expectedVersion: approval.version,
             optionId: option.optionId,
@@ -731,8 +756,8 @@ try {
                 completionRole: 'required'
               }
             )
-        const deniedCampId = deniedRequest.commandResult?.payload?.campId
-          ?? deniedRequest.payload?.campId
+        const deniedCampId = deniedRequest.commandResult?.payload?.threadId
+          ?? deniedRequest.payload?.threadId
           ?? camp.id
         const deniedRunId = deniedRequest.commandResult?.payload?.agentRunIds?.[0]
           ?? deniedRequest.payload?.agentRunIds?.[0]
@@ -742,7 +767,7 @@ try {
         let deniedSnapshot
         let deniedRun
         while (Date.now() < deniedDeadline) {
-          deniedSnapshot = await request('camps.snapshot', { campId: deniedCampId })
+          deniedSnapshot = await request('camps.snapshot', { threadId: deniedCampId })
           for (const approval of deniedSnapshot.approvals.filter((candidate) =>
             candidate.status === 'pending'
               && !deniedApprovals.has(candidate.id)
@@ -753,7 +778,7 @@ try {
             if (!option) throw new Error(`ACP request has no exact safe option: ${JSON.stringify(approval)}`)
             const resolution = await request('action.approvals.resolve', {
               commandId: crypto.randomUUID(),
-              campId: deniedCampId,
+              threadId: deniedCampId,
               approvalId: approval.id,
               expectedVersion: approval.version,
               optionId: option.optionId,
@@ -829,7 +854,7 @@ try {
     }
   }
 
-  console.log(JSON.stringify({ ok: true, results }, null, 2))
+  console.log(JSON.stringify({ ok: true, fixtureRoot, results }, null, 2))
 } finally {
   if (core && !core.killed) {
     shuttingDown = true
@@ -844,22 +869,22 @@ try {
   if (!keepFixture) await rm(fixtureRoot, { recursive: true, force: true })
 }
 
-async function sendExistingCampMessage(request, campId, body, execution) {
+async function sendExistingCampMessage(request, threadId, body, execution) {
   return request('camp.messages.send', {
     commandId: crypto.randomUUID(),
-    campId,
+    threadId,
     content: composerDocumentForAddress({ mode: 'default' }, body),
     sourceAttachments: [],
     quotes: [],
-    replyToCampMessageId: null,
+    replyToThreadMessageId: null,
     execution
   })
 }
 
-async function waitForMessageRun(request, campId, messageId) {
+async function waitForMessageRun(request, threadId, messageId) {
   const deadline = Date.now() + 30_000
   while (Date.now() < deadline) {
-    const snapshot = await request('camps.snapshot', { campId })
+    const snapshot = await request('camps.snapshot', { threadId })
     const run = snapshot.agentRuns.find((candidate) =>
       candidate.inputMessageIds?.includes(messageId) || candidate.anchorMessageId === messageId
     )
@@ -901,7 +926,7 @@ function verifyBootstrapEvidenceReused(dataDir, firstRunId, secondRunId) {
   }
 }
 
-async function runFileOperationMatrix({ request, events, campId, adapterKind, projectRoot }) {
+async function runFileOperationMatrix({ request, events, threadId, adapterKind, projectRoot }) {
   const stem = adapterKind.replaceAll('-', '_').toUpperCase()
   const directory = join(projectRoot, 'runtime-file-operation-matrix', stem)
   const existingPath = join(directory, 'existing.txt')
@@ -979,7 +1004,7 @@ async function runFileOperationMatrix({ request, events, campId, adapterKind, pr
   const results = []
   for (const testCase of cases) {
     const eventStart = events.length
-    const sent = await sendExistingCampMessage(request, campId, testCase.prompt, {
+    const sent = await sendExistingCampMessage(request, threadId, testCase.prompt, {
       taskId: null,
       purpose: `Verify ${adapterKind} ${testCase.name} file-operation Evidence`,
       completionRole: 'required'
@@ -990,13 +1015,13 @@ async function runFileOperationMatrix({ request, events, campId, adapterKind, pr
     }
     const { snapshot, run, approvalCount } = await waitForFileOperationRun({
       request,
-      campId,
+      threadId,
       agentRunId,
       adapterKind,
       name: testCase.name
     })
     const evidencePage = await request('agentRunEvidence.list', {
-      campId,
+      threadId,
       agentRunId,
       afterSequence: 0,
       limit: 1_000
@@ -1152,13 +1177,13 @@ async function runFileOperationMatrix({ request, events, campId, adapterKind, pr
   return results
 }
 
-async function waitForFileOperationRun({ request, campId, agentRunId, adapterKind, name }) {
+async function waitForFileOperationRun({ request, threadId, agentRunId, adapterKind, name }) {
   const resolvedApprovals = new Set()
   const deadline = Date.now() + 300_000
   let snapshot
   let run
   while (Date.now() < deadline) {
-    snapshot = await request('camps.snapshot', { campId })
+    snapshot = await request('camps.snapshot', { threadId })
     const actions = snapshot.actions.filter((action) => action.agentRunId === agentRunId)
     for (const approval of snapshot.approvals.filter((candidate) =>
       candidate.status === 'pending'
@@ -1170,7 +1195,7 @@ async function waitForFileOperationRun({ request, campId, agentRunId, adapterKin
       if (!option) throw new Error(`${adapterKind} ${name} has no bounded allow option: ${JSON.stringify(approval)}`)
       const resolution = await request('action.approvals.resolve', {
         commandId: crypto.randomUUID(),
-        campId,
+        threadId,
         approvalId: approval.id,
         expectedVersion: approval.version,
         optionId: option.optionId,
@@ -1190,13 +1215,13 @@ async function waitForFileOperationRun({ request, campId, agentRunId, adapterKin
   throw new Error(`${adapterKind} ${name} file-operation Run timed out: ${JSON.stringify(run)}`)
 }
 
-async function cancelAgentRun(request, campId, agentRunId, events = []) {
+async function cancelAgentRun(request, threadId, agentRunId, events = []) {
   const resolvedApprovals = new Set()
   const deadline = Date.now() + 180_000
   let cancellationRequested = false
   let run
   while (Date.now() < deadline) {
-    const snapshot = await request('camps.snapshot', { campId })
+    const snapshot = await request('camps.snapshot', { threadId })
     const actions = snapshot.actions.filter((action) => action.agentRunId === agentRunId)
     for (const approval of snapshot.approvals.filter((candidate) =>
       candidate.status === 'pending'
@@ -1208,7 +1233,7 @@ async function cancelAgentRun(request, campId, agentRunId, events = []) {
       if (!option) throw new Error(`ACP cancel request has no bounded allow option: ${JSON.stringify(approval)}`)
       const resolution = await request('action.approvals.resolve', {
         commandId: crypto.randomUUID(),
-        campId,
+        threadId,
         approvalId: approval.id,
         expectedVersion: approval.version,
         optionId: option.optionId,
@@ -1223,9 +1248,9 @@ async function cancelAgentRun(request, campId, agentRunId, events = []) {
       && event.params?.payload?.status === 'in_progress'
       && String(event.params?.payload?.input ?? '').includes('sleep 30'))
     if (!cancellationRequested && (resolvedApprovals.size > 0 || runningNativeTool) && run) {
-      const turn = snapshot.turns.find((candidate) => candidate.id === run.campTurnId)
+      const turn = snapshot.turns.find((candidate) => candidate.id === run.threadTurnId)
       if (!turn) throw new Error(`ACP cancel smoke has no CampTurn: ${JSON.stringify(run)}`)
-      await requestCampTurnCancellation(request, campId, turn)
+      await requestCampTurnCancellation(request, threadId, turn)
       cancellationRequested = true
     }
     if (cancellationRequested && run && ['cancelled', 'failed', 'succeeded'].includes(run.status)) {
@@ -1236,12 +1261,12 @@ async function cancelAgentRun(request, campId, agentRunId, events = []) {
   throw new Error(`Timed out cancelling ACP AgentRun ${agentRunId}: ${JSON.stringify(run)}`)
 }
 
-async function requestCampTurnCancellation(request, campId, turn) {
+async function requestCampTurnCancellation(request, threadId, turn) {
   let expectedVersion = turn.version
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const cancellation = await request('campTurns.cancel', {
       commandId: crypto.randomUUID(),
-      command: { campId, campTurnId: turn.id, expectedVersion }
+      command: { threadId, threadTurnId: turn.id, expectedVersion }
     })
     if (cancellation.status !== 'rejected') return cancellation
     if (cancellation.code !== 'command.version_conflict'
@@ -1253,7 +1278,7 @@ async function requestCampTurnCancellation(request, campId, turn) {
   throw new Error(`ACP CampTurn cancellation remained version-conflicted after bounded retries: ${turn.id}`)
 }
 
-async function runCommandOutputMatrix({ request, events, campId, adapterKind }) {
+async function runCommandOutputMatrix({ request, events, threadId, adapterKind }) {
   const stem = adapterKind.replaceAll('-', '_').toUpperCase()
   const cases = process.platform === 'win32' ? [
     {
@@ -1334,7 +1359,7 @@ async function runCommandOutputMatrix({ request, events, campId, adapterKind }) 
   for (const specification of cases) {
     const sent = await sendExistingCampMessage(
       request,
-      campId,
+      threadId,
       [
         `Use the ${process.platform === 'win32' ? 'pwsh' : 'Bash or terminal'} tool exactly once to run the following command verbatim.`,
         'Do not call any other tool and do not alter the command.',
@@ -1354,7 +1379,7 @@ async function runCommandOutputMatrix({ request, events, campId, adapterKind }) 
     let snapshot
     let run
     while (Date.now() < deadline) {
-      snapshot = await request('camps.snapshot', { campId })
+      snapshot = await request('camps.snapshot', { threadId })
       const actionIds = new Set(snapshot.actions
         .filter((action) => action.agentRunId === runId)
         .map((action) => action.id))
@@ -1368,7 +1393,7 @@ async function runCommandOutputMatrix({ request, events, campId, adapterKind }) 
         if (!option) throw new Error(`ACP ${specification.name} request has no bounded allow option`)
         const resolution = await request('action.approvals.resolve', {
           commandId: crypto.randomUUID(),
-          campId,
+          threadId,
           approvalId: approval.id,
           expectedVersion: approval.version,
           optionId: option.optionId,

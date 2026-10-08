@@ -1,4 +1,4 @@
-import { useCampClient } from './camp-client'
+import { useThreadClient } from './camp-client'
 import { prefersReducedMotion } from './reduced-motion'
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import { createPortal } from 'react-dom'
@@ -7,7 +7,7 @@ import { FilePreviewTabIcon } from './FilePreviewTabIcon'
 import { Icon } from './MissionControls'
 import { ExecutionIcon } from './ExecutionIcons'
 import { previewTabLabel, previewTabLabels, previewTabPresentation } from './file-preview-tab-presentation'
-import { UiText, uiAttribute } from './interface-language'
+import { UiText, uiAttribute, useInterfaceLanguage } from './interface-language'
 
 function tabDomId(tabId: string): string {
   return `file-preview-tab-${tabId}`
@@ -32,7 +32,8 @@ function revealTab(strip: HTMLDivElement, tab: HTMLElement): void {
 }
 
 export function FilePreviewTabs({ compact = false }: { compact?: boolean } = {}): React.JSX.Element | null {
-  const client = useCampClient()
+  const language = useInterfaceLanguage()
+  const client = useThreadClient()
   const {
     tabs,
     activeTabId,
@@ -60,7 +61,7 @@ export function FilePreviewTabs({ compact = false }: { compact?: boolean } = {})
   const menuRef = useRef<HTMLDivElement>(null)
   const [menu, setMenu] = useState<{ tabId: string; left: number; top: number } | null>(null)
   const [announcement, setAnnouncement] = useState('')
-  const tabLabels = useMemo(() => previewTabLabels(tabs), [tabs])
+  const tabLabels = useMemo(() => previewTabLabels(tabs, language), [tabs, language])
 
   const updateEdges = useCallback((): void => {
     const strip = listRef.current
@@ -161,7 +162,7 @@ export function FilePreviewTabs({ compact = false }: { compact?: boolean } = {})
 
   const focusConversation = (): void => {
     window.requestAnimationFrame(() => {
-      const target = document.querySelector<HTMLElement>('.camp-timeline:not([hidden])')
+      const target = document.querySelector<HTMLElement>('.thread-timeline:not([hidden])')
         ?? document.querySelector<HTMLElement>('.timeline-pane')
       target?.focus({ preventScroll: true })
     })
@@ -256,8 +257,8 @@ export function FilePreviewTabs({ compact = false }: { compact?: boolean } = {})
           {tabs.length === 0 && <span className="file-preview-tabs-empty"><UiText zh={"文件预览"} /></span>}
           {tabs.map((tab, index) => {
             const active = tab.id === activeTabId
-            const label = tabLabels.get(tab.id) ?? previewTabLabel(tab)
-            const { displayPath, fileName, icon } = previewTabPresentation(tab)
+            const label = tabLabels.get(tab.id) ?? previewTabLabel(tab, language)
+            const { displayPath, fileName, icon } = previewTabPresentation(tab, language)
             const hasExternalUpdate = tab.kind === 'file' && tab.hasExternalUpdate
             const statusLabel = tab.kind !== 'file' ? ''
               : tab.loadState === 'missing' ? uiAttribute('，找不到文件')
@@ -359,7 +360,7 @@ export function FilePreviewTabs({ compact = false }: { compact?: boolean } = {})
             ref={menuRef}
             className="file-preview-tab-menu"
             role="menu"
-            aria-label={uiAttribute("{0} 操作", String(tabLabels.get(tab.id) ?? previewTabLabel(tab)))}
+            aria-label={uiAttribute("{0} 操作", String(tabLabels.get(tab.id) ?? previewTabLabel(tab, language)))}
             style={{ left: menu.left, top: menu.top }}
           >
             {tab.kind === 'file' && <>

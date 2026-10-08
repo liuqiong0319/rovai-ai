@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::{
     agent_profile::{FrozenAgentRuntimeConfig, resolve_frozen_runtime},
-    camp_content::StructuredCampMessageContent,
+    camp_content::StructuredThreadMessageContent,
     collaboration::build_effective_config,
     context::{
         project_batch_run_input_for_claim, public_history_hint, runtime_max_context_payload_bytes,
@@ -319,12 +319,6 @@ pub fn claim_waiting_delivery_batches(database: &mut Database, limit: i64) -> Re
             {
                 continue;
             }
-            let runtime = match resolve_frozen_runtime(&transaction, &conversation_id, &agent_id)? {
-                Ok(runtime) => runtime,
-                Err(_) => continue,
-            };
-            let effective_config =
-                build_effective_config(&transaction, &conversation_id, &agent_id, &runtime)?;
             let project_path: String = transaction.query_row(
                 "SELECT project_path FROM camp WHERE id = ?1",
                 [&camp_id],
@@ -385,6 +379,41 @@ pub fn claim_waiting_delivery_batches(database: &mut Database, limit: i64) -> Re
                 previous_public_boundary <= camp_public_tail,
                 "Accepted Public Context Boundary is ahead of the claim boundary"
             );
+            let runtime = match resolve_frozen_runtime(&transaction, &conversation_id, &agent_id)? {
+                Ok(runtime) => runtime,
+                Err(blocker) => {
+                    // A failed launch intent must settle visibly. Keeping this delivery
+                    // waiting would retry forever without ever exposing the reason.
+                    let agent_run_id = Uuid::new_v4().to_string();
+                    let now = chrono::Utc::now().to_rfc3339();
+                    insert_batch_run(
+                        &transaction,
+                        &agent_run_id,
+                        &camp_id,
+                        &conversation_id,
+                        &agent_id,
+                        &waiting[0].message_id,
+                        camp_public_tail,
+                        conversation_tail,
+                        previous_public_boundary,
+                        false,
+                        &serde_json::json!({"runtimeConfigurationFailure": blocker.payload}),
+                        workspace.as_ref(),
+                        None,
+                        &SkillSelectionSnapshot::default(),
+                        &waiting[..1],
+                        Some(&blocker.code),
+                        &now,
+                    )?;
+                    claimed_run_ids.push(agent_run_id);
+                    if claimed_run_ids.len() == limit as usize {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let effective_config =
+                build_effective_config(&transaction, &conversation_id, &agent_id, &runtime)?;
             let max_payload_bytes = runtime_max_context_payload_bytes(&runtime);
             let selection = select_batch_prefix(
                 &transaction,
@@ -417,10 +446,12 @@ pub fn claim_waiting_delivery_batches(database: &mut Database, limit: i64) -> Re
                 selection.has_additional_public_messages,
                 &effective_config,
                 workspace.as_ref(),
-                &runtime,
+                Some(&runtime),
                 &selection.skill_selection,
                 selected,
-                selection.first_too_large,
+                selection
+                    .first_too_large
+                    .then_some("context_payload_too_large"),
                 &now,
             )?;
             claimed_run_ids.push(agent_run_id);
@@ -514,7 +545,7 @@ fn select_batch_prefix(
     let mut previous_selection = None;
     for count in 1..=waiting.len() {
         if let Some(content_json) = waiting[count - 1].structured_content_json.as_deref() {
-            let mut content = serde_json::from_str::<StructuredCampMessageContent>(content_json)
+            let mut content = serde_json::from_str::<StructuredThreadMessageContent>(content_json)
                 .context("CampMessage Structured Content is invalid during Delivery claim")?;
             batch_message_indices.extend(std::iter::repeat_n(count - 1, content.len()));
             batch_content.append(&mut content);
@@ -628,19 +659,22 @@ fn insert_batch_run(
     has_additional_public_messages: bool,
     effective_config: &Value,
     workspace: Option<&AgentRunWorkspace>,
-    runtime: &FrozenAgentRuntimeConfig,
+    runtime: Option<&FrozenAgentRuntimeConfig>,
     skill_selection: &SkillSelectionSnapshot,
     selected: &[WaitingDelivery],
-    first_too_large: bool,
+    error_code: Option<&str>,
     now: &str,
 ) -> Result<()> {
     let (skill_selection_json, skill_selection_digest) =
         skill_selection.canonical_json_and_digest()?;
     let first_delivery_id = &selected[0].id;
     let last_delivery_id = &selected[selected.len() - 1].id;
-    let status = if first_too_large { "failed" } else { "queued" };
-    let ended_at = first_too_large.then_some(now);
-    let error_code = first_too_large.then_some("context_payload_too_large");
+    let status = if error_code.is_some() {
+        "failed"
+    } else {
+        "queued"
+    };
+    let ended_at = error_code.map(|_| now);
     transaction.execute(
         r#"
         INSERT INTO agent_run(
@@ -694,21 +728,27 @@ fn insert_batch_run(
             format!("delivery-batch:{first_delivery_id}:{last_delivery_id}"),
             error_code,
             ended_at,
-            runtime.adapter_kind.as_str(),
-            runtime.installation_id,
-            runtime.reported_version,
-            runtime.executable_fingerprint,
-            serde_json::to_string(&runtime.capabilities)?,
-            serde_json::to_string(&runtime.model)?,
-            serde_json::to_string(&runtime.permissions)?,
-            runtime.binding_compatibility_digest,
-            runtime.executable_path,
-            runtime.auth_scope,
-            runtime.host_config_digest,
-            runtime.protocol_version,
-            runtime.installation_generation,
-            runtime.search_environment_generation,
-            runtime.native_session_compatibility_key,
+            runtime.map(|runtime| runtime.adapter_kind.as_str()),
+            runtime.map(|runtime| runtime.installation_id.as_str()),
+            runtime.and_then(|runtime| runtime.reported_version.as_deref()),
+            runtime.map(|runtime| runtime.executable_fingerprint.as_str()),
+            runtime
+                .map(|runtime| serde_json::to_string(&runtime.capabilities))
+                .transpose()?,
+            runtime
+                .map(|runtime| serde_json::to_string(&runtime.model))
+                .transpose()?,
+            runtime
+                .map(|runtime| serde_json::to_string(&runtime.permissions))
+                .transpose()?,
+            runtime.map(|runtime| runtime.binding_compatibility_digest.as_str()),
+            runtime.map(|runtime| runtime.executable_path.as_str()),
+            runtime.map(|runtime| runtime.auth_scope.as_str()),
+            runtime.map(|runtime| runtime.host_config_digest.as_str()),
+            runtime.map(|runtime| runtime.protocol_version.as_str()),
+            runtime.map(|runtime| runtime.installation_generation),
+            runtime.map(|runtime| runtime.search_environment_generation),
+            runtime.and_then(|runtime| runtime.native_session_compatibility_key.as_deref()),
             skill_selection_json,
             skill_selection_digest,
             camp_id,
@@ -737,7 +777,11 @@ fn insert_batch_run(
                 delivery.default_recipient_display_name,
             ],
         )?;
-        let terminal_status = if first_too_large { "failed" } else { "claimed" };
+        let terminal_status = if error_code.is_some() {
+            "failed"
+        } else {
+            "claimed"
+        };
         transaction.execute(
             r#"
             UPDATE camp_message_delivery
@@ -796,8 +840,8 @@ mod tests {
     use super::*;
     use crate::{
         agent_profile::{ModelDescriptor, ModelOptionDescriptor, RuntimeOptionScope, ValueChoice},
-        camp_content::{StructuredCampMessageSegment, canonical_content_digest},
-        collaboration::{CollaborationService, CreateCampCommand},
+        camp_content::{StructuredThreadMessageSegment, canonical_content_digest},
+        collaboration::{CollaborationService, CreateThreadCommand},
         command::{ActorRef, CommandEnvelope},
         current_input_skill::{CurrentInputSkillLink, parse_skill_selection_snapshot},
         message_quote::{QuoteSelection, QuoteStorage, capture_quote, store_quotes},
@@ -827,7 +871,7 @@ mod tests {
                         camp_id: None,
                         expected_versions: Vec::new(),
                         execution_epoch: None,
-                        payload: CreateCampCommand::for_test_with_members(
+                        payload: CreateThreadCommand::for_test_with_members(
                             workspace.to_string_lossy().into_owned(),
                             &["agent_1"],
                             "agent_1",
@@ -835,7 +879,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            let camp_id = created.result.payload["campId"]
+            let camp_id = created.result.payload["threadId"]
                 .as_str()
                 .unwrap()
                 .to_string();
@@ -880,7 +924,7 @@ mod tests {
                         camp_id: None,
                         expected_versions: Vec::new(),
                         execution_epoch: None,
-                        payload: CreateCampCommand::for_test_with_members(
+                        payload: CreateThreadCommand::for_test_with_members(
                             workspace.to_string_lossy().into_owned(),
                             &["agent_1"],
                             "agent_1",
@@ -888,7 +932,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            let camp_id = created.result.payload["campId"]
+            let camp_id = created.result.payload["threadId"]
                 .as_str()
                 .unwrap()
                 .to_string();
@@ -1468,33 +1512,39 @@ mod tests {
     }
 
     #[test]
-    fn light_ready_runtime_with_saved_explicit_model_claims_for_dispatch_preflight() {
-        let mut fixture = Fixture::new();
-        fixture
-            .database
-            .connection()
-            .execute(
-                r#"
+    fn historical_probe_results_do_not_block_claiming_saved_explicit_intent() {
+        for status in [
+            "light_ready",
+            "light_failed",
+            "probe_failed",
+            "missing_snapshot",
+        ] {
+            let mut fixture = Fixture::new();
+            fixture
+                .database
+                .connection()
+                .execute(
+                    r#"
                 UPDATE agent_profile
                 SET default_model_selection_json = ?1
                 WHERE id = 'agent_1'
                 "#,
-                [json!({
-                    "mode": "explicit",
-                    "modelId": "gpt-test",
-                    "options": {"reasoning_effort": "high"}
-                })
-                .to_string()],
-            )
-            .unwrap();
-        fixture
-            .database
-            .connection()
-            .execute(
-                r#"
+                    [json!({
+                        "mode": "explicit",
+                        "modelId": "gpt-test",
+                        "options": {"reasoning_effort": "high"}
+                    })
+                    .to_string()],
+                )
+                .unwrap();
+            fixture
+                .database
+                .connection()
+                .execute(
+                    r#"
                 UPDATE adapter_capability_snapshot
                 SET authentication_status = 'unknown',
-                    probe_status = 'light_ready',
+                    probe_status = ?1,
                     capabilities_json = '[]',
                     protocols_json = '[]',
                     model_catalog_json = '[]',
@@ -1502,48 +1552,144 @@ mod tests {
                     model_catalog_succeeded_at = NULL
                 WHERE installation_id = 'adapter-test-codex'
                 "#,
-                [],
-            )
-            .unwrap();
-        fixture.enqueue("explicit-light-ready", "请处理");
+                    [if status == "missing_snapshot" {
+                        "light_failed"
+                    } else {
+                        status
+                    }],
+                )
+                .unwrap();
+            if status == "missing_snapshot" {
+                fixture
+                    .database
+                    .connection()
+                    .execute("DELETE FROM adapter_capability_snapshot", [])
+                    .unwrap();
+            }
+            fixture.enqueue("explicit-light-ready", "请处理");
 
-        let run_id = claim_waiting_delivery_batches(&mut fixture.database, 100)
-            .unwrap()
-            .pop()
-            .expect("saved explicit model should reach queued Dispatch Preflight");
-        let (status, model_json): (String, String) = fixture
-            .database
-            .connection()
-            .query_row(
-                "SELECT status, runtime_model_selection_json FROM agent_run WHERE id = ?1",
-                [&run_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
+            let run_id = claim_waiting_delivery_batches(&mut fixture.database, 100)
+                .unwrap()
+                .pop()
+                .expect("saved explicit model should reach queued Dispatch Preflight");
+            let (status, model_json): (String, String) = fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT status, runtime_model_selection_json FROM agent_run WHERE id = ?1",
+                    [&run_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
 
-        assert_eq!(status, "queued");
-        assert_eq!(
-            serde_json::from_str::<Value>(&model_json).unwrap(),
-            json!({
-                "source": "explicit",
-                "modelId": "gpt-test",
-                "options": {"reasoning_effort": "high"}
-            })
-        );
-        let delivery: (String, Option<String>) = fixture
-            .database
-            .connection()
-            .query_row(
-                r#"
+            assert_eq!(status, "queued");
+            assert_eq!(
+                serde_json::from_str::<Value>(&model_json).unwrap(),
+                json!({
+                    "source": "explicit",
+                    "modelId": "gpt-test",
+                    "options": {"reasoning_effort": "high"}
+                })
+            );
+            let delivery: (String, Option<String>) = fixture
+                .database
+                .connection()
+                .query_row(
+                    r#"
                 SELECT status, claimed_agent_run_id
                 FROM camp_message_delivery
                 WHERE message_id = 'explicit-light-ready'
                 "#,
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(delivery, ("claimed".to_string(), Some(run_id)));
+        }
+        let mut fixture = Fixture::new();
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE adapter_installation SET enabled = 0 WHERE id = 'adapter-test-codex'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(delivery, ("claimed".to_string(), Some(run_id)));
+        fixture.enqueue("broken-entry", "must fail visibly");
+        let failed = claim_waiting_delivery_batches(&mut fixture.database, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let snapshot = crate::read_model::ReadModelService
+            .camp_snapshot(&mut fixture.database, &fixture.camp_id)
+            .unwrap();
+        let run = snapshot
+            .agent_runs
+            .iter()
+            .find(|run| run.id == failed)
+            .unwrap();
+        assert_eq!(run.status, "failed");
+        assert_eq!(
+            run.terminal_reason_code.as_deref(),
+            Some("adapter_installation_disabled")
+        );
+        // Configuration failures are a public fallback, never a replacement for
+        // an existing terminal reason or a route to expose arbitrary errors.
+        for (status, error, stored_reason, expected_reason) in [
+            (
+                "failed",
+                "runtime_model_unavailable",
+                Some("planned_shutdown_failed"),
+                Some("planned_shutdown_failed"),
+            ),
+            ("failed", "private_diagnostic", None, None),
+            ("queued", "adapter_installation_disabled", None, None),
+            (
+                "failed",
+                "adapter_installation_disabled",
+                None,
+                Some("adapter_installation_disabled"),
+            ),
+        ] {
+            fixture
+                .database
+                .connection()
+                .execute(
+                    "UPDATE agent_run SET status = ?2, last_error_code = ?3, terminal_reason_code = ?4,
+                        ended_at = CASE WHEN ?2 = 'failed' THEN updated_at ELSE NULL END
+                     WHERE id = ?1",
+                    params![failed, status, error, stored_reason],
+                )
+                .unwrap();
+            let snapshot = crate::read_model::ReadModelService
+                .camp_snapshot(&mut fixture.database, &fixture.camp_id)
+                .unwrap();
+            let run = snapshot
+                .agent_runs
+                .iter()
+                .find(|run| run.id == failed)
+                .unwrap();
+            assert_eq!(run.terminal_reason_code.as_deref(), expected_reason);
+        }
+        assert!(
+            claim_waiting_delivery_batches(&mut fixture.database, 1)
+                .unwrap()
+                .is_empty()
+        );
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE adapter_installation SET enabled = 1 WHERE id = 'adapter-test-codex'",
+                [],
+            )
+            .unwrap();
+        fixture.enqueue("repaired-entry", "new normal Run");
+        let next = claim_waiting_delivery_batches(&mut fixture.database, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_ne!(failed, next);
     }
 
     #[test]
@@ -2017,7 +2163,7 @@ mod tests {
         let mut fixture = Fixture::new();
         fixture.enqueue("message-1", "$review-code first");
         fixture.enqueue("message-2", "$review-code second");
-        let content = vec![StructuredCampMessageSegment::SkillMention {
+        let content = vec![StructuredThreadMessageSegment::SkillMention {
             skill_id: "missing-skill".to_string(),
             name_at_send: "review-code".to_string(),
         }];
@@ -2217,10 +2363,10 @@ mod tests {
             "observedByteSize": 11
         }]);
         let second_content = vec![
-            StructuredCampMessageSegment::Text {
+            StructuredThreadMessageSegment::Text {
                 text: "review this ".to_string(),
             },
-            StructuredCampMessageSegment::SkillMention {
+            StructuredThreadMessageSegment::SkillMention {
                 skill_id: "skill-review".to_string(),
                 name_at_send: "review-code".to_string(),
             },

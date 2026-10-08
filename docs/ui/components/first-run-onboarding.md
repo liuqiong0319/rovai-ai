@@ -2,7 +2,7 @@
 document_type: ui-component-spec
 authority: first-run-onboarding-presentation
 status: accepted
-last_updated: 2026-09-13
+last_updated: 2026-10-05
 ---
 
 # 首次训练与“初次集结”
@@ -23,8 +23,16 @@ Full Core authority ready 后，前三页才作为全窗口 mandatory gate 挂�
 
 界面语言与“设置 → 通用”共用一个偏好。欢迎页切换后立即更新当前文案及尚未保存的四位内置候选资料，
 保持已选角色、步骤和主题；偏好保存失败时回到最近保存的语言并在欢迎页显示可重试错误。开始
-provisioning 后不能再切换候选或语言。创建时只提交选中候选的当前语言初始资料；已保存的队员资料、
-输入草稿、消息、Runtime 输出和持久 Camp 标题不随界面语言变化。
+provisioning 后不能再切换候选或语言。正常配置分支在完成前按所选语言初始化全部四位未经修改、未配置的
+默认队员；所选队员及其余未配置的内置队员使用同一份 Runtime、模型、推理参数和默认权限，仅所选队员加入首次会话。
+配置复制在「开始对话」后的初始化阶段完成，不增加页面；中断后从逐人检查点恢复。已有配置、已移除或期间被另行修改的
+目标不覆盖；已完成训练营的用户不自动补写。已编辑、已配置或已移除的队员保留原身份资料；训练结束后，
+队员资料、输入草稿、消息、Runtime 输出和持久 Camp 标题不随界面语言变化。
+
+Desktop 用已完成 onboarding 快照中的 `quickChatThreadId` 识别首次会话；仅在该会话仍使用默认标题
+`初次集结` 时，英文界面将侧栏、共享顶栏、最近对话、跳转搜索、提醒浮层和可访问名称显示为 `First Chat`。
+这是显示投影，不写回 Core 标题；重命名后显示用户保存的名字，同名的其他会话保持原文。
+跳转搜索同时接受当前显示名和保存的标题，打开、重命名与删除仍使用原 Camp 身份与数据。
 
 队员页标题为“选择第一位队员”，说明“之后可以继续邀请其他队员。”；完整职责通过“了解工作方式”展开。
 队员与智能体采用中性选中底色、单选圆环与中心点，不用身份色竖线或黑色圆盘勾选。智能体状态在右侧以
@@ -52,7 +60,9 @@ Dispatch Preflight 中确认。
 模型字段复用队员运行配置的 schema 驱动组件。Runtime Default 不依赖 catalog；显式模型需要 24 小时内可服务
 且未失效的 catalog。打开 Picker 使用 Core-owned 60 秒 stale-while-revalidate，切换 Runtime 不触发 discovery。
 菜单的搜索、默认项置底及推理强度样式与[队员配置](member-identity.md#队员配置页)同步。初始模型保持 Runtime Default；
-用户选择固定模型后，推理强度保持跟随模型默认值，不预填 schema 的推荐值。
+用户从 Runtime Default 首次选择固定模型后，推理强度保持跟随模型默认值，不预填 schema 的推荐值。
+此后在同一 Runtime 内切换固定模型时，按队员配置的显式覆盖值兼容规则处理；过期历史目录和异步刷新均
+只保留草稿、等待 Core 校验，不自行清除未核实的强度。
 页面只告诉用户选择 Runtime 与模型，权限取 Adapter 静态默认值且
 不在 onboarding 展示。
 
@@ -92,7 +102,7 @@ Camp Composer 规则恢复。仅辅助技术可见的 live status 说明“内�
 
 ## References
 
-- [First-run Onboarding v5](../../contracts/first-run-onboarding-v5.md)
+- [First-run Onboarding v6](../../contracts/first-run-onboarding-v6.md)
 - [Desktop Bootstrap Shell](bootstrap-shell.md)
 - [First-run Onboarding 架构](../../architecture/first-run-onboarding.md)
 - [Camp 会话工作区](conversation-workspace.md)

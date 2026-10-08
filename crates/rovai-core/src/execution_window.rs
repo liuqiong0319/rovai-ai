@@ -17,6 +17,11 @@ use crate::{
 
 pub const DEFAULT_WINDOW_LIMIT: i64 = 24;
 
+mod associations;
+mod blocks;
+mod carrier;
+pub use blocks::{read_block_changes, read_block_page, read_group_changes, read_group_page};
+
 fn agent_run_belongs_to_camp(
     connection: &Connection,
     camp_id: &str,
@@ -41,6 +46,7 @@ fn agent_run_belongs_to_camp(
 #[serde(rename_all = "camelCase")]
 pub struct ExecutionWindowPage {
     pub schema_version: i64,
+    #[serde(rename = "threadId", alias = "campId")]
     pub camp_id: String,
     pub agent_run_id: String,
     pub requested_before_sequence: Option<i64>,
@@ -208,7 +214,7 @@ fn select_items(
           FROM agent_run_execution_evidence e LEFT JOIN owners o ON o.id = e.id
           WHERE e.agent_run_id = ?1
             AND e.event_type IN ('agent.text.block', 'agent.text.delta', 'runtime.plan', 'runtime.plan.delta',
-              'runtime.diagnostic', 'runtime.compaction.display', 'activity.started', 'activity.completed', 'runtime.action')
+              'runtime.diagnostic', 'runtime.fast.observed', 'runtime.compaction.display', 'activity.started', 'activity.completed', 'runtime.action')
             AND e.kind <> 'reasoning_summary'
         ), items AS (
           SELECT item_key, MIN(first_sequence) AS first_sequence,
@@ -248,6 +254,7 @@ fn select_items(
 #[serde(rename_all = "camelCase")]
 pub struct ExecutionWindowChanges {
     pub schema_version: i64,
+    #[serde(rename = "threadId", alias = "campId")]
     pub camp_id: String,
     pub agent_run_id: String,
     pub requested_after_change_sequence: i64,
@@ -427,6 +434,13 @@ fn supporting_builtin_operation(
     connection: &Connection,
     item: &AgentRunExecutionEvidenceView,
 ) -> Result<Option<String>> {
+    Ok(supporting_builtin_invocation(connection, item)?.map(|(_, operation)| operation))
+}
+
+fn supporting_builtin_invocation(
+    connection: &Connection,
+    item: &AgentRunExecutionEvidenceView,
+) -> Result<Option<(String, String)>> {
     let Some(shell) = item.canonical.as_ref().filter(|canonical| {
         canonical.activity_domain == "shell" && canonical.outcome == "succeeded"
     }) else {
@@ -529,7 +543,7 @@ fn supporting_builtin_operation(
             matched.insert(id, operation.to_string());
         }
     }
-    Ok((matched.len() == 1).then(|| matched.into_values().next().unwrap()))
+    Ok((matched.len() == 1).then(|| matched.into_iter().next().unwrap()))
 }
 
 fn historical_builtin_cli_result(operation: &str, result: &Value) -> Option<Value> {

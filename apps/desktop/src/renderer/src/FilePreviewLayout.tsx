@@ -46,23 +46,25 @@ interface FilePreviewLayoutValue {
 }
 
 const FilePreviewLayoutContext = createContext<FilePreviewLayoutValue | null>(null)
+// Initializing a pane must not subscribe the conversation to drag geometry.
+const FilePreviewInitialWidthContext = createContext<(() => void) | null>(null)
 
-function readPreferredRatio(): number {
+function readPreferredRatio(): number | null {
   try {
     return filePreviewRatioFromStoredValue(window.localStorage.getItem(FILE_PREVIEW_RATIO_STORAGE_KEY))
   } catch {
-    return DEFAULT_FILE_PREVIEW_RATIO
+    return null
   }
 }
 
-// Layout updates have their own context so dragging does not rerender the Camp or file contents.
+// Layout updates have their own context so dragging does not rerender the Thread or file contents.
 export function FilePreviewLayoutProvider({
-  campId,
+  threadId,
   visible,
   activityMode = false,
   children
 }: {
-  campId: string | null
+  threadId: string | null
   visible: boolean
   activityMode?: boolean
   children: ReactNode
@@ -71,11 +73,25 @@ export function FilePreviewLayoutProvider({
   const [availableWidth, setAvailableWidth] = useState(0)
   const availableWidthRef = useRef(0)
   const [preferredRatio, setPreferredRatio] = useState(readPreferredRatio)
+  const [initialRatios, setInitialRatios] = useState<ReadonlyMap<string, number>>(() => new Map())
+  const openedThreads = useRef(new Set<string>())
   const [dragWidth, setDragWidth] = useState<number | null>(null)
   const [snapping, setSnapping] = useState(false)
   const snapTimer = useRef<number | null>(null)
 
   const cancelResize = useCallback(() => setDragWidth(null), [])
+
+  useLayoutEffect(() => {
+    if (threadId && visible) openedThreads.current.add(threadId)
+  }, [threadId, visible])
+
+  const initializeMinimumWidth = useCallback((): void => {
+    if (!threadId || visible || preferredRatio !== null || openedThreads.current.has(threadId)) return
+    const ratio = filePreviewRatioForWidth(availableWidthRef.current, MIN_FILE_PREVIEW_WIDTH)
+    if (ratio === null) return
+    openedThreads.current.add(threadId)
+    setInitialRatios(current => new Map(current).set(threadId, ratio))
+  }, [preferredRatio, threadId, visible])
 
   useLayoutEffect(() => {
     if (!workspace) return
@@ -96,7 +112,7 @@ export function FilePreviewLayoutProvider({
     }
   }, [workspace])
 
-  useEffect(cancelResize, [activityMode, campId, visible, cancelResize])
+  useEffect(cancelResize, [activityMode, threadId, visible, cancelResize])
   useEffect(() => () => {
     if (snapTimer.current !== null) window.clearTimeout(snapTimer.current)
   }, [])
@@ -129,7 +145,8 @@ export function FilePreviewLayoutProvider({
   }, [])
 
   const compact = availableWidth < filePreviewSplitMinWidth(activityMode)
-  const width = dragWidth ?? filePreviewWidthForRatio(availableWidth, preferredRatio)
+  const ratio = preferredRatio ?? initialRatios.get(threadId ?? '') ?? DEFAULT_FILE_PREVIEW_RATIO
+  const width = dragWidth ?? filePreviewWidthForRatio(availableWidth, ratio)
   const value = useMemo<FilePreviewLayoutValue>(() => ({
     visible,
     activityMode,
@@ -152,7 +169,13 @@ export function FilePreviewLayoutProvider({
     resetRatio
   }), [activityMode, availableWidth, cancelResize, commitWidth, compact, dragWidth, previewWidth, resetRatio, snapping, visible, width, workspace])
 
-  return <FilePreviewLayoutContext.Provider value={value}>{children}</FilePreviewLayoutContext.Provider>
+  return <FilePreviewInitialWidthContext.Provider value={initializeMinimumWidth}>
+    <FilePreviewLayoutContext.Provider value={value}>{children}</FilePreviewLayoutContext.Provider>
+  </FilePreviewInitialWidthContext.Provider>
+}
+
+export function useInitializeFilePreviewMinimumWidth(): (() => void) | null {
+  return useContext(FilePreviewInitialWidthContext)
 }
 
 export function useOptionalFilePreviewLayout(): FilePreviewLayoutValue | null {
@@ -240,7 +263,7 @@ export function FilePreviewResizeHandle({ onClose }: { onClose(): void }): React
     cancelGesture()
     onClose()
     window.requestAnimationFrame(() => {
-      const target = document.querySelector<HTMLElement>('.camp-timeline:not([hidden])')
+      const target = document.querySelector<HTMLElement>('.thread-timeline:not([hidden])')
         ?? document.querySelector<HTMLElement>('.timeline-pane')
       target?.focus({ preventScroll: true })
     })

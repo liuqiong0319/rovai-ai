@@ -5,16 +5,16 @@ import type { BuiltinMemberAvatarRole } from './member-avatar'
 export * from './member-avatar'
 export * from './current-user-profile'
 
-export const CAMP_ID_PATTERN = /^rvcamp_[0-7][0123456789abcdefghjkmnpqrstvwxyz]{25}$/u
+export const THREAD_ID_PATTERN = /^rvcamp_[0-7][0123456789abcdefghjkmnpqrstvwxyz]{25}$/u
 
-const CAMP_ID_PREFIX_LENGTH = 'rvcamp_'.length
-const CAMP_ID_CROCKFORD = '0123456789abcdefghjkmnpqrstvwxyz'
+const THREAD_ID_PREFIX_LENGTH = 'rvcamp_'.length
+const THREAD_ID_CROCKFORD = '0123456789abcdefghjkmnpqrstvwxyz'
 
-export function isCampId(value: unknown): value is string {
-  if (typeof value !== 'string' || !CAMP_ID_PATTERN.test(value)) return false
+export function isThreadId(value: unknown): value is string {
+  if (typeof value !== 'string' || !THREAD_ID_PATTERN.test(value)) return false
   let decoded = 0n
-  for (const character of value.slice(CAMP_ID_PREFIX_LENGTH)) {
-    const digit = CAMP_ID_CROCKFORD.indexOf(character)
+  for (const character of value.slice(THREAD_ID_PREFIX_LENGTH)) {
+    const digit = THREAD_ID_CROCKFORD.indexOf(character)
     if (digit < 0) return false
     decoded = (decoded << 5n) | BigInt(digit)
   }
@@ -22,6 +22,9 @@ export function isCampId(value: unknown): value is string {
   const variant = Number((decoded >> 62n) & 0x3n)
   return version === 7 && variant === 2
 }
+
+/** Legacy input helper; Thread IDs keep the existing physical encoding. */
+export const isCampId = isThreadId
 
 export type AdapterKind =
   | 'codex-cli'
@@ -188,6 +191,8 @@ export interface AdapterInstallation {
   pathState: 'valid' | 'path_missing'
   version: number
   referencedProfileCount: number
+  /** Static Adapter permission vocabulary, available before diagnostics. */
+  permissionOptions?: PermissionOptionDescriptor[]
   snapshot: AdapterCapabilitySnapshot | null
   modelCatalog: RuntimeModelCatalogCache
   memberRuntimeDefaults: MemberRuntimeConfiguration | null
@@ -197,8 +202,8 @@ export interface AdapterInstallation {
   updatedAt: string
 }
 
-export interface MemberCampMembership {
-  campId: string
+export interface MemberThreadMembership {
+  threadId: string
   projectPath: string
   membershipStatus: 'active' | 'left'
   isDefaultLead: boolean
@@ -309,10 +314,10 @@ export interface MemberRemovalPreview {
   displayName: string
   version: number
   nonTerminalAgentRunCount: number
-  currentCampMembershipCount: number
+  currentThreadMembershipCount: number
   openAssignedTaskCount: number
-  defaultLeadCampCount: number
-  soleMemberCampCount: number
+  defaultLeadThreadCount: number
+  soleMemberThreadCount: number
   removable: boolean
 }
 
@@ -362,7 +367,10 @@ export interface RuntimeStartupSettings {
   runtimeKind: AdapterKind
   revision: number
   configuration: RuntimeStartupConfiguration
+  reconnectRequired: boolean
 }
+export interface RuntimeStartupFieldEdit { path: string[]; before: unknown; after: unknown; label: string }
+export interface RuntimeStartupFieldConflict extends RuntimeStartupFieldEdit { current: unknown }
 
 export interface RuntimeStartupInspection {
   status: 'missing' | 'recognized' | 'version_unverified' | 'authentication_required' | 'ready' | 'check_failed'
@@ -646,6 +654,36 @@ export interface RuntimeUsageSnapshot {
   }
 }
 
+export interface RuntimeExecutionMetricsSnapshot {
+  schemaVersion: 1
+  runs: Array<{
+    agentRunId: string
+    executionEpoch: number
+    promptInputTotalTokens: number | null
+    outputTokens: number | null
+    cacheReadTokens: number | null
+    cacheWriteTokens: number | null
+    finalizedAt: string | null
+    lastObservedAt: string | null
+    /** Coverage of received Input/Output contributions; missing/legacy evidence is not complete. */
+    inputOutputComplete?: boolean
+  }>
+  sessions: Array<{
+    conversationId: string
+    agentId: string
+    sessionGeneration: number
+    runtimeKind: AdapterKind
+    modelKey: string | null
+    usedTokens: number | null
+    windowTokens: number | null
+    /** Independently observed native fraction; never used to infer token quantities. */
+    nativeRatio?: number | null
+    source: string
+    dialectId: string
+    observedAt: string
+  }>
+}
+
 export type StartPreflightBlockerCode =
   | 'runtime_not_configured'
   | 'runtime_probe_required'
@@ -731,7 +769,7 @@ export interface StoredCommandResult {
   recordedAt: string
 }
 
-export interface CampDeletionIssue {
+export interface ThreadDeletionIssue {
   operationId: string
   attentionRevision: number
 }
@@ -742,7 +780,7 @@ export interface CreateTaskAndQueueExecutionResult {
   preflight: StartPreflightResult | null
 }
 
-export interface SendCampMessageResult {
+export interface SendThreadMessageResult {
   commandResult: StoredCommandResult | null
   replayed: boolean
   preflight: StartPreflightResult | null
@@ -758,28 +796,28 @@ export type PendingExecutionIntentStatus =
 
 export interface PendingExecutionIntentView {
   id: string
-  requestMethod: 'camp.messages.send'
-  campId: string | null
+  requestMethod: 'thread.messages.send'
+  threadId: string | null
   status: PendingExecutionIntentStatus
   diagnosticCode: string | null
   attemptCount: number
   retryAfter: string | null
 }
 
-export type CampCollaborationMode = 'peer' | 'lead_coordinated'
-export type CampActivationState = 'pending' | 'active'
+export type ThreadCollaborationMode = 'peer' | 'lead_coordinated'
+export type ThreadActivationState = 'pending' | 'active'
 
-export interface CreateCampRequest {
+export interface CreateThreadRequest {
   commandId: string
   name: string | null
   workspace: { projectPath: string } | null
   memberAgentIds: string[]
   defaultLeadAgentId: string
-  collaborationMode: CampCollaborationMode
-  activationState: CampActivationState
+  collaborationMode: ThreadCollaborationMode
+  activationState: ThreadActivationState
 }
 
-export interface CampCreationPreflight {
+export interface ThreadCreationPreflight {
   admissible: boolean
   presentMembers: Array<{
     agentId: string
@@ -789,65 +827,66 @@ export interface CampCreationPreflight {
     runtimeReadiness: RuntimeReadinessStatus
   }>
   initialLeadAgentId: string | null
+  lastMemberCreationHelperAgentId?: string | null
   blockers: Array<{
     code: 'no_present_members'
     detail: string
   }>
 }
 
-export interface RenameCampCommand {
-  campId: string
+export interface RenameThreadCommand {
+  threadId: string
   title: string
   expectedVersion: number
 }
 
 export interface ChangeDefaultLeadCommand {
-  campId: string
+  threadId: string
   successorAgentId: string
   expectedVersion: number
 }
 
 export interface ReconcileDefaultLeadCommand {
-  campId: string
+  threadId: string
 }
 
-export interface DeleteCampCommand {
-  campId: string
+export interface DeleteThreadCommand {
+  threadId: string
   expectedVersion: number
   force?: boolean
   workspaceDisposition?: 'retain' | 'cleanup'
 }
 
-export interface DiscardPendingCampCommand {
-  campId: string
+export interface DiscardPendingThreadCommand {
+  threadId: string
 }
 
-export interface CancelCampTurnCommand {
-  campId: string
-  campTurnId: string
+export interface CancelThreadTurnCommand {
+  threadId: string
+  threadTurnId: string
   expectedVersion: number
 }
 
 export interface OpenSingleChatCommand {
-  campId: string
+  threadId: string
   agentId: string
 }
 
 export interface SendSingleChatMessageCommand {
-  campId: string
+  threadId: string
   conversationId: string
   body: string
   draftRevision: number
 }
 
 export interface EndSingleChatCommand {
-  campId: string
+  threadId: string
   conversationId: string
 }
 
 export interface SingleChatConversationView {
   id: string
-  campId: string
+  threadId: string
   agentId: string
   version: number
   status: 'active' | 'ended'
@@ -866,14 +905,14 @@ export interface SingleChatMessageView {
   authorType: 'user' | 'agent' | 'system'
   authorId: string
   body: string
-  attachments: CampMessageAttachmentView[]
+  attachments: ThreadMessageAttachmentView[]
   agentRunId: string | null
   createdAt: string
 }
 
 export interface SingleChatRunView {
   id: string
-  campTurnId: string
+  threadTurnId: string
   triggerConversationMessageId: string
   status: 'queued' | 'running' | 'waiting' | 'succeeded' | 'failed' | 'cancelled'
   version: number
@@ -942,7 +981,7 @@ export type SingleChatPendingInputEditAction =
   | { type: 'reorder_attachments'; attachmentRefIds: string[] }
 
 export interface EditSingleChatPendingInputCommand {
-  campId: string
+  threadId: string
   conversationId: string
   pendingInputId: string
   expectedRevision: number
@@ -950,21 +989,21 @@ export interface EditSingleChatPendingInputCommand {
   action: SingleChatPendingInputEditAction
 }
 
-export type NavigationCampMarker = 'loading' | 'unread_completed' | 'none'
+export type NavigationThreadMarker = 'loading' | 'unread_completed' | 'none'
 
-export type CampChannelSource =
+export type ThreadChannelSource =
   | { provider: 'feishu' | 'lark'; conversationKind: 'p2p' | 'group' | 'topic' }
   | { provider: 'dingtalk'; conversationKind: 'p2p' | 'group' }
 
-export interface NavigationCampItem {
+export interface NavigationThreadItem {
   id: string
   title: string
-  channelSource?: CampChannelSource | null
-  activationState: CampActivationState
+  channelSource?: ThreadChannelSource | null
+  activationState: ThreadActivationState
   projectBindingKind: ProjectBindingKind
   projectPath: string
   defaultLead: { agentId: string; displayName: string } | null
-  marker: NavigationCampMarker
+  marker: NavigationThreadMarker
   lastActivityAt: string
   lastActivityGlobalSequence: number
   latestCompletionGlobalSequence: number
@@ -973,12 +1012,12 @@ export interface NavigationCampItem {
   version: number
 }
 
-export type NavigationCampTarget = Pick<NavigationCampItem,
+export type NavigationThreadTarget = Pick<NavigationThreadItem,
   'id' | 'title' | 'channelSource' | 'activationState' | 'projectBindingKind' | 'projectPath'>
 
-export interface NavigationCampGroup {
+export interface NavigationThreadGroup {
   totalCount: number
-  recentCamps: NavigationCampItem[]
+  recentThreads: NavigationThreadItem[]
 }
 
 export interface ProjectNavigationGroup {
@@ -988,7 +1027,7 @@ export interface ProjectNavigationGroup {
   lastActivityAt: string
   lastActivityGlobalSequence: number
   totalCount: number
-  recentCamps: NavigationCampItem[]
+  recentThreads: NavigationThreadItem[]
 }
 
 export interface NavigationSnapshotRequest {
@@ -1001,40 +1040,40 @@ export interface NavigationSnapshotRequest {
 export interface NavigationSnapshot {
   schemaVersion: 3
   throughGlobalSequence: number
-  quickChat: NavigationCampGroup
+  quickChat: NavigationThreadGroup
   projects: ProjectNavigationGroup[]
 }
 
-export interface NavigationCampPage {
+export interface NavigationThreadPage {
   schemaVersion: 3
   throughGlobalSequence: number
   projectPath: string | null
   totalCount: number
   nextOffset: number | null
-  camps: NavigationCampItem[]
+  threads: NavigationThreadItem[]
 }
 
-export interface NavigationCampRows {
+export interface NavigationThreadRows {
   throughGlobalSequence: number
   groupKeys: string[]
-  camps: NavigationCampItem[]
+  threads: NavigationThreadItem[]
 }
 
-export interface CampViewedAcknowledgement {
-  campId: string
+export interface ThreadViewedAcknowledgement {
+  threadId: string
   lastSeenGlobalSequence: number
   changed: boolean
-  navigation: NavigationCampRows
+  navigation: NavigationThreadRows
 }
 
-export interface CampMemberFastView {
+export interface ThreadMemberFastView {
   runtimeBindingRevision: string
   fastOverride: boolean | null
   runtimeDefaultFast: boolean | null
 }
 
-export interface CampMemberView {
-  fast?: CampMemberFastView
+export interface ThreadMemberView {
+  fast?: ThreadMemberFastView
 
   agentId: string
   displayName: string
@@ -1049,7 +1088,7 @@ export interface CampMemberView {
   version: number
 }
 
-export interface CampMembershipReconciliationView {
+export interface ThreadMembershipReconciliationView {
   id: string
   agentId: string
   membershipVersion: number
@@ -1061,15 +1100,15 @@ export interface CampMembershipReconciliationView {
   updatedAt: string
 }
 
-export interface AddCampMemberCommand {
-  campId: string
+export interface AddThreadMemberCommand {
+  threadId: string
   agentId: string
   expectedMembershipGeneration: number
   capabilityOverrides?: Record<string, unknown>
 }
 
-export interface RemoveCampMemberCommand {
-  campId: string
+export interface RemoveThreadMemberCommand {
+  threadId: string
   agentId: string
   expectedMembershipGeneration: number
   expectedMembershipVersion: number
@@ -1077,8 +1116,8 @@ export interface RemoveCampMemberCommand {
   reason?: string | null
 }
 
-export interface CampMemberRemovalPreview {
-  campId: string
+export interface ThreadMemberRemovalPreview {
+  threadId: string
   agentId: string
   displayName: string
   membershipGeneration: number
@@ -1095,7 +1134,7 @@ export interface CampMemberRemovalPreview {
 
 export interface TaskView {
   taskId: string
-  campId: string
+  threadId: string
   title: string
   description: string
   status: 'pending' | 'in_progress' | 'blocked' | 'completed' | 'cancelled'
@@ -1136,7 +1175,7 @@ export type TaskAssigneePatch =
   | { operation: 'assign'; agentId: string }
   | { operation: 'clear' }
 
-export type StructuredCampMessageSegment =
+export type StructuredThreadMessageSegment =
   | { kind: 'text'; text: string }
   | { kind: 'member_mention'; agentId: string }
   | { kind: 'all_members_mention' }
@@ -1150,7 +1189,7 @@ export type StructuredCampMessageSegment =
       contentDigest: `sha256:${string}`
     }
 
-export type StructuredCampMessageContent = StructuredCampMessageSegment[]
+export type StructuredThreadMessageContent = StructuredThreadMessageSegment[]
 
 export interface ComposerDocument {
   version: 2
@@ -1235,7 +1274,7 @@ export interface CurrentInputSkillResolution {
   entries: CurrentInputSkillResolutionEntry[]
 }
 
-export interface CampMessageView {
+export interface ThreadMessageView {
   missionStart?: {missionId: string; title: string; description: string}
   quotes: MessageQuoteSnapshot[]
   id: string
@@ -1245,21 +1284,30 @@ export interface CampMessageView {
   authorId: string
   authorDisplayName?: string | null
   sourceAgentRunId: string | null
+  /** Read-only source Run metadata; absent in older projections. Never inferred from a profile. */
+  runtimeModel?: ThreadMessageRuntimeModelView | null
   body: string
-  content: StructuredCampMessageContent
-  attachments: CampMessageAttachmentView[]
+  content: StructuredThreadMessageContent
+  attachments: ThreadMessageAttachmentView[]
   addressMode: 'default' | 'explicit' | 'broadcast'
   addressedAgentIds: string[]
-  replyToCampMessageId: string | null
-  campTurnId: string | null
-  presentation: CampTimelinePresentation | null
+  replyToThreadMessageId: string | null
+  threadTurnId: string | null
+  presentation: ThreadTimelinePresentation | null
   createdAt: string
   withdrawn: boolean
   canWithdraw: boolean
   version: number
 }
 
-export interface CampMessageAttachmentView {
+export interface ThreadMessageRuntimeModelView {
+  adapterKind: string
+  /** Null means the Run used Agent defaults with no native model observation. */
+  modelId: string | null
+  reasoningEffort: string | null
+}
+
+export interface ThreadMessageAttachmentView {
   id: string
   displayName: string
   kind: 'file' | 'directory'
@@ -1279,36 +1327,36 @@ export type LocalAttachmentAvailability =
   | 'unreadable'
   | 'kind_changed'
 
-export type LocalAttachmentSourceView = CampMessageAttachmentView
+export type LocalAttachmentSourceView = ThreadMessageAttachmentView
 
 export type LocalAttachmentOwnerLocator =
-  | { owner: 'composer'; campId: string; attachmentRefId: string }
-  | { owner: 'pending'; campId: string; pendingInputId: string; attachmentRefId: string }
+  | { owner: 'composer'; threadId: string; attachmentRefId: string }
+  | { owner: 'pending'; threadId: string; pendingInputId: string; attachmentRefId: string }
   | {
       owner: 'pending_edit'
-      campId: string
+      threadId: string
       pendingInputId: string
       editToken: string
       attachmentRefId: string
     }
-  | { owner: 'message'; campId: string; messageId: string; attachmentRefId: string }
-  | { owner: 'mission'; campId: string; missionId: string; attachmentRefId: string }
+  | { owner: 'message'; threadId: string; messageId: string; attachmentRefId: string }
+  | { owner: 'mission'; threadId: string; missionId: string; attachmentRefId: string }
   | {
       owner: 'single_chat_composer'
-      campId: string
+      threadId: string
       conversationId: string
       attachmentRefId: string
     }
   | {
       owner: 'single_chat_pending'
-      campId: string
+      threadId: string
       conversationId: string
       pendingInputId: string
       attachmentRefId: string
     }
   | {
       owner: 'single_chat_pending_edit'
-      campId: string
+      threadId: string
       conversationId: string
       pendingInputId: string
       editToken: string
@@ -1316,7 +1364,7 @@ export type LocalAttachmentOwnerLocator =
     }
   | {
       owner: 'single_chat_message'
-      campId: string
+      threadId: string
       conversationId: string
       conversationMessageId: string
       attachmentRefId: string
@@ -1349,31 +1397,31 @@ export type MessageQuoteAction =
   | { type: 'add'; selection: MessageQuoteSelection }
   | { type: 'remove' | 'restore'; quoteId: string }
 
-export interface CampComposerDraftView {
+export interface ThreadComposerDraftView {
   /** Host-owned editor identity; independent of a short-lived authentication Session. */
   draftId?: string
   quotes: MessageQuoteSnapshot[]
-  campId: string
+  threadId: string
   body: string
   content: ComposerDocument
   revision: number
   attachments: LocalAttachmentSourceView[]
-  replyIntent: CampComposerReplyIntentView | null
-  continuationIntent: CampComposerContinuationIntentView | null
+  replyIntent: ThreadComposerReplyIntentView | null
+  continuationIntent: ThreadComposerContinuationIntentView | null
   updatedAt: string | null
   expiresAt: string | null
 }
 
-export interface PendingCampInputView {
+export interface PendingThreadInputView {
   quotes: MessageQuoteSnapshot[]
   id: string
-  campId: string
+  threadId: string
   enqueueSequence: number
   revision: number
   state: 'queued' | 'needs_repair'
   content: ComposerDocument
   body: string
-  replyIntent: CampComposerReplyIntentView | null
+  replyIntent: ThreadComposerReplyIntentView | null
   recipientSelectionRequired: boolean
   lastAttemptErrorCode: string | null
   attachments: LocalAttachmentSourceView[]
@@ -1390,18 +1438,18 @@ export interface PendingInputEditSession {
   workingAttachments: LocalAttachmentSourceView[]
 }
 
-export interface CampPendingInputsView {
-  campId: string
+export interface ThreadPendingInputsView {
+  threadId: string
   executionActive: boolean
-  items: PendingCampInputView[]
+  items: PendingThreadInputView[]
   editSession: PendingInputEditSession | null
-  submissionOutcomes?: PendingCampInputSubmissionOutcome[]
+  submissionOutcomes?: PendingThreadInputSubmissionOutcome[]
 }
 
-export interface PendingCampInputSubmissionOutcome {
+export interface PendingThreadInputSubmissionOutcome {
   pendingInputId: string
   state: 'queued' | 'needs_repair' | 'published' | 'cancelled' | 'missing'
-  campTurnId: string | null
+  threadTurnId: string | null
   addressedAgentIds: string[]
 }
 
@@ -1412,14 +1460,14 @@ export type PendingInputEditAction =
   | {
       type: 'save'
       content: ComposerDocument
-      replyToCampMessageId: string | null
+      replyToThreadMessageId: string | null
       recipientSelectionRequired: boolean
     }
   | { type: 'remove_attachment'; attachmentRefId: string }
   | { type: 'reorder_attachments'; attachmentRefIds: string[] }
 
-export interface CampComposerContinuationIntentView {
-  sourceCampMessageId: string
+export interface ThreadComposerContinuationIntentView {
+  sourceThreadMessageId: string
   recipient: {
     agentId: string
     displayName: string
@@ -1428,8 +1476,8 @@ export interface CampComposerContinuationIntentView {
   recipientSelectionRequired: boolean
 }
 
-export interface CampComposerReplyIntentView {
-  replyToCampMessageId: string
+export interface ThreadComposerReplyIntentView {
+  replyToThreadMessageId: string
   targetState: 'available' | 'message_unavailable'
   author: {
     authorType: 'user' | 'agent' | 'system'
@@ -1441,7 +1489,7 @@ export interface CampComposerReplyIntentView {
   recipientSelectionRequired: boolean
 }
 
-export type CampComposerReplyRecipient =
+export type ThreadComposerReplyRecipient =
   | { kind: 'member'; agentId: string }
   | { kind: 'all_members' }
 
@@ -1472,29 +1520,29 @@ export interface AttachmentRevealResult {
 export type OpenFilePreviewRequest =
   | {
       kind: 'skill_reference'
-      campId: string
+      threadId: string
       skillId: string
       rawReference: 'SKILL.md'
     }
   | {
       kind: 'message_reference'
-      campId: string
+      threadId: string
       messageId: string
       rawReference: string
     }
   | {
       kind: 'camp_workspace'
-      campId: string
+      threadId: string
       rawReference: string
     }
   | {
       kind: 'attachment'
-      campId: string
+      threadId: string
       locator: LocalAttachmentOwnerLocator
     }
   | {
       kind: 'run_evidence'
-      campId: string
+      threadId: string
       agentRunId: string
       executionEpoch: number
       evidenceFileId: string
@@ -1502,7 +1550,7 @@ export type OpenFilePreviewRequest =
     }
   | {
       kind: 'run_activity_file'
-      campId: string
+      threadId: string
       agentRunId: string
       executionEpoch: number
       evidenceId: string
@@ -1516,7 +1564,7 @@ export type OpenFilePreviewRequest =
     }
   | {
       kind: 'authorized_root'
-      campId: string
+      threadId: string
       rootGrantId: string
       rawReference: string
     }
@@ -1526,7 +1574,7 @@ export type RestoreFilePreviewRequest = Extract<OpenFilePreviewRequest, {
 }>
 
 export interface ReopenFilePreviewRequest {
-  campId: string
+  threadId: string
   reopenToken: string
 }
 
@@ -1605,7 +1653,7 @@ export interface ResolvedFilePreview {
 export type OpenFilePreviewResult =
   | {
       kind: 'evidence_review'
-      campId: string
+      threadId: string
       agentRunId: string
       executionEpoch: number
       evidenceFileId: string
@@ -1646,7 +1694,7 @@ export type FilePreviewOperationResult<T> =
 
 export interface FilePreviewAuthorizationChallenge {
   pendingOpenId: string
-  campId: string
+  threadId: string
   displayReference: string
   expiresAt: number
 }
@@ -1700,13 +1748,13 @@ export interface FilePreviewHtmlDocument {
 }
 
 export interface FilePreviewExternalUpdateEvent {
-  campId: string
+  threadId: string
   previewKeys: string[]
 }
 
 /** Window-local preview retention. Usage is a user-action sequence, never an I/O timestamp. */
 export interface FilePreviewRetentionState {
-  sessions: { campId: string; previewSessionId: string }[]
+  sessions: { threadId: string; previewSessionId: string }[]
   handles: { handleId: string; previewSessionId: string; tabId: string; lastUsed: number; visible: boolean; busy: boolean; recoverable: boolean }[]
 }
 
@@ -1717,7 +1765,7 @@ export interface FilePreviewApi {
   /** Native capability ownership; stateless browser adapters do not need a native registry. */
   updateRetention?(state: FilePreviewRetentionState): Promise<void>
   onResourcesReleased?(listener: (event: { handleIds: string[] }) => void): () => void
-  bindCamp(campId: string | null): Promise<void>
+  bindThread(threadId: string | null): Promise<void>
   open(request: OpenFilePreviewRequest): Promise<FilePreviewOperationResult<OpenFilePreviewResult>>
   restore(request: RestoreFilePreviewRequest): Promise<FilePreviewOperationResult<OpenFilePreviewResult>>
   reopen(request: ReopenFilePreviewRequest): Promise<FilePreviewOperationResult<OpenFilePreviewResult>>
@@ -1734,11 +1782,27 @@ export interface FilePreviewApi {
   openInSystem(request: { handleId: string }): Promise<FilePreviewOperationResult<{ opened: true }>>
   revealInFolder(request: { handleId: string }): Promise<FilePreviewOperationResult<{ revealed: true }>>
   copyPath(request: { handleId: string; format: 'display' | 'absolute' }): Promise<FilePreviewOperationResult<{ copied: true }>>
-  chooseAuthorizedRoot(request: { campId: string; pendingOpenId: string }): Promise<FilePreviewOperationResult<FilePreviewRootGrantResult | null>>
+  chooseAuthorizedRoot(request: { threadId: string; pendingOpenId: string }): Promise<FilePreviewOperationResult<FilePreviewRootGrantResult | null>>
   onExternalUpdate(listener: (event: FilePreviewExternalUpdateEvent) => void): () => void
 }
 
-export type CampTimelinePresentation =
+/** Creation-time snapshot, independent of the current member's configuration and presence. */
+export interface MemberCreationView {
+  creationId: string
+  /** Authenticated creating Run; absent only on receipts written before Run association. */
+  sourceAgentRunId?: string | null
+  agentId: string
+  displayName: string
+  avatarRef: string | null
+  teamRole: string
+  professionalResponsibilities: string
+  personalityTraits: string[]
+  creatorAgentId: string
+  creatorDisplayName: string
+  createdAt: string
+}
+
+export type ThreadTimelinePresentation =
   | {
       kind: 'task_event'
       taskId: string
@@ -1749,21 +1813,21 @@ export type CampTimelinePresentation =
       occurredAt: string
     }
 
-export interface CampTurnView {
+export interface ThreadTurnView {
   id: string
   triggerType: 'camp_message' | 'system_event'
   triggerId: string
   status: 'running' | 'waiting' | 'completed' | 'failed' | 'cancelled'
   cancelRequestedAt: string | null
   aggregateReasonCode: 'required_run_incomplete' | null
-  executionBudget: CampTurnExecutionBudgetView
+  executionBudget: ThreadTurnExecutionBudgetView
   version: number
   createdAt: string
   updatedAt: string
   endedAt: string | null
 }
 
-export interface CampTurnExecutionBudgetView {
+export interface ThreadTurnExecutionBudgetView {
   schemaVersion: 1
   acceptedAt: string
   deadlineAt: string | null
@@ -1785,7 +1849,7 @@ export type AgentRunCancelReasonCode =
 
 export interface AgentRunView {
   id: string
-  campTurnId: string | null
+  threadTurnId: string | null
   inputMessageIds?: string[]
   anchorMessageId?: string | null
   /** Core-rendered title source, independent of the loaded conversation page. */
@@ -1808,6 +1872,27 @@ export interface AgentRunView {
     | 'planned_shutdown_failed'
     | 'planned_shutdown_cancelled'
     | 'runtime_interrupted'
+    | 'agent_unavailable'
+    | 'member_away'
+    | 'member_removed'
+    | 'runtime_not_configured'
+    | 'runtime_configuration_invalid'
+    | 'runtime_configuration_adapter_mismatch'
+    | 'conversation_runtime_override_unsupported'
+    | 'adapter_installation_missing'
+    | 'adapter_installation_disabled'
+    | 'runtime_permission_adapter_mismatch'
+    | 'runtime_permission_schema_mismatch'
+    | 'runtime_permission_values_invalid'
+    | 'runtime_permission_option_unknown'
+    | 'runtime_permission_option_unsupported'
+    | 'runtime_permission_value_invalid'
+    | 'runtime_permission_value_required'
+    | 'runtime_model_options_invalid'
+    | 'runtime_model_unavailable'
+    | 'runtime_model_option_unknown'
+    | 'runtime_model_option_invalid'
+    | 'runtime_adapter_not_implemented'
     | null
   failure: RuntimeFailureView | null
   runtimeModel: { modelId: string | null } | null
@@ -1837,8 +1922,8 @@ export interface AgentRunDiagnosticView {
   schemaVersion: 1
   agentRunId: string
   executionEpoch: number
-  campId: string
-  campTurnId: string | null
+  threadId: string
+  threadTurnId: string | null
   conversationId: string
   agentId: string
   status: AgentRunView['status']
@@ -1858,7 +1943,7 @@ export interface AgentRunDiagnosticView {
   }
   output: {
     finalOutputDigest: string | null
-    finalCampMessageId: string | null
+    finalThreadMessageId: string | null
     publicOutput: string | null
     unavailableReason: 'run_not_succeeded' | 'not_published' | 'published_message_unavailable' | null
   }
@@ -1870,7 +1955,7 @@ export interface AgentRunDiagnosticView {
     manifestId: string | null
     renderedPayloadDigest: string | null
     charterDeliveryMode: 'native_append' | 'first_payload' | null
-    campMessageBoundarySequence: number | null
+    threadMessageBoundarySequence: number | null
     skillExposureDigest: string | null
     mcpExposureDigest: string | null
     mcpProjectionDigest: string | null
@@ -1973,7 +2058,7 @@ export interface AgentRunExecutionEvidencePage {
 /** Logical execution items, ordered by their stable first evidence sequence. */
 export interface AgentRunExecutionWindowPage {
   schemaVersion: 2
-  campId: string
+  threadId: string
   agentRunId: string
   requestedBeforeSequence: number | null
   requestedAfterSequence?: number | null
@@ -1982,6 +2067,8 @@ export interface AgentRunExecutionWindowPage {
   throughSequence: number
   throughChangeSequence: number
   runtimePhase?: 'thinking' | 'executing'
+  /** Ephemeral native short title; never a reasoning body or historical evidence. */
+  runtimeThinkingTitle?: string | null
   hasMore: boolean
   /** Unfinished operations older than the first page remain visible, outside the cursor. */
   activeEvidence?: AgentRunExecutionEvidenceView[]
@@ -1991,17 +2078,59 @@ export interface AgentRunExecutionWindowPage {
 
 export interface AgentRunExecutionWindowChanges {
   schemaVersion: 2
-  campId: string
+  threadId: string
   agentRunId: string
   requestedAfterChangeSequence: number
   nextAfterChangeSequence: number
   throughSequence: number
   throughChangeSequence: number
   runtimePhase?: 'thinking' | 'executing'
+  /** Ephemeral native short title; never a reasoning body or historical evidence. */
+  runtimeThinkingTitle?: string | null
   hasMore: boolean
   evidence: AgentRunExecutionEvidenceView[]
   /** In-place updates of previously loaded, unfinished evidence (including text). */
   refreshedEvidence: AgentRunExecutionEvidenceView[]
+}
+
+/** A read-time presentation boundary; tools inside it have a separate cursor. */
+export interface AgentRunExecutionBlock {
+  key: string
+  kind: 'item' | 'toolGroup'
+  sequence: number
+  lastSequence: number
+  changeSequence: number
+  toolCount: number
+  counts: Record<'completed' | 'failed' | 'stopped' | 'recorded' | 'running' | 'waiting', number>
+  /** One root item, or latest/active operations with their proven Shell supports (at most four rows). */
+  evidence: AgentRunExecutionEvidenceView[]
+}
+
+export interface AgentRunExecutionBlockPage extends Omit<AgentRunExecutionWindowPage, 'schemaVersion' | 'evidence' | 'activeEvidence'> {
+  schemaVersion: 3
+  blocks: AgentRunExecutionBlock[]
+  activeBlocks?: AgentRunExecutionBlock[]
+}
+
+export interface AgentRunExecutionBlockChanges extends Omit<AgentRunExecutionWindowChanges, 'schemaVersion' | 'evidence' | 'refreshedEvidence'> {
+  schemaVersion: 3
+  blocks: AgentRunExecutionBlock[]
+  /** Watched in-memory text may grow without advancing the durable change cursor. */
+  refreshedBlocks?: AgentRunExecutionBlock[]
+}
+
+export interface AgentRunExecutionGroupPage {
+  schemaVersion: 3
+  threadId: string
+  agentRunId: string
+  groupSequence: number
+  requestedBeforeSequence: number | null
+  requestedAfterSequence: number | null
+  nextBeforeSequence: number | null
+  nextAfterSequence: number | null
+  throughChangeSequence: number
+  hasMore: boolean
+  evidence: AgentRunExecutionEvidenceView[]
 }
 
 export interface ExecutionConsolePage {
@@ -2015,7 +2144,7 @@ export interface RuntimeInputDeliveryView {
   executionEpoch: number
   status: 'prepared' | 'accepted' | 'delivery_unknown' | 'not_accepted'
   nativeInputId: string | null
-  boundaryCampMessageSequence: number
+  boundaryThreadMessageSequence: number
   preparedAt: string
   acceptedAt: string | null
   resolvedAt: string | null
@@ -2088,7 +2217,7 @@ export interface NativeSessionBootstrapEvidenceView {
   createdAt: string
 }
 
-export interface CampAttachmentRefView {
+export interface ThreadAttachmentRefView {
   attachmentId: string
   path: string
   contentDigest?: string
@@ -2105,11 +2234,11 @@ export interface ContextManifestView {
   agentRunId: string
   bootstrap: NativeSessionBootstrapEvidenceView
   nativeBindingGeneration: number
-  campMessageBoundarySequence: number
+  threadMessageBoundarySequence: number
   conversationMessageBoundarySequence: number
   historyFenceVersion: number
   globalPublicMessageBoundary: number
-  historyCamps: ContextManifestHistoryCampView[]
+  historyThreads: ContextManifestHistoryThreadView[]
   rawMessageCount: number
   previousAcceptedPublicBoundarySequence: number
   contextDeliveryProfileVersion: 4 | 5 | 6 | 7 | 8
@@ -2139,13 +2268,13 @@ export interface ContextManifestView {
   workspaceFactDigest?: string | null
   workspaceFactIncluded?: boolean
   currentInputSource: unknown
-  attachmentRefs: CampAttachmentRefView[]
+  attachmentRefs: ThreadAttachmentRefView[]
   attachmentDigest: string
   skillExposure: SkillExposureSnapshot
   skillExposureDigest: string
   currentInputSkillResolution: CurrentInputSkillResolution
   currentInputSkillResolutionDigest: string
-  messageProjectionAudience: 'agent_v1'
+  messageProjectionAudience: 'agent_v1' | 'agent_v2'
   a2aGuidanceEvidence: unknown
   a2aGuidanceEvidenceDigest: string
   mcpExposure: McpExposureSnapshot
@@ -2159,9 +2288,9 @@ export interface ContextManifestView {
   createdAt: string
 }
 
-export interface ContextManifestHistoryCampView {
-  campId: string
-  campTitle: string
+export interface ContextManifestHistoryThreadView {
+  threadId: string
+  threadTitle: string
   lastVisibleActivityAt: string
 }
 
@@ -2217,7 +2346,7 @@ export interface DomainEventView {
   globalSequence: number
   eventId: string | null
   eventType: string
-  campId: string | null
+  threadId: string | null
   entityType: string | null
   entityId: string | null
   actorType: string | null
@@ -2297,15 +2426,17 @@ export interface AgentRunImageContent {
   data: string
 }
 
-export interface CampSnapshot {
-  schemaVersion: 34
+export const THREAD_SNAPSHOT_SCHEMA_VERSION = 35
+
+export interface ThreadSnapshot {
+  schemaVersion: typeof THREAD_SNAPSHOT_SCHEMA_VERSION
   throughGlobalSequence: number
-  camp: {
+  thread: {
     id: string
     title: string
     missionId?: string | null
-    channelSource?: CampChannelSource | null
-    activationState: CampActivationState
+    channelSource?: ThreadChannelSource | null
+    activationState: ThreadActivationState
     projectBindingKind: ProjectBindingKind
     projectPath: string
     defaultLeadAgentId: string | null
@@ -2314,12 +2445,13 @@ export interface CampSnapshot {
     createdAt: string
     updatedAt: string
   }
-  members: CampMemberView[]
-  membershipReconciliations: CampMembershipReconciliationView[]
+  members: ThreadMemberView[]
+  membershipReconciliations: ThreadMembershipReconciliationView[]
   tasks: TaskView[]
-  messages: CampMessageView[]
+  memberCreations?: MemberCreationView[]
+  messages: ThreadMessageView[]
   messageDeliveries: MessageDeliveryView[]
-  turns: CampTurnView[]
+  turns: ThreadTurnView[]
   agentRuns: AgentRunView[]
   executionEvidence: AgentRunExecutionEvidenceView[]
   agentRunFileChanges: AgentRunFileChangesView[]
@@ -2330,69 +2462,70 @@ export interface CampSnapshot {
   timeline: DomainEventView[]
 }
 
-export interface CampOpenCollectionCoverage {
+export interface ThreadOpenCollectionCoverage {
   loadedCount: number
   totalCount: number
   omittedCount: number
   complete: boolean
 }
 
-export interface CampOpenMessageCoverage extends CampOpenCollectionCoverage {
+export interface ThreadOpenMessageCoverage extends ThreadOpenCollectionCoverage {
   oldestLoadedSequence: number | null
   newestLoadedSequence: number | null
   hasEarlier: boolean
 }
 
-export interface CampOpenProjection {
+export interface ThreadOpenProjection {
   schemaVersion: 8
   throughGlobalSequence: number
-  camp: CampSnapshot['camp']
-  members: CampMemberView[]
-  membershipReconciliations: CampMembershipReconciliationView[]
+  thread: ThreadSnapshot['thread']
+  members: ThreadMemberView[]
+  membershipReconciliations: ThreadMembershipReconciliationView[]
   tasks: TaskView[]
-  messages: CampMessageView[]
+  memberCreations?: MemberCreationView[]
+  messages: ThreadMessageView[]
   messageDeliveries: MessageDeliveryView[]
-  turns: CampTurnView[]
+  turns: ThreadTurnView[]
   agentRuns: AgentRunView[]
   executionEvidence: AgentRunExecutionEvidenceView[]
   agentRunFileChanges: AgentRunFileChangesView[]
   agentRunImages?: AgentRunImagesView[]
   approvals: ActionApprovalView[]
   coverage: {
-    tasks: CampOpenCollectionCoverage
-    messages: CampOpenMessageCoverage
-    messageDeliveries: CampOpenCollectionCoverage
-    turns: CampOpenCollectionCoverage
-    agentRuns: CampOpenCollectionCoverage
-    approvals: CampOpenCollectionCoverage
+    tasks: ThreadOpenCollectionCoverage
+    messages: ThreadOpenMessageCoverage
+    messageDeliveries: ThreadOpenCollectionCoverage
+    turns: ThreadOpenCollectionCoverage
+    agentRuns: ThreadOpenCollectionCoverage
+    approvals: ThreadOpenCollectionCoverage
   }
 }
 
-export interface CampMessagePage {
+export interface ThreadMessagePage {
   schemaVersion: 1
-  campId: string
+  threadId: string
   throughGlobalSequence: number
   requestedBeforeSequence: number
   nextBeforeSequence: number | null
   hasMore: boolean
-  messages: CampMessageView[]
+  messages: ThreadMessageView[]
 }
 
-export interface CampMessageAroundSnapshot {
+export interface ThreadMessageAroundSnapshot {
   schemaVersion: 1
   throughGlobalSequence: number
-  campId: string
+  threadId: string
   anchorMessageId: string
   sourceAvailable: boolean
-  messages: CampMessageView[]
+  messages: ThreadMessageView[]
 }
 
-export interface CampMessageAroundParams {
-  campId: string
+export interface ThreadMessageAroundParams {
+  threadId: string
   messageId: string
 }
 
-export interface CampMessageFindMatch {
+export interface ThreadMessageFindMatch {
   messageId: string
   messageSequence: number
   occurrenceIndex: number
@@ -2400,18 +2533,18 @@ export interface CampMessageFindMatch {
   endOffset: number
 }
 
-export interface CampMessageFindSnapshot {
+export interface ThreadMessageFindSnapshot {
   schemaVersion: 1
   throughGlobalSequence: number
-  campId: string
+  threadId: string
   query: string
   totalMatchCount: number
   selectedMatchIndex: number | null
-  match: CampMessageFindMatch | null
+  match: ThreadMessageFindMatch | null
 }
 
-export interface CampMessageFindParams {
-  campId: string
+export interface ThreadMessageFindParams {
+  threadId: string
   query: string
   selectedMatchIndex?: number | null
   anchorMessageId?: string | null
@@ -2420,7 +2553,7 @@ export interface CampMessageFindParams {
 interface MessageDeliveryBaseView {
   id: string
   messageId: string
-  campTurnId: string | null
+  threadTurnId: string | null
   taskId: string | null
   recipientAgentId: string
   recipientMembershipVersionAtAdmission: number | null
@@ -2542,8 +2675,8 @@ export interface NotificationActionView {
   actionId: string
   kind: NotificationActionKind
   available: boolean
-  campId: string
-  campTurnId: string | null
+  threadId: string
+  threadTurnId: string | null
   agentRunId: string | null
   messageId: string | null
   approvalId: string | null
@@ -2559,12 +2692,12 @@ export interface NotificationEpisodeView {
   episodeVersion: number
   attentionRevision: number
   changeSequence: number
-  camp: {
+  thread: {
     id: string
     title: string
-    channelSource?: CampChannelSource | null
+    channelSource?: ThreadChannelSource | null
   }
-  campTurnId: string | null
+  threadTurnId: string | null
   agentRunId: string | null
   primarySemantic: NotificationSemantic
   unread: boolean
@@ -3032,7 +3165,7 @@ export type MemberWorkspaceLocationTab = 'identity' | 'runtime'
 
 export type RestorableLocation =
   | { kind: 'quick_chat' }
-  | { kind: 'camp'; campId: string }
+  | { kind: 'camp'; threadId: string }
   | { kind: 'members'; agentId: string | null; tab: MemberWorkspaceLocationTab }
   | { kind: 'memory' }
 
@@ -3067,6 +3200,27 @@ export interface DesktopStartupSnapshot {
 export interface WindowResetCapability {
   canReset: boolean
   reason: 'fullscreen' | null
+}
+
+export type WindowCloseBehavior = 'ask' | 'tray' | 'exit'
+export interface WindowCloseSnapshot {
+  revision: number
+  behavior: WindowCloseBehavior
+  promptId: number | null
+  busy: boolean
+  error: 'load_failed' | 'tray_unavailable' | 'save_failed' | 'quit_failed' | null
+}
+export interface WindowCloseResponse {
+  promptId: number
+  action: 'tray' | 'exit' | 'cancel'
+  remember: boolean
+}
+/** Windows Desktop only. Main owns the preference, prompt identity and native tray. */
+export interface WindowCloseApi {
+  get(): Promise<WindowCloseSnapshot>
+  setBehavior(behavior: WindowCloseBehavior): Promise<WindowCloseSnapshot>
+  respond(response: WindowCloseResponse): Promise<WindowCloseSnapshot>
+  onChanged(listener: (snapshot: WindowCloseSnapshot) => void): () => void
 }
 
 export interface WindowResetResult {
@@ -3108,16 +3262,29 @@ export interface OnboardingProvisioningOperation {
   memberAgentId: string | null
   memberVersionBeforeRuntime: number | null
   memberVersionAfterRuntime: number | null
-  quickChatCampId: string | null
+  runtimeCopies: OnboardingRuntimeCopy[] | null
+  quickChatThreadId: string | null
 }
+
+export interface OnboardingRuntimeCopyTarget {
+  agentId: string
+  expectedVersion: number
+}
+
+export interface OnboardingRuntimeCopy extends OnboardingRuntimeCopyTarget {
+  commandId: string
+  status: 'pending' | 'applied' | 'skipped'
+}
+
+export type OnboardingRuntimeCopyOutcome = 'applied' | 'skipped' | 'retry'
 
 export type OnboardingSnapshot =
   | {
-      schemaVersion: 2
+      schemaVersion: 3
       status: 'uninitialized'
     }
   | {
-      schemaVersion: 2
+      schemaVersion: 3
       status: 'in_progress'
       step: OnboardingStep
       selectedMemberRole: BuiltinMemberAvatarRole | null
@@ -3125,13 +3292,13 @@ export type OnboardingSnapshot =
       provisioning: OnboardingProvisioningOperation | null
     }
   | {
-      schemaVersion: 2
+      schemaVersion: 3
       status: 'completed'
       origin: 'onboarding' | 'runtime_deferred' | 'existing_installation'
       completedAt: string
       selectedMemberRole: BuiltinMemberAvatarRole | null
       memberAgentId: string | null
-      quickChatCampId: string | null
+      quickChatThreadId: string | null
     }
 
 export interface OnboardingApi {
@@ -3149,7 +3316,9 @@ export interface OnboardingApi {
   ): Promise<OnboardingSnapshot>
   recordProvisionedMember(agentId: string, version: number): Promise<OnboardingSnapshot>
   recordProvisionedRuntime(version: number): Promise<OnboardingSnapshot>
-  recordProvisionedCamp(campId: string): Promise<OnboardingSnapshot>
+  prepareRuntimeCopies(targets: OnboardingRuntimeCopyTarget[]): Promise<OnboardingSnapshot>
+  recordRuntimeCopy(agentId: string, commandId: string, outcome: OnboardingRuntimeCopyOutcome): Promise<OnboardingSnapshot>
+  recordProvisionedThread(threadId: string): Promise<OnboardingSnapshot>
   complete(): Promise<OnboardingSnapshot>
 }
 
@@ -3182,20 +3351,30 @@ export interface RemovedNavigationProject {
   removedAt: string
 }
 
+export interface NavigationThreadReadState {
+  /** Explicit local reminder; viewing new replies does not clear this intent. */
+  manualUnread: boolean
+  /** Explicit mark-read boundary; never changes Core's observed read cursor. */
+  readThroughGlobalSequence: number
+}
+
 export interface NavigationPreferencesSnapshot {
-  schemaVersion: 4
+  schemaVersion: 5
   pins: NavigationPin[]
   removedProjects: RemovedNavigationProject[]
   projectOrder: string[] | null
   projectNames: Record<string, string>
+  threadReadStates: Record<string, NavigationThreadReadState>
 }
 
 export interface NavigationPreferencesApi {
   get(): Promise<NavigationPreferencesSnapshot>
+  setThreadReadState(threadId: string, state: NavigationThreadReadState | null): Promise<NavigationPreferencesSnapshot>
+  onChanged(listener: (snapshot: NavigationPreferencesSnapshot) => void): () => void
   replacePins(pins: NavigationPin[]): Promise<NavigationPreferencesSnapshot>
   synchronizeProjectOrder(projectKeys: string[]): Promise<NavigationPreferencesSnapshot>
   setProjectName(targetKey: string, name: string | null): Promise<NavigationPreferencesSnapshot>
-  removeProject(targetKey: string, relatedCampIds: string[]): Promise<NavigationPreferencesSnapshot>
+  removeProject(targetKey: string, relatedThreadIds: string[]): Promise<NavigationPreferencesSnapshot>
   restoreProject(targetKey: string): Promise<NavigationPreferencesSnapshot>
 }
 
@@ -3602,7 +3781,7 @@ export interface MemoryRevision {
   retrievalKeys: string[]
   actorKind: MemoryRevisionActorKind | null
   actorId: string | null
-  sourceCampId: string | null
+  sourceThreadId: string | null
   sourceAgentRunId: string | null
   sourceExecutionEpoch: number | null
   createdFromHearthReviewItemId: string | null
@@ -3667,7 +3846,7 @@ export interface HearthReviewItem {
   targetMemoryId: string | null
   baseRevisionId: string | null
   sourceAgentId: string
-  sourceCampId: string
+  sourceThreadId: string
   sourceAgentRunId: string
   sourceExecutionEpoch: number
   acceptedMemoryId: string | null
@@ -3743,7 +3922,7 @@ export interface AutomationRunSummary {
   status: 'running' | 'cancelling' | 'completed' | 'failed' | 'skipped'
   reason: string | null
   scheduledFor: string
-  campId: string | null
+  threadId: string | null
   resultMessageId: string | null
   notificationStatus: 'none' | 'pending' | 'sent' | 'failed' | 'partial'
   createdAt: string
@@ -3809,6 +3988,7 @@ export type CoreMethod =
   | 'health.check'
   | 'diagnostics.check'
   | 'monitoring.snapshot'
+  | 'monitoring.execution'
   | 'runtime.discovery.rescan'
   | 'runtime.networkRecovery.wake'
   | 'runtime.subsystems.get'
@@ -3823,7 +4003,7 @@ export type CoreMethod =
   | 'runtime.pendingExecution.cancel'
   | 'members.list'
   | 'members.get'
-  | 'members.camps.list'
+  | 'members.threads.list'
   | 'members.create'
   | 'members.update'
   | 'memberAvatars.read'
@@ -3985,33 +4165,34 @@ export type CoreMethod =
   | 'channels.executionConsole.agentRun.cancel'
   | 'channels.executionConsole.webSnapshot'
   | 'channels.deliveries.settle'
-  | 'camp.attachments.desktopOpenTarget'
-  | 'camp.attachments.location'
+  | 'thread.attachments.desktopOpenTarget'
+  | 'thread.attachments.location'
   | 'app.info'
-  | 'camps.creationPreflight'
+  | 'threads.creationPreflight'
   | 'workspaces.validate'
   | 'workspaces.inspect'
   | 'navigation.snapshot'
-  | 'navigation.camps'
-  | 'navigation.groupCamps'
-  | 'navigation.findCamp'
+  | 'navigation.threads'
+  | 'navigation.groupThreads'
+  | 'navigation.findThread'
   | 'navigation.campViewed'
-  | 'camps.create'
-  | 'camps.discardPending'
-  | 'camps.rename'
-  | 'camps.members.fast.check'
-  | 'camps.members.fast.set'
-  | 'camps.members.add'
-  | 'camps.members.removalPreview'
-  | 'camps.members.remove'
-  | 'camps.changeDefaultLead'
-  | 'camps.reconcileDefaultLead'
-  | 'camps.exists'
-  | 'camps.enter'
-  | 'camps.open'
-  | 'camps.delete'
-  | 'camps.deletionIssues'
-  | 'camps.retryDeletion'
+  | 'threads.create'
+  | 'threads.discardPending'
+  | 'threads.pendingDraft.setPresence'
+  | 'threads.rename'
+  | 'threads.members.fast.check'
+  | 'threads.members.fast.set'
+  | 'threads.members.add'
+  | 'threads.members.removalPreview'
+  | 'threads.members.remove'
+  | 'threads.changeDefaultLead'
+  | 'threads.reconcileDefaultLead'
+  | 'threads.exists'
+  | 'threads.enter'
+  | 'threads.open'
+  | 'threads.delete'
+  | 'threads.deletionIssues'
+  | 'threads.retryDeletion'
   | 'singleChat.list'
   | 'singleChat.get'
   | 'singleChat.open'
@@ -4024,13 +4205,13 @@ export type CoreMethod =
   | 'agentRuns.cancel'
   | 'agentRuns.diagnostic.get'
   | 'executionTrace.export'
-  | 'camps.snapshot'
+  | 'threads.snapshot'
   | 'agentRunFileChanges.get'
   | 'agentRunImages.read'
-  | 'camp.messages.page'
-  | 'camp.messages.around'
-  | 'camp.messages.find'
-  | 'camp.messages.withdraw'
+  | 'thread.messages.page'
+  | 'thread.messages.around'
+  | 'thread.messages.find'
+  | 'thread.messages.withdraw'
   | 'agentRunEvidence.getContent'
   | 'agentRunEvidence.list'
   | 'agentRunExecution.page'
@@ -4041,9 +4222,9 @@ export type CoreMethod =
   | 'tasks.get'
   | 'messageQuotes.mutateDraft'
   | 'messageQuotes.capture'
-  | 'camp.messages.send'
-  | 'camp.messages.withdraw'
-  | 'userAutomation.camp.send'
+  | 'thread.messages.send'
+  | 'thread.messages.withdraw'
+  | 'userAutomation.thread.send'
   | 'action.approvals.resolve'
   | 'notifications.inbox'
   | 'notifications.changesSince'
@@ -4090,7 +4271,7 @@ export interface RovaiApi {
   }
   supervisor: SupervisorApi
   userAutomation: {
-    onOpenCamp(listener: (request: { campId: string }) => void): () => void
+    onOpenThread(listener: (request: { threadId: string }) => void): () => void
   }
   appearance: AppearanceApi
   appUpdates: AppUpdatesApi
@@ -4100,15 +4281,16 @@ export interface RovaiApi {
   channels: ChannelsApi
   onboarding: OnboardingApi
   windowControls: WindowControlsApi
+  windowClose?: WindowCloseApi
   navigationPreferences: NavigationPreferencesApi
   memberAvatars: MemberAvatarsApi
   composerAttachments: {
-    prepare(campId: string, expectedRevision: number, file: File): Promise<LocalAttachmentSourceView>
+    prepare(threadId: string, expectedRevision: number, file: File): Promise<LocalAttachmentSourceView>
     preview(locator: LocalAttachmentOwnerLocator): Promise<AttachmentPreviewResult>
     /** Desktop-local authority restore; absent on remote/browser adapters. */
-    restore?(campId: string, attachments: LocalAttachmentSourceView[]): Promise<LocalAttachmentSourceView[]>
-    /** Releases Desktop-local authority after remove, send, or Camp deletion. */
-    discard?(campId: string, attachmentRefIds?: string[]): Promise<void>
+    restore?(threadId: string, attachments: LocalAttachmentSourceView[]): Promise<LocalAttachmentSourceView[]>
+    /** Releases Desktop-local authority after remove, send, or Thread deletion. */
+    discard?(threadId: string, attachmentRefIds?: string[]): Promise<void>
     location?(locator: LocalAttachmentOwnerLocator): Promise<string | null>
   }
   missionAttachments: MissionAttachmentsApi
@@ -4119,7 +4301,7 @@ export interface RovaiApi {
       file: File
     ): Promise<SingleChatSnapshot>
     preparePending(input: {
-      campId: string
+      threadId: string
       conversationId: string
       pendingInputId: string
       expectedRevision: number
@@ -4140,6 +4322,7 @@ export interface RovaiApi {
     write(input: { text: string; html: string | null }): Promise<void>
   }
   selectWorkspaceDirectory(): Promise<WorkspaceSelection | null>
+  revealProjectDirectory(projectPath: string): Promise<void>
   selectRuntimeExecutable(): Promise<string | null>
   selectSkillImportDirectory(): Promise<string | null>
   revealSkill(skillId: string): Promise<void>
@@ -4155,7 +4338,7 @@ export interface RovaiApi {
 export type MissionStatus = 'needs_you' | 'not_started' | 'in_progress' | 'completed'
 export interface MissionInfo { missionId: string; title: string; description: string; status: MissionStatus; sourceMessageId: string | null }
 export interface MissionWorkspaceCleanupView { state: 'cleaning' | 'failed' | 'cleaned'; worktreeRemoved: boolean; branchRemoved: boolean; diagnostic: string | null }
-export interface MissionRecord extends MissionInfo { number: number; hasUnread: boolean; campId: string; projectPath: string; projectBindingKind: ProjectBindingKind; detailsVersion: number; tags: string[]; attachments: LocalAttachmentSourceView[]; createdAt: string; updatedAt: string; memberAgentIds: string[]; defaultLeadAgentId: string | null; runningAgentIds: string[]; startAvailable: boolean; workspaceEverCreated: boolean; workspaceResourcesPresent: boolean; cleanupAvailable: boolean; workspaceCleanup?: MissionWorkspaceCleanupView }
+export interface MissionRecord extends MissionInfo { number: number; hasUnread: boolean; threadId: string; projectPath: string; projectBindingKind: ProjectBindingKind; detailsVersion: number; tags: string[]; attachments: LocalAttachmentSourceView[]; createdAt: string; updatedAt: string; memberAgentIds: string[]; defaultLeadAgentId: string | null; runningAgentIds: string[]; startAvailable: boolean; workspaceEverCreated: boolean; workspaceResourcesPresent: boolean; cleanupAvailable: boolean; workspaceCleanup?: MissionWorkspaceCleanupView }
 export interface MissionCreate { title: string; description: string; projectPath: string; projectBindingKind: ProjectBindingKind; memberAgentIds: string[]; defaultLeadAgentId: string; tags: string[] }
 export interface MissionUpdate { missionId: string; title?: string; description?: string; tags?: string[]; expectedDetailsVersion?: number }
 export interface MissionAttachmentDraft { id: string; file: File; kindHint: 'file' | 'directory' }
@@ -4164,8 +4347,8 @@ export interface MissionAttachmentsApi {
   update(commandId: string, command: MissionUpdate, keepAttachmentIds: string[], attachments: MissionAttachmentDraft[]): Promise<StoredCommandResult>
 }
 export interface MissionActivity { id: number; kind: string; actorType: string; actorId: string; changes: Record<string, unknown>; createdAt: string }
-export interface MissionWorkspace { id: string; missionId: string; campId: string; executionHostId: string; sourceDirectory: string; repositoryRoot: string; gitCommonDir: string; worktreePath: string; workingDirectory: string; baseBranch: string | null; managedBranch: string; baseSha: string; state: 'preparing' | 'ready' | 'cleaned' | 'cleanup_pending' | 'cleanup_failed'; cleanupWorktreeRemoved: boolean; cleanupBranchRemoved: boolean; diagnostic: string | null }
-export interface MissionDelivery { campId: string; workingDirectory: string; git: boolean; workspace: MissionWorkspace | null; pullRequests: { id: string; url: string; title: string; createdAt: string }[]; files: { attachmentId: string; displayName: string; kind: 'file' | 'directory'; fileCount: number; mediaType: string; byteSize: number; previewKind: 'image' | 'none'; messageId: string; agentId: string; createdAt: string }[] }
+export interface MissionWorkspace { id: string; missionId: string; threadId: string; executionHostId: string; sourceDirectory: string; repositoryRoot: string; gitCommonDir: string; worktreePath: string; workingDirectory: string; baseBranch: string | null; managedBranch: string; baseSha: string; state: 'preparing' | 'ready' | 'cleaned' | 'cleanup_pending' | 'cleanup_failed'; cleanupWorktreeRemoved: boolean; cleanupBranchRemoved: boolean; diagnostic: string | null }
+export interface MissionDelivery { threadId: string; workingDirectory: string; git: boolean; workspace: MissionWorkspace | null; pullRequests: { id: string; url: string; title: string; createdAt: string }[]; files: { attachmentId: string; displayName: string; kind: 'file' | 'directory'; fileCount: number; mediaType: string; byteSize: number; previewKind: 'image' | 'none'; messageId: string; agentId: string; createdAt: string }[] }
 export interface MissionChangedFile { id: string; path: string; oldPath: string | null; kind: 'added' | 'deleted' | 'renamed' | 'copied' | 'type_changed' | 'unmerged' | 'modified'; additions: number | null; deletions: number | null; binary: boolean; oldMode: string; newMode: string }
 export type CheckoutState = { kind: 'branch'; branch: string; head: string } | { kind: 'detached'; head: string } | { kind: 'unavailable' }
 export interface MissionWorkspaceChangesView { checkoutState: CheckoutState; viewId: string | null; files: MissionChangedFile[] | null; diffError: string | null }

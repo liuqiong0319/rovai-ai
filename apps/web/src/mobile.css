@@ -36,7 +36,7 @@ html[data-mobile-web="true"] .mobile-icon-button:disabled { opacity: .4; }
 html[data-mobile-web="true"] .navigation-scroll { flex: 1; min-height: 0; margin-right: 0; padding: 0 20px 12px; overscroll-behavior: contain; }
 html[data-mobile-web="true"] :is(.camp-nav-row, .camp-nav-open) { min-height: 44px; height: 44px; margin: 0; border: 0; }
 html[data-mobile-web="true"] .camp-nav-row { margin-inline: -12px; }
-html[data-mobile-web="true"] .camp-nav-open { position: relative; gap: 8px; padding: 0 12px; font-size: 14px; }
+html[data-mobile-web="true"] .camp-nav-open { position: relative; gap: 8px; padding: 0 56px 0 12px; font-size: 14px; }
 html[data-mobile-web="true"] .pinned-navigation > .camp-nav-row > .camp-nav-open { padding-left: 12px; }
 html[data-mobile-web="true"] .pinned-navigation > .camp-nav-row > .camp-nav-open > .pinned-camp-icon { display: inline-flex; flex: 0 0 20px; width: 20px; height: 20px; color: var(--muted); }
 html[data-mobile-web="true"] .pinned-navigation > .camp-nav-row > .camp-nav-open > .pinned-camp-icon > svg { width: 20px; height: 20px; flex: none; }
@@ -185,8 +185,8 @@ html[data-mobile-web="true"] .approval-reason-wrap { flex: 0 0 auto; max-height:
 html[data-mobile-web="true"] .approval-reason { font-size: 12px; line-height: 1.5; }
 html[data-mobile-web="true"] .approval-reason-toggle { min-width: 44px; }
 html[data-mobile-web="true"] .approval-dock-scroll > pre { flex: 0 1 auto; min-height: 48px; max-height: 160px; margin: 0; padding: 10px; }
-html[data-mobile-web="true"] .approval-dock-actions { flex: none; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-html[data-mobile-web="true"] .approval-dock .runtime-option { min-height: 44px; padding: 8px 6px; color: var(--ink); background: var(--surface); font-size: 12px; line-height: 1.35; text-align: center; touch-action: manipulation; }
+html[data-mobile-web="true"] .approval-dock-actions { flex: none; gap: 8px; }
+html[data-mobile-web="true"] .approval-dock .runtime-option { min-width: 44px; min-height: 44px; padding: 8px 6px; color: var(--ink); background: var(--surface); font-size: 12px; line-height: 1.35; text-align: center; touch-action: manipulation; }
 html[data-mobile-web="true"] .approval-dock .runtime-option:hover:not(:disabled) { border-color: var(--control-line); background: var(--neutral-hover); }
 html[data-mobile-web="true"] .approval-option-error { font-size: 12px; line-height: 1.5; }
 /* The shell tracks visualViewport, including a raised software keyboard. */
@@ -233,7 +233,7 @@ html[data-mobile-web="true"] .settings-page-heading { flex-wrap: wrap; gap: 8px;
 html[data-mobile-web="true"] .settings-page-heading h1 { font-size: 24px; }
 html[data-mobile-web="true"] :is(.settings-page-eyebrow, .settings-page-heading-copy > p, .appearance-settings-page .display-section) { display: none; }
 html[data-mobile-web="true"] .settings-page-heading-aside { width: 100%; }
-html[data-mobile-web="true"] .settings-panel-about .about-update-control { display: grid; grid-template-columns: minmax(0, 1fr); justify-content: stretch; gap: 14px; }
+html[data-mobile-web="true"] .settings-panel-about .about-updates-topline { display: grid; grid-template-columns: minmax(0, 1fr); justify-content: stretch; gap: 14px; }
 html[data-mobile-web="true"] .settings-panel-about .about-update-actions { display: flex !important; width: 100%; margin-left: 0; }
 html[data-mobile-web="true"] .settings-panel-about .about-update-actions > .primary-button { min-height: 44px; flex: 1 1 auto; }
 html[data-mobile-web="true"] .settings-panel-about .about-update-actions > .quiet-button { min-height: 44px; order: 2; }
@@ -600,3 +600,6 @@ html[data-mobile-web="true"][data-motion-preference="reduce"] :is(.app-shell > .
 @media(prefers-reduced-motion:reduce) {
   html[data-mobile-web="true"] :is(.app-shell > .content,.mobile-settings-detail,.app-menu,.mobile-conversation-scrim) { animation: none !important; }
 }
+
+html[data-mobile-web="true"] .camp-nav-row .camp-status-cluster,
+html[data-mobile-web="true"] .camp-nav-row:is(:hover, :has(:focus-visible), [data-menu-open="true"]) .camp-status-cluster { right: 12px; visibility: visible; }

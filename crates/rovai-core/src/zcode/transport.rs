@@ -21,7 +21,7 @@ use tokio::{
         AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader,
         DuplexStream,
     },
-    sync::{Mutex, mpsc, oneshot},
+    sync::{Mutex, Notify, mpsc, oneshot},
     task::JoinSet,
 };
 
@@ -168,6 +168,7 @@ struct Session {
     cancel_input: Option<String>,
     cancel_requests: std::collections::HashSet<String>,
     acceptance_compaction: Option<oneshot::Sender<()>>,
+    context_refresh_pending: Option<u64>,
 }
 
 struct PendingPermission {
@@ -185,6 +186,8 @@ struct Bridge {
     sessions: Mutex<HashMap<String, Session>>,
     finished: mpsc::Sender<(String, Result<Value>)>,
     background_settle: mpsc::Sender<String>,
+    context_refresh: Notify,
+    snapshot_read: Mutex<()>,
     config: NativeConfig,
     cwd: PathBuf,
     mode: String,
@@ -220,6 +223,8 @@ where
         mode,
         finished,
         background_settle,
+        context_refresh: Notify::new(),
+        snapshot_read: Mutex::new(()),
         acceptance_compacted: AtomicBool::new(false),
     });
     tokio::spawn(async move {
@@ -269,6 +274,48 @@ where
             }
             Ok(())
         });
+        let context_bridge = bridge.clone();
+        workers.spawn(async move {
+            loop {
+                context_bridge.context_refresh.notified().await;
+                let requested = {
+                    let mut sessions = context_bridge.sessions.lock().await;
+                    sessions
+                        .iter_mut()
+                        .filter_map(|(id, session)| {
+                            session.context_refresh_pending.take()?;
+                            Some((id.clone(), session.events.input_id()?.to_string()))
+                        })
+                        .collect::<Vec<_>>()
+                };
+                for (session_id, input_id) in requested {
+                    // The reader task continues servicing RPC responses while
+                    // this worker waits. No prompt-final or UI visibility gate.
+                    let Ok(snapshot) = context_bridge.read_snapshot(&session_id, true).await else {
+                        continue;
+                    };
+                    let mut sessions = context_bridge.sessions.lock().await;
+                    if let Some(session) = sessions.get_mut(&session_id)
+                        && session.events.input_id() == Some(input_id.as_str())
+                    {
+                        // The snapshot can already cover events received while
+                        // its RPC was in flight. Keep only newer pending work.
+                        if let Some(covered) = snapshot
+                            .pointer("/runtime/eventSeq")
+                            .and_then(Value::as_u64)
+                        {
+                            session.context_refresh_pending =
+                                session.context_refresh_pending.filter(|seq| *seq > covered);
+                        }
+                        // Keep the owner stable through forwarding. The next Run
+                        // must not inherit an earlier read's numeric receipt.
+                        if let Some(context) = native_context_update(&session_id, &snapshot) {
+                            write_frame(&context_bridge.core, &context).await?;
+                        }
+                    }
+                }
+            }
+        });
         let finish_bridge = bridge.clone();
         let background_bridge = bridge.clone();
         workers.spawn(async move {
@@ -283,11 +330,18 @@ where
         });
         workers.spawn(async move {
             while let Some((session_id,terminal)) = finished_rx.recv().await {
-                let jobs = finish_bridge.settle_foreground(&session_id, terminal.is_err()).await?;
+                let snapshot = finish_bridge.settle_foreground(&session_id, terminal.is_err()).await?;
+                let jobs = snapshot.pointer("/projection/backgroundJobs").and_then(Value::as_array)
+                    .context("ZCode background state unavailable")?;
                 let (messages,reply,cancel_tasks) = {
                     let mut sessions = finish_bridge.sessions.lock().await;
                     let session = sessions.get_mut(&session_id).context("ZCode finishing Session missing")?;
-                    let messages = session.events.finish(&session_id,&jobs)?;
+                    let mut messages = Vec::new();
+                    if session.events.input_id().is_some()
+                        && let Some(context) = native_context_update(&session_id, &snapshot) {
+                        messages.push(context);
+                    }
+                    messages.extend(session.events.finish(&session_id,jobs)?);
                     let cancel_tasks = if session.cancelled {
                         session.events.background_tasks_for_input(session.cancel_input.as_deref())
                     } else { Vec::new() };
@@ -598,6 +652,7 @@ impl Bridge {
                         cancel_input: None,
                         cancel_requests: Default::default(),
                         acceptance_compaction: None,
+                        context_refresh_pending: None,
                     },
                 );
                 self.call(
@@ -782,19 +837,43 @@ impl Bridge {
         Ok(())
     }
 
-    async fn settle_foreground(&self, session_id: &str, allow_failed: bool) -> Result<Vec<Value>> {
+    async fn read_snapshot(&self, session_id: &str, bounded_messages: bool) -> Result<Value> {
+        // Also serialize with terminal/background reads. The official protocol
+        // accepts a positive messageLimit; 1 avoids transferring chat history.
+        let _guard = self.snapshot_read.lock().await;
+        let mut params = json!({"sessionId":session_id});
+        if bounded_messages {
+            params["messageLimit"] = json!(1);
+        }
+        // Older native shapes may reject the optional limit. A live metrics
+        // failure must not break the pre-existing terminal settlement request.
+        let started = std::time::Instant::now();
+        let result = self.call("session/read", params).await;
+        crate::monitoring::context_acceptance_trace(|| {
+            let snapshot = result.as_ref().ok();
+            json!({"kind":"zcode_context_read", "sessionId":session_id,
+                "returnedAt":chrono::Utc::now().to_rfc3339(), "durationMs":started.elapsed().as_millis(),
+                "boundedMessages":bounded_messages, "succeeded":result.is_ok(),
+                "eventSeq":snapshot.and_then(|s|s.pointer("/runtime/eventSeq")).and_then(Value::as_u64),
+                "stateRevision":snapshot.and_then(|s|s.pointer("/runtime/stateRevision")).and_then(Value::as_u64),
+                "used":snapshot.and_then(|s|s.pointer("/runtime/contextUsage/used")).and_then(Value::as_u64),
+                "size":snapshot.and_then(|s|s.pointer("/runtime/contextUsage/size")).and_then(Value::as_u64)
+            })
+        });
+        result
+    }
+
+    async fn settle_foreground(&self, session_id: &str, allow_failed: bool) -> Result<Value> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
-            let snapshot = self
-                .call("session/read", json!({"sessionId":session_id}))
-                .await?;
-            let jobs = snapshot
+            let snapshot = self.read_snapshot(session_id, false).await?;
+            snapshot
                 .pointer("/projection/backgroundJobs")
                 .and_then(Value::as_array)
                 .context("ZCode background state unavailable")?;
             let quiescent = foreground_quiescent(&snapshot, allow_failed);
             if quiescent {
-                return Ok(jobs.clone());
+                return Ok(snapshot);
             }
             if tokio::time::Instant::now() >= deadline {
                 bail!("ZCode foreground Tool or permission did not settle");
@@ -937,7 +1016,22 @@ impl Bridge {
                 .try_send(session_id.to_string())
                 .context("ZCode background observer queue unavailable")?;
         }
+        if translated.context_refresh {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(session_id)
+                && session.events.input_id().is_some()
+            {
+                session.context_refresh_pending = params.get("seq").and_then(Value::as_u64);
+                self.context_refresh.notify_one();
+            }
+        }
         if let Some(terminal) = translated.terminal {
+            crate::monitoring::context_acceptance_trace(|| {
+                json!({
+                    "kind":"zcode_native_final", "sessionId":session_id,
+                    "receivedAt":chrono::Utc::now().to_rfc3339()
+                })
+            });
             // Foreground closure is independent of managed background jobs.
             self.finished
                 .send((session_id.to_string(), terminal))
@@ -946,6 +1040,47 @@ impl Bridge {
         }
         Ok(())
     }
+}
+
+// Read the native root Session's own observation from a bounded live/terminal
+// snapshot. Its runtime contextUsage owns occupancy/window pairing, including
+// native compaction; turn Usage and projection.totalTokenCount are not Context.
+// Keep only numeric fields and native revision identities on the Core channel.
+fn native_context_update(session_id: &str, snapshot: &Value) -> Option<Value> {
+    if snapshot.pointer("/session/sessionId")?.as_str()? != session_id {
+        return None;
+    }
+    let runtime = snapshot.get("runtime")?;
+    let seq = runtime.get("eventSeq")?.as_u64()?;
+    let revision = runtime.get("stateRevision")?.as_u64()?;
+    let context = runtime.get("contextUsage")?;
+    let used = context
+        .get("used")
+        .and_then(Value::as_i64)
+        .filter(|n| (0..=9_007_199_254_740_991).contains(n));
+    let size = context
+        .get("size")
+        .and_then(Value::as_i64)
+        .filter(|n| (0..=9_007_199_254_740_991).contains(n));
+    if used.is_none() && size.is_none() {
+        return None;
+    }
+    let model = snapshot
+        .pointer("/settings/model/current/providerId")
+        .and_then(Value::as_str)
+        .zip(
+            snapshot
+                .pointer("/settings/model/current/modelId")
+                .and_then(Value::as_str),
+        )
+        .filter(|(provider, model)| !provider.is_empty() && !model.is_empty())
+        .map(|(provider, model)| format!("{provider}/{model}"));
+    Some(
+        json!({"method":"session/update","params":{"sessionId":session_id,"update":{
+            "sessionUpdate":"usage_update","used":used,"size":size,
+            "_meta":{"zcodeContext":{"eventSeq":seq,"stateRevision":revision,"modelId":model}}
+        }}}),
+    )
 }
 
 // A provider failure leaves the native projection in error, not idle. It can
@@ -1072,6 +1207,61 @@ mod tests {
     // facade before Core receives the provider failure. No process, disk or DB.
     #[tokio::test]
     async fn provider_failure_reaches_core_without_poisoning_the_host() {
+        let context_snapshot = json!({"session":{"sessionId":"s1"},"runtime":{
+            "eventSeq":9,"stateRevision":4,"contextUsage":{"used":450,"size":1000,"breakdown":"PRIVATE_TEST_KEY"}},
+            "projection":{"totalTokenCount":99999}});
+        let context = native_context_update("s1", &context_snapshot).unwrap();
+        assert!(!context.to_string().contains("PRIVATE_TEST_KEY"));
+        let parsed = crate::monitoring::parse_acp_usage_message(
+            crate::agent_profile::AdapterKind::ZcodeApp,
+            None,
+            "session/update",
+            &context["params"],
+        );
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].fields.context_used_tokens, Some(450));
+        assert_eq!(parsed[0].fields.context_size_tokens, Some(1000));
+        assert_eq!(parsed[0].fields.input_tokens, None);
+        assert!(native_context_update("old-session", &context_snapshot).is_none());
+        let mut invalid = context_snapshot.clone();
+        invalid["runtime"]["eventSeq"] = json!(-1);
+        assert!(native_context_update("s1", &invalid).is_none());
+        for (field, value, remaining) in [
+            ("used", json!(-1), "size"),
+            ("used", json!("450"), "size"),
+            ("size", Value::Null, "used"),
+        ] {
+            let mut partial = context_snapshot.clone();
+            partial["runtime"]["contextUsage"][field] = value;
+            let mapped = native_context_update("s1", &partial).unwrap();
+            assert!(mapped["params"]["update"][field].is_null());
+            assert_eq!(
+                mapped["params"]["update"][remaining],
+                context["params"]["update"][remaining]
+            );
+        }
+        for (field, remaining) in [("used", "size"), ("size", "used")] {
+            let mut partial = context_snapshot.clone();
+            partial["runtime"]["contextUsage"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            let mapped = native_context_update("s1", &partial).unwrap();
+            assert_eq!(mapped["params"]["update"][field], Value::Null);
+            assert_eq!(
+                mapped["params"]["update"][remaining],
+                context["params"]["update"][remaining]
+            );
+        }
+        let mut compacted = context_snapshot.clone();
+        compacted["runtime"]["stateRevision"] = json!(5);
+        compacted["runtime"]["contextUsage"]["used"] = json!(100);
+        let decreased = native_context_update("s1", &compacted).unwrap();
+        assert_eq!(decreased["params"]["update"]["used"], 100);
+        assert_ne!(
+            decreased["params"]["update"]["_meta"],
+            context["params"]["update"]["_meta"]
+        );
         let snapshot = json!({"projection":{"status":"error","activeToolCalls":[],"pendingPermissions":[]},
             "runtime":{"pendingRequestIds":[]}});
         assert!(foreground_quiescent(&snapshot, true));
@@ -1100,7 +1290,10 @@ mod tests {
         let (native, adapter) = tokio::io::duplex(64 * 1024);
         let (native_read, native_write) = tokio::io::split(native);
         let (adapter_read, adapter_write) = tokio::io::split(adapter);
+        let (live_tx, live_rx) = oneshot::channel();
+        let mut live_tx = Some(live_tx);
         let peer = tokio::spawn(async move {
+            let mut live_rx = Some(live_rx);
             let mut reader = BufReader::new(native_read);
             let writer: Mutex<Writer> = Mutex::new(Box::new(native_write));
             let mut frame = Vec::new();
@@ -1119,6 +1312,65 @@ mod tests {
                         )
                         .await
                         .unwrap();
+                        let completed = |seq| {
+                            json!({"method":"session/event","params":{
+                            "sessionId":"s1","seq":seq,"turnId":"t1","type":"session.updated",
+                            "payload":{"usage":{"inputTokens":40},"querySource":"main_turn"}}})
+                        };
+                        write_frame(&writer, &completed(2)).await.unwrap();
+                        let first = read_frame(&mut reader, &mut frame).await.unwrap().unwrap();
+                        assert_eq!(first["method"], "session/read");
+                        assert_eq!(first["params"]["messageLimit"], 1);
+                        for seq in 3..23 {
+                            write_frame(&writer, &completed(seq)).await.unwrap();
+                        }
+                        // This callback is processed after the burst, while the
+                        // first read is still held: proves one in-flight request.
+                        write_frame(
+                            &writer,
+                            &json!({"id":"barrier","method":"session/requestRuntimePreferences"}),
+                        )
+                        .await
+                        .unwrap();
+                        let barrier = read_frame(&mut reader, &mut frame).await.unwrap().unwrap();
+                        assert_eq!(barrier["id"], "barrier");
+                        let live_snapshot = |used, revision, seq| {
+                            json!({"session":{"sessionId":"s1"},
+                            "runtime":{"eventSeq":seq,"stateRevision":revision,"activeTurnId":"t1",
+                                "contextUsage":{"used":used,"size":1000}}})
+                        };
+                        write_frame(
+                            &writer,
+                            &json!({"id":first["id"],"result":live_snapshot(450,5,2)}),
+                        )
+                        .await
+                        .unwrap();
+                        let second = read_frame(&mut reader, &mut frame).await.unwrap().unwrap();
+                        assert_eq!(second["method"], "session/read");
+                        // These arrive while the second read is pending; its
+                        // snapshot already covers them, so no third read.
+                        for seq in 23..26 {
+                            write_frame(&writer, &completed(seq)).await.unwrap();
+                        }
+                        write_frame(
+                            &writer,
+                            &json!({"id":"covered","method":"session/requestRuntimePreferences"}),
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(
+                            read_frame(&mut reader, &mut frame).await.unwrap().unwrap()["id"],
+                            "covered"
+                        );
+                        write_frame(
+                            &writer,
+                            &json!({"id":second["id"],"result":live_snapshot(400,6,25)}),
+                        )
+                        .await
+                        .unwrap();
+                        // Do not issue the final/error until Core received both
+                        // numeric observations. No completed prompt can mask this.
+                        live_rx.take().unwrap().await.unwrap();
                         write_frame(&writer,&json!({"id":"headers","method":"interaction/requestProviderRuntimeHeaders",
                             "params":{"sessionId":"s1","turnId":"t1","reason":"model-request",
                                 "workspace":{"workspacePath":"/fixture","workspaceKey":"/fixture"}}})).await.unwrap();
@@ -1126,7 +1378,7 @@ mod tests {
                         assert_eq!(callback["id"], "headers");
                         assert_eq!(callback["result"]["headersApplied"], false);
                         write_frame(&writer,&json!({"method":"session/event","params":{
-                            "sessionId":"s1","seq":2,"turnId":"t1","type":"turn.failed",
+                            "sessionId":"s1","seq":26,"turnId":"t1","type":"turn.failed",
                             "payload":{"inputId":input,"turnPhase":"model","error":{
                                 "type":"model_request_failed","code":"model_request_failed",
                                 "message":"Model request failed.","stack":"PRIVATE_TEST_KEY",
@@ -1134,8 +1386,11 @@ mod tests {
                         }})).await.unwrap();
                         json!({"status":"accepted","result":{"inputId":input}})
                     }
-                    "session/read" => json!({"projection":{"status":"error","backgroundJobs":[],
-                        "activeToolCalls":[],"pendingPermissions":[]},"runtime":{"pendingRequestIds":[]}}),
+                    "session/read" => {
+                        json!({"session":{"sessionId":"s1"},"projection":{"status":"error","backgroundJobs":[],
+                        "activeToolCalls":[],"pendingPermissions":[]},"runtime":{"pendingRequestIds":[],
+                        "eventSeq":26,"stateRevision":7,"contextUsage":{"used":450,"size":1000,"breakdown":"PRIVATE_TEST_KEY"}}})
+                    }
                     "workspace/readState" | "session/setMode" => json!({}),
                     method => panic!("unexpected native method {method}"),
                 };
@@ -1155,6 +1410,8 @@ mod tests {
         let mut reader = BufReader::new(read);
         let writer: Mutex<Writer> = Mutex::new(Box::new(write));
         let mut frame = Vec::new();
+        let mut observed_context = false;
+        let mut live_values = Vec::new();
         for (id, method, params) in [
             (1, "session/new", json!({"cwd":"/fixture"})),
             (
@@ -1174,6 +1431,19 @@ mod tests {
                         .unwrap()
                         .expect("provider failure must reach Core before any transport close");
                     assert!(!message.to_string().contains("PRIVATE_TEST_KEY"));
+                    if message["params"]["update"]["_meta"]
+                        .get("zcodeContext")
+                        .is_some()
+                    {
+                        observed_context = true;
+                        if live_values.len() < 2 {
+                            live_values.push(message["params"]["update"]["used"].as_i64().unwrap());
+                            if live_values.len() == 2 {
+                                assert_eq!(live_values, [450, 400]);
+                                live_tx.take().unwrap().send(()).unwrap();
+                            }
+                        }
+                    }
                     if message["id"] == id {
                         break message;
                     }
@@ -1182,6 +1452,10 @@ mod tests {
             .await
             .unwrap();
             if id == 2 {
+                assert!(
+                    observed_context,
+                    "native Context must precede the prompt terminal"
+                );
                 assert!(
                     response["error"]["message"]
                         .as_str()
@@ -1198,6 +1472,7 @@ mod tests {
                 assert!(response.get("error").is_none(), "{response}");
             }
         }
+        assert_eq!(live_values, [450, 400]);
         peer.abort();
     }
 

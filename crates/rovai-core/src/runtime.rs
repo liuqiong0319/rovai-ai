@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeSet, HashMap},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
@@ -14,7 +14,7 @@ use crate::{
         AdapterKind, AgentProfileService, FrozenAgentRuntimeConfig, MissingSendRecoveryMode,
         PublicOutputMode,
     },
-    camp_content::{StructuredCampMessageSegment, canonical_content_digest},
+    camp_content::{StructuredThreadMessageSegment, canonical_content_digest},
     collaboration::exhaust_camp_turn_execution_budget,
     command::{
         ActorRef, CommandEnvelope, CommandExecution, CommandHandlerResult, DomainCommand,
@@ -23,7 +23,7 @@ use crate::{
     context_index::index_camp_message,
     db::Database,
     delivery_queue::settle_run_deliveries,
-    execution_budget::{CampTurnExecutionBudgetExhaustionReason, camp_turn_execution_budget_now},
+    execution_budget::{ThreadTurnExecutionBudgetExhaustionReason, camp_turn_execution_budget_now},
     execution_evidence::AgentRunExecutionEvidence,
     git::GitObservation,
     message_delivery::{
@@ -35,6 +35,49 @@ use crate::{
     planned_shutdown::{ActiveExecutionKey, RuntimeTerminalOutcome, TerminalSettlementPermit},
     runtime_failure::RuntimeFailureView,
 };
+
+/// Reject explicit child ownership, replay and complete snapshots before an
+/// adapter strips private payload fields. Native Session/turn fencing still
+/// belongs to the transport; this helper cannot establish ownership by itself.
+pub fn is_root_output(payload: &Value) -> bool {
+    [
+        payload,
+        &payload["_meta"],
+        &payload["content"],
+        &payload["content"]["_meta"],
+        &payload["message"],
+        &payload["assistantMessageEvent"],
+        &payload["assistantMessageEvent"]["partial"],
+        &payload["payload"],
+        &payload["payload"]["_meta"],
+    ]
+    .iter()
+    .all(|value| {
+        ![
+            "agentId",
+            "sourceAgentId",
+            "subagentId",
+            "parentAgentId",
+            "parentSessionId",
+            "parent_tool_use_id",
+            "parentToolCallId",
+            "parent_tool_call_id",
+            "subAgentId",
+            "source_agent_id",
+            "replay",
+            "isReplay",
+            "historical",
+            "snapshot",
+            "isSnapshot",
+        ]
+        .iter()
+        .any(|field| {
+            value
+                .get(*field)
+                .is_some_and(|value| !value.is_null() && value != false)
+        })
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,6 +109,15 @@ pub struct AgentRunWorkspace {
     pub execution_root: String,
     pub access: String,
     pub isolation: String,
+}
+
+/// Resolve a local input without touching the filesystem or changing symlinks.
+pub fn resolve_agent_local_path(path: &Path, execution_root: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        execution_root.join(path)
+    }
 }
 
 impl AgentRunWorkspace {
@@ -172,6 +224,7 @@ impl DomainCommand for CompleteAgentRunNetworkRecoveryCommand {
 #[serde(rename_all = "camelCase")]
 pub struct ResolveAcceptedInputRecoveryBlockerCommand {
     #[serde(deserialize_with = "crate::camp_id::deserialize_camp_id_string")]
+    #[serde(rename = "threadId", alias = "campId")]
     pub camp_id: String,
     pub agent_run_id: String,
     pub expected_version: i64,
@@ -184,15 +237,17 @@ impl DomainCommand for ResolveAcceptedInputRecoveryBlockerCommand {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CancelCampTurnCommand {
+pub struct CancelThreadTurnCommand {
     #[serde(deserialize_with = "crate::camp_id::deserialize_camp_id_string")]
+    #[serde(rename = "threadId", alias = "campId")]
     pub camp_id: String,
+    #[serde(rename = "threadTurnId", alias = "campTurnId")]
     pub camp_turn_id: String,
     pub expected_version: i64,
 }
 
-impl sealed::Sealed for CancelCampTurnCommand {}
-impl DomainCommand for CancelCampTurnCommand {
+impl sealed::Sealed for CancelThreadTurnCommand {}
+impl DomainCommand for CancelThreadTurnCommand {
     const TYPE: &'static str = "camp_turn.cancel";
 }
 
@@ -200,6 +255,7 @@ impl DomainCommand for CancelCampTurnCommand {
 #[serde(rename_all = "camelCase")]
 pub struct CancelAgentRunCommand {
     #[serde(deserialize_with = "crate::camp_id::deserialize_camp_id_string")]
+    #[serde(rename = "threadId", alias = "campId")]
     pub camp_id: String,
     pub agent_run_id: String,
     pub expected_version: i64,
@@ -357,8 +413,10 @@ pub struct PlannedShutdownAbortiveTerminal {
 #[serde(rename_all = "camelCase")]
 pub struct PlannedShutdownTerminalSettlement {
     pub agent_run_id: String,
+    #[serde(rename = "threadTurnId", alias = "campTurnId")]
     pub camp_turn_id: String,
     pub agent_run_status: String,
+    #[serde(rename = "threadTurnStatus", alias = "campTurnStatus")]
     pub camp_turn_status: String,
     pub terminal_reason_code: String,
     pub already_settled: bool,
@@ -425,7 +483,9 @@ impl DomainCommand for RebindAgentRunRuntimeCommand {
 #[serde(rename_all = "camelCase")]
 pub struct QueuedAgentRunCandidate {
     pub agent_run_id: String,
+    #[serde(rename = "threadId", alias = "campId")]
     pub camp_id: String,
+    #[serde(rename = "threadTurnId", alias = "campTurnId")]
     pub camp_turn_id: String,
     pub conversation_id: String,
     pub agent_id: String,
@@ -442,7 +502,9 @@ pub struct QueuedAgentRunCandidate {
 #[serde(rename_all = "camelCase")]
 pub struct AgentRunCancellationCandidate {
     pub agent_run_id: String,
+    #[serde(rename = "threadId", alias = "campId")]
     pub camp_id: String,
+    #[serde(rename = "threadTurnId", alias = "campTurnId")]
     pub camp_turn_id: String,
     pub project_binding_kind: String,
     pub project_path: String,
@@ -455,7 +517,7 @@ pub struct AgentRunCancellationCandidate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CampRuntimeCleanupTarget {
+pub struct ThreadRuntimeCleanupTarget {
     pub agent_run_id: String,
     pub execution_epoch: i64,
     pub adapter_kind: AdapterKind,
@@ -463,8 +525,10 @@ pub struct CampRuntimeCleanupTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CampTurnExecutionBudgetExpiry {
+pub struct ThreadTurnExecutionBudgetExpiry {
+    #[serde(rename = "threadTurnId", alias = "campTurnId")]
     pub camp_turn_id: String,
+    #[serde(rename = "threadId", alias = "campId")]
     pub camp_id: String,
     pub deadline_at: String,
     pub agent_runs_fenced: i64,
@@ -506,7 +570,9 @@ impl QueuedAgentRunCandidate {
 #[serde(rename_all = "camelCase")]
 pub struct AgentRunExecution {
     pub agent_run_id: String,
+    #[serde(rename = "threadId", alias = "campId")]
     pub camp_id: String,
+    #[serde(rename = "threadTurnId", alias = "campTurnId")]
     pub camp_turn_id: String,
     pub conversation_id: String,
     pub conversation_version: i64,
@@ -800,7 +866,7 @@ impl ExecutionRuntimeService {
                     "agent_run.runtime_model_observation_fenced",
                     json!({
                         "agentRunId": envelope.payload.agent_run_id,
-                        "campId": camp_id,
+                        "threadId": camp_id,
                         "changed": false,
                         "reason": "cancellation_requested",
                     }),
@@ -812,7 +878,7 @@ impl ExecutionRuntimeService {
                     "agent_run.runtime_model_not_recorded",
                     json!({
                         "agentRunId": envelope.payload.agent_run_id,
-                        "campId": camp_id,
+                        "threadId": camp_id,
                         "changed": false,
                         "reason": if existing_model_id.is_some() {
                             "already_observed"
@@ -848,7 +914,7 @@ impl ExecutionRuntimeService {
                     "agent_run.runtime_model_observation_fenced",
                     json!({
                         "agentRunId": envelope.payload.agent_run_id,
-                        "campId": camp_id,
+                        "threadId": camp_id,
                         "changed": false,
                         "reason": "concurrent_change",
                     }),
@@ -872,7 +938,7 @@ impl ExecutionRuntimeService {
                 "agent_run.runtime_model_observed",
                 json!({
                     "agentRunId": envelope.payload.agent_run_id,
-                    "campId": camp_id,
+                    "threadId": camp_id,
                     "changed": true,
                     "modelId": model_id,
                 }),
@@ -1066,7 +1132,7 @@ impl ExecutionRuntimeService {
         observed_budget_now: chrono::DateTime<chrono::Utc>,
         audit_now: chrono::DateTime<chrono::Utc>,
         limit: i64,
-    ) -> Result<Vec<CampTurnExecutionBudgetExpiry>> {
+    ) -> Result<Vec<ThreadTurnExecutionBudgetExpiry>> {
         if !(1..=100).contains(&limit) {
             anyhow::bail!("CampTurn Execution Budget expiry limit must be between 1 and 100");
         }
@@ -1106,14 +1172,14 @@ impl ExecutionRuntimeService {
             let exhaustion = exhaust_camp_turn_execution_budget(
                 &transaction,
                 &camp_turn_id,
-                CampTurnExecutionBudgetExhaustionReason::Elapsed,
+                ThreadTurnExecutionBudgetExhaustionReason::Elapsed,
                 &command_id,
                 &audit_now,
                 &actor,
                 None,
             )?;
             if exhaustion.newly_exhausted {
-                expired.push(CampTurnExecutionBudgetExpiry {
+                expired.push(ThreadTurnExecutionBudgetExpiry {
                     camp_turn_id,
                     camp_id,
                     deadline_at,
@@ -1231,7 +1297,7 @@ impl ExecutionRuntimeService {
         &self,
         database: &Database,
         camp_id: &str,
-    ) -> Result<Vec<CampRuntimeCleanupTarget>> {
+    ) -> Result<Vec<ThreadRuntimeCleanupTarget>> {
         let mut statement = database.connection().prepare(
             r#"
             SELECT target.id, target.execution_epoch, target.runtime_adapter_kind
@@ -1274,7 +1340,7 @@ impl ExecutionRuntimeService {
         Ok(rows
             .into_iter()
             .filter_map(|(agent_run_id, execution_epoch, adapter_kind)| {
-                Some(CampRuntimeCleanupTarget {
+                Some(ThreadRuntimeCleanupTarget {
                     agent_run_id,
                     execution_epoch,
                     adapter_kind: adapter_kind?.parse::<AdapterKind>().ok()?,
@@ -1853,7 +1919,7 @@ impl ExecutionRuntimeService {
                 SET workspace_json = COALESCE(workspace_json, ?2),
                     starting_git_observation_json =
                         COALESCE(starting_git_observation_json, ?8),
-                    status = 'running', wait_reason = NULL, wait_deadline_at = NULL,
+                    status = 'running', wait_reason = 'runtime_initializing', wait_deadline_at = NULL,
                     runtime_recovery_required = 0,
                     execution_epoch = ?3, execution_lease_owner = ?4,
                     execution_lease_expires_at = ?5,
@@ -2172,8 +2238,8 @@ impl ExecutionRuntimeService {
                 "agent_run.network_recovery_waiting",
                 json!({
                     "agentRunId": run.id,
-                    "campTurnId": run.camp_turn_id,
-                    "campTurnStatus": camp_turn_status,
+                    "threadTurnId": run.camp_turn_id,
+                    "threadTurnStatus": camp_turn_status,
                     "executionEpoch": run.execution_epoch,
                     "version": run.version + 1,
                 }),
@@ -2213,7 +2279,10 @@ impl ExecutionRuntimeService {
             if run.version != envelope.payload.expected_version
                 || run.execution_epoch != envelope.payload.execution_epoch
                 || run.status != "waiting"
-                || run.wait_reason.as_deref() != Some("network_recovery")
+                || !matches!(
+                    run.wait_reason.as_deref(),
+                    Some("network_recovery" | "runtime_recovery")
+                )
                 || !run.runtime_recovery_required
             {
                 return Ok(rejected(
@@ -2259,7 +2328,7 @@ impl ExecutionRuntimeService {
                         manual_retry_allowed = 0,
                         version = version + 1, updated_at = ?4
                     WHERE id = ?1 AND status = 'waiting'
-                      AND wait_reason = 'network_recovery'
+                      AND wait_reason IN ('network_recovery', 'runtime_recovery')
                       AND runtime_recovery_required = 1
                       AND version = ?2 AND execution_epoch = ?3
                     "#,
@@ -2303,7 +2372,7 @@ impl ExecutionRuntimeService {
                 SET wait_reason = 'runtime_recovery',
                     version = version + 1, updated_at = ?4
                 WHERE id = ?1 AND status = 'waiting'
-                  AND wait_reason = 'network_recovery'
+                  AND wait_reason IN ('network_recovery', 'runtime_recovery')
                   AND runtime_recovery_required = 1
                   AND version = ?2 AND execution_epoch = ?3
                   AND cancel_requested_at IS NULL
@@ -2622,8 +2691,8 @@ impl ExecutionRuntimeService {
                 "agent_run.accepted_input_outcome_unknown",
                 json!({
                     "agentRunId": envelope.payload.agent_run_id,
-                    "campTurnId": (!camp_turn_id.is_empty()).then_some(camp_turn_id),
-                    "campTurnStatus": camp_turn_status,
+                    "threadTurnId": (!camp_turn_id.is_empty()).then_some(camp_turn_id),
+                    "threadTurnStatus": camp_turn_status,
                     "acceptedInputPreserved": true,
                 }),
                 Some(entity_ref("agent_run", &envelope.payload.agent_run_id)),
@@ -2640,7 +2709,7 @@ impl ExecutionRuntimeService {
     pub fn request_camp_turn_cancellation(
         &self,
         database: &mut Database,
-        envelope: &CommandEnvelope<CancelCampTurnCommand>,
+        envelope: &CommandEnvelope<CancelThreadTurnCommand>,
     ) -> Result<CommandExecution> {
         self.gateway.execute(database, envelope, |transaction| {
             if !matches!(envelope.actor, ActorRef::User { .. }) {
@@ -2679,8 +2748,8 @@ impl ExecutionRuntimeService {
                 return Ok(CommandHandlerResult::applied(
                     "camp_turn.already_terminal",
                     json!({
-                        "campTurnId": envelope.payload.camp_turn_id,
-                        "campTurnStatus": status,
+                        "threadTurnId": envelope.payload.camp_turn_id,
+                        "threadTurnStatus": status,
                         "status": status,
                     }),
                     Some(entity_ref("camp_turn", &envelope.payload.camp_turn_id)),
@@ -2720,8 +2789,8 @@ impl ExecutionRuntimeService {
             Ok(CommandHandlerResult::applied(
                 "camp_turn.cancelled",
                 json!({
-                    "campTurnId": envelope.payload.camp_turn_id,
-                    "campTurnStatus": settlement.terminal_status,
+                    "threadTurnId": envelope.payload.camp_turn_id,
+                    "threadTurnStatus": settlement.terminal_status,
                     "agentRunCount": settlement.runs.len(),
                     "runs": settlement.runs,
                     "messageDeliveriesCancelled": settlement.message_deliveries_cancelled,
@@ -2847,8 +2916,8 @@ impl ExecutionRuntimeService {
                 settlement.terminal_code,
                 json!({
                     "agentRunId": envelope.payload.agent_run_id,
-                    "campTurnId": (!camp_turn_id.is_empty()).then_some(camp_turn_id),
-                    "campTurnStatus": camp_turn_status,
+                    "threadTurnId": (!camp_turn_id.is_empty()).then_some(camp_turn_id),
+                    "threadTurnStatus": camp_turn_status,
                     "status": settlement.terminal_status,
                 }),
                 Some(entity_ref("agent_run", &envelope.payload.agent_run_id)),
@@ -3539,7 +3608,7 @@ impl ExecutionRuntimeService {
         database: &mut Database,
         envelope: &CommandEnvelope<SucceedAgentRunCommand>,
     ) -> Result<CommandExecution> {
-        self.succeed_agent_run_with_terminal_reason(database, envelope, None)
+        self.succeed_agent_run_with_terminal_reason(database, envelope, None, false)
     }
 
     pub fn succeed_agent_run_during_planned_shutdown(
@@ -3559,6 +3628,30 @@ impl ExecutionRuntimeService {
             database,
             envelope,
             Some("planned_shutdown_completed"),
+            false,
+        )
+    }
+
+    pub fn succeed_agent_run_requiring_cleanup(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<SucceedAgentRunCommand>,
+        permit: Option<&TerminalSettlementPermit>,
+    ) -> Result<CommandExecution> {
+        if permit.is_some_and(|permit| {
+            !permit.authorizes(
+                &envelope.payload.agent_run_id,
+                envelope.payload.execution_epoch,
+                RuntimeTerminalOutcome::Succeeded,
+            )
+        }) {
+            anyhow::bail!("planned shutdown terminal permit does not match the success target");
+        }
+        self.succeed_agent_run_with_terminal_reason(
+            database,
+            envelope,
+            permit.map(|_| "planned_shutdown_completed"),
+            true,
         )
     }
 
@@ -3567,6 +3660,7 @@ impl ExecutionRuntimeService {
         database: &mut Database,
         envelope: &CommandEnvelope<SucceedAgentRunCommand>,
         terminal_reason_code: Option<&str>,
+        cleanup_required: bool,
     ) -> Result<CommandExecution> {
         if envelope.payload.native_turn_id.trim().is_empty() {
             anyhow::bail!("nativeTurnId must not be empty");
@@ -3600,6 +3694,7 @@ impl ExecutionRuntimeService {
                     &target,
                     envelope,
                     terminal_reason_code,
+                    cleanup_required,
                 );
             }
             let adapter_kind = target
@@ -3611,7 +3706,7 @@ impl ExecutionRuntimeService {
                 .unwrap_or(PublicOutputMode::ExplicitSendOnly);
             let publication_allowed = terminal_publication_allowed(transaction, &target)?;
             let final_output_digest =
-                canonical_content_digest(&[StructuredCampMessageSegment::Text {
+                canonical_content_digest(&[StructuredThreadMessageSegment::Text {
                     text: envelope.payload.final_output.clone(),
                 }])?;
             let (ordinary_final_camp_message_id, automatic_public_output_suppressed) =
@@ -3689,6 +3784,8 @@ impl ExecutionRuntimeService {
                     execution_lease_owner = NULL, execution_lease_expires_at = NULL,
                     terminal_resolution_source = 'runtime_terminal',
                     terminal_reason_code = ?7,
+                    cancel_requested_at = CASE WHEN ?8 THEN COALESCE(cancel_requested_at, ?3) ELSE cancel_requested_at END,
+                    cancel_reason_code = CASE WHEN ?8 THEN COALESCE(cancel_reason_code, 'runtime_host_release_pending') ELSE cancel_reason_code END,
                     final_conversation_message_id = NULL,
                     final_camp_message_id = ?2,
                     ending_git_observation_json = ?6,
@@ -3704,6 +3801,7 @@ impl ExecutionRuntimeService {
                     envelope.payload.execution_epoch,
                     ending_git_observation,
                     terminal_reason_code,
+                    cleanup_required,
                 ],
             )?;
             if updated != 1 {
@@ -3718,7 +3816,7 @@ impl ExecutionRuntimeService {
                 Some(envelope.payload.execution_epoch),
                 &json!({
                     "nativeTurnId": envelope.payload.native_turn_id,
-                    "finalCampMessageId": final_camp_message_id,
+                    "finalThreadMessageId": final_camp_message_id,
                     "finalOutputDigest": final_output_digest,
                     "publicOutputMode": public_output_mode.as_str(),
                     "recipientFree": true,
@@ -3765,10 +3863,10 @@ impl ExecutionRuntimeService {
                 "agent_run.succeeded",
                 json!({
                     "agentRunId": target.agent_run_id,
-                    "campTurnId": (!target.camp_turn_id.is_empty())
+                    "threadTurnId": (!target.camp_turn_id.is_empty())
                         .then_some(target.camp_turn_id),
-                    "campTurnStatus": camp_turn_status,
-                    "finalCampMessageId": final_camp_message_id,
+                    "threadTurnStatus": camp_turn_status,
+                    "finalThreadMessageId": final_camp_message_id,
                     "finalOutputDigest": final_output_digest,
                     "publicOutputMode": public_output_mode.as_str(),
                     "automaticPublicOutputSuppressed": automatic_public_output_suppressed,
@@ -4128,9 +4226,9 @@ impl ExecutionRuntimeService {
                 "agent_run.dispatch_rejected",
                 json!({
                     "agentRunId": target.agent_run_id,
-                    "campTurnId": (!target.camp_turn_id.is_empty())
+                    "threadTurnId": (!target.camp_turn_id.is_empty())
                         .then_some(target.camp_turn_id),
-                    "campTurnStatus": camp_turn_status,
+                    "threadTurnStatus": camp_turn_status,
                 }),
                 Some(entity_ref("agent_run", &target.agent_run_id)),
             ))
@@ -4146,7 +4244,12 @@ impl ExecutionRuntimeService {
         database: &mut Database,
         envelope: &CommandEnvelope<FailAgentRunCommand>,
     ) -> Result<CommandExecution> {
-        self.fail_agent_run_with_terminal_source(database, envelope, Some("runtime_terminal"))
+        self.fail_agent_run_with_terminal_source(
+            database,
+            envelope,
+            Some("runtime_terminal"),
+            false,
+        )
     }
 
     pub fn fail_agent_run_without_runtime_terminal(
@@ -4154,7 +4257,18 @@ impl ExecutionRuntimeService {
         database: &mut Database,
         envelope: &CommandEnvelope<FailAgentRunCommand>,
     ) -> Result<CommandExecution> {
-        self.fail_agent_run_with_terminal_source(database, envelope, None)
+        self.fail_agent_run_with_terminal_source(database, envelope, None, true)
+    }
+
+    /// Native failure provenance and process cleanup are independent facts.
+    /// The cleanup intent commits with the terminal under the same database
+    /// transaction used by Delivery claim; no successor Run can slip between.
+    pub fn fail_agent_run_requiring_cleanup(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<FailAgentRunCommand>,
+    ) -> Result<CommandExecution> {
+        self.fail_agent_run_with_terminal_source(database, envelope, Some("runtime_terminal"), true)
     }
 
     fn fail_agent_run_with_terminal_source(
@@ -4162,6 +4276,7 @@ impl ExecutionRuntimeService {
         database: &mut Database,
         envelope: &CommandEnvelope<FailAgentRunCommand>,
         terminal_resolution_source: Option<&str>,
+        cleanup_required: bool,
     ) -> Result<CommandExecution> {
         if envelope.payload.error_code.trim().is_empty() {
             anyhow::bail!("AgentRun errorCode must not be empty");
@@ -4181,6 +4296,21 @@ impl ExecutionRuntimeService {
             let Some(target) = target else {
                 return Ok(rejected("agent_run.not_found", "AgentRun does not exist"));
             };
+            if terminal_resolution_source.is_none()
+                && target.runtime_adapter_kind.as_deref() == Some("codex-cli")
+                && target.version == envelope.payload.expected_version
+                && target.execution_epoch == envelope.payload.execution_epoch
+                && envelope.camp_id.as_deref() == Some(target.camp_id.as_str()) {
+                let uncertain: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM runtime_input_delivery WHERE agent_run_id = ?1
+                     AND (status IN ('accepted', 'delivery_unknown') OR (status = 'prepared' AND dispatch_started_at IS NOT NULL)))",
+                    [&target.agent_run_id], |row| row.get(0),
+                )?;
+                if uncertain {
+                    return fail_lost_agent_run_in_tx(transaction, &target.agent_run_id, &envelope.actor,
+                        "Codex input outcome could not be reconciled after a nonterminal failure");
+                }
+            }
             if let Some(rejection) = validate_terminal_target(
                 transaction,
                 envelope.camp_id.as_deref(),
@@ -4190,124 +4320,14 @@ impl ExecutionRuntimeService {
             )? {
                 return Ok(rejection);
             }
-            let error_details_ref = envelope
-                .payload
-                .error_detail
-                .as_ref()
-                .map(|detail| json!({ "detail": detail }).to_string());
-            let public_runtime_failure_json = envelope
-                .payload
-                .failure
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()?;
-            let ending_git_observation = envelope
-                .payload
-                .ending_git_observation
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()?;
-            let updated = transaction.execute(
-                r#"
-                UPDATE agent_run
-                SET status = 'failed', wait_reason = NULL, wait_deadline_at = NULL,
-                    runtime_recovery_required = 0,
-                    execution_lease_owner = NULL, execution_lease_expires_at = NULL,
-                    cancel_requested_at = CASE
-                        WHEN ?9 IS NULL THEN COALESCE(cancel_requested_at, ?5)
-                        ELSE cancel_requested_at
-                    END,
-                    cancel_reason_code = CASE
-                        WHEN ?9 IS NULL THEN COALESCE(
-                            cancel_reason_code,
-                            'runtime_terminal_unconfirmed'
-                        )
-                        ELSE cancel_reason_code
-                    END,
-                    terminal_resolution_source = ?9,
-                    terminal_reason_code = NULL,
-                    last_error_code = ?2, last_error_details_ref = ?3,
-                    public_runtime_failure_json = ?10,
-                    manual_retry_allowed = ?4,
-                    ending_git_observation_json = ?8,
-                    ended_at = ?5, version = version + 1, updated_at = ?5
-                WHERE id = ?1 AND status = 'running'
-                  AND version = ?6 AND execution_epoch = ?7
-                "#,
-                params![
-                    target.agent_run_id,
-                    envelope.payload.error_code,
-                    error_details_ref,
-                    i64::from(envelope.payload.manual_retry_allowed),
-                    target.now,
-                    envelope.payload.expected_version,
-                    envelope.payload.execution_epoch,
-                    ending_git_observation,
-                    terminal_resolution_source,
-                    public_runtime_failure_json,
-                ],
-            )?;
-            if updated != 1 {
-                anyhow::bail!("AgentRun changed inside its failure transaction");
-            }
-            append_domain_event(
+            settle_failed_agent_run_in_tx(
                 transaction,
-                "agent_run.failed",
-                &target.camp_id,
-                ("agent_run", &target.agent_run_id),
+                &target,
                 &envelope.actor,
-                Some(envelope.payload.execution_epoch),
-                &json!({
-                    "errorCode": envelope.payload.error_code,
-                    "errorDetail": envelope.payload.error_detail,
-                    "failure": envelope.payload.failure,
-                    "manualRetryAllowed": envelope.payload.manual_retry_allowed,
-                    "endingGitObservation": envelope.payload.ending_git_observation,
-                    "terminalResolutionSource": terminal_resolution_source,
-                }),
-            )?;
-            settle_materialized_delivery_for_agent_run(
-                transaction,
-                AgentRunDeliverySettlement {
-                    agent_run_id: &target.agent_run_id,
-                    agent_run_status: "failed",
-                    agent_run_error_code: Some(&envelope.payload.error_code),
-                    terminal_resolution_source,
-                    terminal_reason_code: None,
-                    actor: &envelope.actor,
-                    execution_epoch: Some(envelope.payload.execution_epoch),
-                    now: &target.now,
-                },
-            )?;
-            let camp_turn_status = if target.camp_turn_id.is_empty() {
-                settle_run_deliveries(
-                    transaction,
-                    &target.agent_run_id,
-                    "failed",
-                    Some(&envelope.payload.error_code),
-                    &target.now,
-                )?;
-                None
-            } else {
-                Some(recompute_camp_turn(
-                    transaction,
-                    &target.camp_id,
-                    &target.camp_turn_id,
-                    &envelope.actor,
-                    Some(envelope.payload.execution_epoch),
-                    &target.now,
-                )?)
-            };
-            Ok(CommandHandlerResult::applied(
-                "agent_run.failed",
-                json!({
-                    "agentRunId": target.agent_run_id,
-                    "campTurnId": (!target.camp_turn_id.is_empty())
-                        .then_some(target.camp_turn_id),
-                    "campTurnStatus": camp_turn_status,
-                }),
-                Some(entity_ref("agent_run", &target.agent_run_id)),
-            ))
+                &envelope.payload,
+                terminal_resolution_source,
+                cleanup_required,
+            )
         })?;
         if !execution.replayed && execution.result.code == "agent_run.failed" {
             pump_target_after_run_terminal(database, &envelope.payload.agent_run_id)?;
@@ -4673,6 +4693,8 @@ impl ExecutionRuntimeService {
                 execution_lease_owner = NULL, execution_lease_expires_at = NULL,
                 terminal_resolution_source = 'runtime_terminal',
                 terminal_reason_code = ?3,
+                cancel_requested_at = CASE WHEN runtime_adapter_kind = 'codex-cli' THEN ?7 ELSE cancel_requested_at END,
+                cancel_reason_code = CASE WHEN runtime_adapter_kind = 'codex-cli' THEN 'runtime_host_release_pending' ELSE cancel_reason_code END,
                 last_error_code = ?4, last_error_details_ref = ?5,
                 public_runtime_failure_json = ?9,
                 manual_retry_allowed = ?6,
@@ -4766,6 +4788,188 @@ impl ExecutionRuntimeService {
     }
 }
 
+// Both normal Runtime failures and confirmed Host loss use the same terminal
+// write, Delivery settlement and cleanup intent. Callers validate their own
+// admission facts before entering this transaction-local settlement.
+fn settle_failed_agent_run_in_tx(
+    transaction: &Transaction<'_>,
+    target: &TerminalTarget,
+    actor: &ActorRef,
+    failure: &FailAgentRunCommand,
+    terminal_resolution_source: Option<&str>,
+    cleanup_required: bool,
+) -> Result<CommandHandlerResult> {
+    let error_details_ref = failure
+        .error_detail
+        .as_ref()
+        .map(|detail| json!({ "detail": detail }).to_string());
+    let public_runtime_failure_json = failure
+        .failure
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let ending_git_observation = failure
+        .ending_git_observation
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let updated = transaction.execute(
+        r#"
+        UPDATE agent_run
+        SET status = 'failed', wait_reason = NULL, wait_deadline_at = NULL,
+            runtime_recovery_required = 0,
+            execution_lease_owner = NULL, execution_lease_expires_at = NULL,
+            cancel_requested_at = CASE
+                WHEN ?11 THEN COALESCE(cancel_requested_at, ?5)
+                ELSE cancel_requested_at
+            END,
+            cancel_reason_code = CASE
+                WHEN ?11 THEN COALESCE(cancel_reason_code,
+                    CASE WHEN ?9 IS NULL THEN 'runtime_terminal_unconfirmed'
+                         ELSE 'runtime_terminal_host_failed' END
+                )
+                ELSE cancel_reason_code
+            END,
+            terminal_resolution_source = ?9,
+            terminal_reason_code = NULL,
+            last_error_code = ?2, last_error_details_ref = ?3,
+            public_runtime_failure_json = ?10,
+            manual_retry_allowed = ?4,
+            ending_git_observation_json = ?8,
+            ended_at = ?5, version = version + 1, updated_at = ?5
+        WHERE id = ?1 AND status IN ('running', 'waiting')
+          AND version = ?6 AND execution_epoch = ?7
+        "#,
+        params![
+            target.agent_run_id,
+            failure.error_code,
+            error_details_ref,
+            i64::from(failure.manual_retry_allowed),
+            target.now,
+            failure.expected_version,
+            failure.execution_epoch,
+            ending_git_observation,
+            terminal_resolution_source,
+            public_runtime_failure_json,
+            cleanup_required,
+        ],
+    )?;
+    if updated != 1 {
+        anyhow::bail!("AgentRun changed inside its failure transaction");
+    }
+    append_domain_event(
+        transaction,
+        "agent_run.failed",
+        &target.camp_id,
+        ("agent_run", &target.agent_run_id),
+        actor,
+        Some(failure.execution_epoch),
+        &json!({
+            "errorCode": failure.error_code,
+            "errorDetail": failure.error_detail,
+            "failure": failure.failure,
+            "manualRetryAllowed": failure.manual_retry_allowed,
+            "endingGitObservation": failure.ending_git_observation,
+            "terminalResolutionSource": terminal_resolution_source,
+        }),
+    )?;
+    settle_materialized_delivery_for_agent_run(
+        transaction,
+        AgentRunDeliverySettlement {
+            agent_run_id: &target.agent_run_id,
+            agent_run_status: "failed",
+            agent_run_error_code: Some(&failure.error_code),
+            terminal_resolution_source,
+            terminal_reason_code: None,
+            actor,
+            execution_epoch: Some(failure.execution_epoch),
+            now: &target.now,
+        },
+    )?;
+    let camp_turn_status = if target.camp_turn_id.is_empty() {
+        settle_run_deliveries(
+            transaction,
+            &target.agent_run_id,
+            "failed",
+            Some(&failure.error_code),
+            &target.now,
+        )?;
+        None
+    } else {
+        Some(recompute_camp_turn(
+            transaction,
+            &target.camp_id,
+            &target.camp_turn_id,
+            actor,
+            Some(failure.execution_epoch),
+            &target.now,
+        )?)
+    };
+    Ok(CommandHandlerResult::applied(
+        "agent_run.failed",
+        json!({
+            "agentRunId": target.agent_run_id,
+            "threadTurnId": (!target.camp_turn_id.is_empty())
+                .then_some(&target.camp_turn_id),
+            "threadTurnStatus": camp_turn_status,
+        }),
+        Some(entity_ref("agent_run", &target.agent_run_id)),
+    ))
+}
+
+/// The caller has fenced a confirmed lost execution by Run/version/epoch.
+/// Accepted or uncertain input cannot be dispatched again after that loss.
+pub(crate) fn fail_lost_agent_run_in_tx(
+    transaction: &Transaction<'_>,
+    agent_run_id: &str,
+    actor: &ActorRef,
+    reason: &str,
+) -> Result<CommandHandlerResult> {
+    let target =
+        load_terminal_target(transaction, agent_run_id)?.context("lost AgentRun does not exist")?;
+    if !matches!(target.status.as_str(), "running" | "waiting")
+        || target.cancel_requested_at.is_some()
+        || target.final_conversation_message_id.is_some()
+        || target.final_camp_message_id.is_some()
+    {
+        return Ok(rejected(
+            "runtime_loss.fenced",
+            "AgentRun is no longer active",
+        ));
+    }
+    close_abortive_run_effects(
+        transaction,
+        agent_run_id,
+        &target.now,
+        AbortiveEffectClosureReason::runtime_loss(),
+    )?;
+    // Cleanup still gates the lane. Discard only continuation metadata, keeping
+    // the accepted boundary and immutable input/output evidence intact.
+    transaction.execute(
+        "UPDATE conversation SET native_session_id = NULL,
+             native_binding_compatibility_digest = NULL,
+             version = version + 1, updated_at = ?2 WHERE id = ?1",
+        params![target.conversation_id, target.now],
+    )?;
+    settle_failed_agent_run_in_tx(
+        transaction,
+        &target,
+        actor,
+        &FailAgentRunCommand {
+            agent_run_id: agent_run_id.to_string(),
+            expected_version: target.version,
+            execution_epoch: target.execution_epoch,
+            error_code: "accepted_input_outcome_unknown".to_string(),
+            error_detail: Some(reason.to_string()),
+            failure: None,
+            manual_retry_allowed: false,
+            ending_git_observation: None,
+        },
+        None,
+        true,
+    )
+}
+
 struct AbortiveEffectClosure {
     actions_marked_unknown: usize,
     actions_closed: usize,
@@ -4791,6 +4995,18 @@ enum AbortivePreparedInputDisposition {
 }
 
 impl AbortiveEffectClosureReason<'static> {
+    const fn runtime_loss() -> Self {
+        Self {
+            action_unknown_error_code: "runtime_lost_after_dispatch",
+            action_not_executed_reason: "runtime_request_lost",
+            approval_reason: "runtime_request_lost",
+            approval_resolver_id: "runtime-recovery-coordinator",
+            runtime_delivery_error: "runtime_request_lost",
+            prepared_input_error: "runtime_request_lost",
+            prepared_input_disposition: AbortivePreparedInputDisposition::DispatchEvidence,
+        }
+    }
+
     const fn cancellation() -> Self {
         Self {
             action_unknown_error_code: "agent_run_cancelled_after_dispatch",
@@ -4955,8 +5171,9 @@ fn persist_single_chat_success(
     target: &TerminalTarget,
     envelope: &CommandEnvelope<SucceedAgentRunCommand>,
     terminal_reason_code: Option<&str>,
+    cleanup_required: bool,
 ) -> Result<CommandHandlerResult> {
-    let final_output_digest = canonical_content_digest(&[StructuredCampMessageSegment::Text {
+    let final_output_digest = canonical_content_digest(&[StructuredThreadMessageSegment::Text {
         text: envelope.payload.final_output.clone(),
     }])?;
     let final_conversation_message_id = Uuid::new_v4().to_string();
@@ -5014,6 +5231,8 @@ fn persist_single_chat_success(
             execution_lease_owner = NULL, execution_lease_expires_at = NULL,
             terminal_resolution_source = 'runtime_terminal',
             terminal_reason_code = ?7,
+            cancel_requested_at = CASE WHEN ?9 THEN COALESCE(cancel_requested_at, ?3) ELSE cancel_requested_at END,
+            cancel_reason_code = CASE WHEN ?9 THEN COALESCE(cancel_reason_code, 'runtime_host_release_pending') ELSE cancel_reason_code END,
             final_conversation_message_id = ?2,
             final_camp_message_id = NULL,
             ending_git_observation_json = ?6,
@@ -5035,6 +5254,7 @@ fn persist_single_chat_success(
             ending_git_observation,
             terminal_reason_code,
             target.conversation_id,
+            cleanup_required,
         ],
     )?;
     if updated != 1 {
@@ -5051,7 +5271,7 @@ fn persist_single_chat_success(
             "nativeTurnId": envelope.payload.native_turn_id,
             "conversationId": target.conversation_id,
             "finalConversationMessageId": final_conversation_message_id,
-            "finalCampMessageId": Value::Null,
+            "finalThreadMessageId": Value::Null,
             "finalOutputDigest": final_output_digest,
             "responseDelivery": "conversation_message",
             "operationPolicy": "single_chat_v1",
@@ -5085,10 +5305,10 @@ fn persist_single_chat_success(
         "agent_run.succeeded",
         json!({
             "agentRunId": target.agent_run_id,
-            "campTurnId": target.camp_turn_id,
-            "campTurnStatus": camp_turn_status,
+            "threadTurnId": target.camp_turn_id,
+            "threadTurnStatus": camp_turn_status,
             "finalConversationMessageId": final_conversation_message_id,
-            "finalCampMessageId": Value::Null,
+            "finalThreadMessageId": Value::Null,
             "finalOutputDigest": final_output_digest,
             "responseDelivery": "conversation_message",
             "automaticPublicOutputSuppressed": true,
@@ -5175,7 +5395,7 @@ fn decide_missing_send_recovery(
     if candidate.body.len() > CAMP_MESSAGE_SEND_MAX_BODY_BYTES {
         return Ok(outcome("skipped_candidate_too_large", None, None));
     }
-    let candidate_digest = canonical_content_digest(&[StructuredCampMessageSegment::Text {
+    let candidate_digest = canonical_content_digest(&[StructuredThreadMessageSegment::Text {
         text: candidate.body.clone(),
     }])?;
     let message_id = persist_recipient_free_agent_publication(
@@ -5254,7 +5474,7 @@ fn persist_recipient_free_agent_publication(
     )?;
     let message_id = Uuid::new_v4().to_string();
     let addressed_agents_json = "[]";
-    let structured_content = vec![StructuredCampMessageSegment::Text {
+    let structured_content = vec![StructuredThreadMessageSegment::Text {
         text: body.to_string(),
     }];
     let structured_content_json = serde_json::to_string(&structured_content)?;
@@ -5564,7 +5784,9 @@ pub fn settle_legacy_retry_waits(database: &mut Database) -> Result<()> {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AbortiveRunSettlement {
     pub agent_run_id: String,
+    #[serde(rename = "threadId", alias = "campId")]
     pub camp_id: String,
+    #[serde(rename = "threadTurnId", alias = "campTurnId")]
     pub camp_turn_id: String,
     pub conversation_id: String,
     pub execution_epoch: i64,
@@ -5706,7 +5928,7 @@ pub(crate) fn settle_abortive_agent_run_in_tx(
             ("agent_run", agent_run_id),
             actor,
             Some(execution_epoch),
-            &json!({"campTurnId": camp_turn_id, "reasonCode": reason_code}),
+            &json!({"threadTurnId": camp_turn_id, "reasonCode": reason_code}),
         )?;
     }
     append_domain_event(
@@ -6127,7 +6349,10 @@ pub(crate) fn pump_targets_after_runs_terminal(
     Ok(())
 }
 
-fn pump_target_after_run_terminal(database: &mut Database, agent_run_id: &str) -> Result<()> {
+pub(crate) fn pump_target_after_run_terminal(
+    database: &mut Database,
+    agent_run_id: &str,
+) -> Result<()> {
     let target = database
         .connection()
         .query_row(
@@ -6206,7 +6431,7 @@ fn claim_admission_rejection(
             let exhaustion = exhaust_camp_turn_execution_budget(
                 transaction,
                 &run.camp_turn_id,
-                CampTurnExecutionBudgetExhaustionReason::Elapsed,
+                ThreadTurnExecutionBudgetExhaustionReason::Elapsed,
                 &envelope.command_id,
                 &audit_now_text,
                 &envelope.actor,
@@ -6217,7 +6442,7 @@ fn claim_admission_rejection(
                 json!({
                     "message": "CampTurn Execution Budget deadline has elapsed",
                     "reason": "elapsed",
-                    "campTurnId": run.camp_turn_id,
+                    "threadTurnId": run.camp_turn_id,
                     "deadlineAt": run.execution_budget_deadline_at,
                     "agentRunsFenced": exhaustion.agent_runs_fenced,
                 }),
@@ -6872,8 +7097,8 @@ mod tests {
             AdapterKind, AdapterPermissionConfig, FrozenAgentRuntimeConfig, ResolvedModelSelection,
         },
         collaboration::{
-            AddCampMemberCommand, CollaborationService, CreateCampCommand, ExecutionRequest,
-            ProjectBindingKind, TestCampMessageAddress, TestCampMessageCommand,
+            AddThreadMemberCommand, CollaborationService, CreateThreadCommand, ExecutionRequest,
+            ProjectBindingKind, TestThreadMessageAddress, TestThreadMessageCommand,
         },
         command::CommandResultStatus,
         planned_shutdown::{
@@ -6926,7 +7151,7 @@ mod tests {
         let service = CollaborationService::default();
         let mut camps = Vec::new();
         for index in 0..2 {
-            let mut create = CreateCampCommand::for_test_with_members(
+            let mut create = CreateThreadCommand::for_test_with_members(
                 database
                     .directory()
                     .join(format!("startup-recovery-{index}"))
@@ -6942,7 +7167,7 @@ mod tests {
                     &user_envelope(&format!("recovery-create-{index}"), None, create),
                 )
                 .unwrap();
-            let camp_id = created.result.payload["campId"]
+            let camp_id = created.result.payload["threadId"]
                 .as_str()
                 .unwrap()
                 .to_string();
@@ -6952,12 +7177,12 @@ mod tests {
                     &user_envelope(
                         &format!("recovery-send-{index}"),
                         Some(&camp_id),
-                        TestCampMessageCommand {
+                        TestThreadMessageCommand {
                             camp_id: camp_id.clone(),
                             draft_revision: None,
                             body: "recover persisted cancellation".into(),
                             prepared_attachment_ids: Vec::new(),
-                            address: TestCampMessageAddress::Explicit {
+                            address: TestThreadMessageAddress::Explicit {
                                 agent_ids: vec!["agent_1".into(), "agent_2".into()],
                             },
                             reply_to_camp_message_id: None,
@@ -7082,6 +7307,7 @@ mod tests {
             purpose: "resume safely".to_string(),
             effective_config: json!({}),
             runtime: FrozenAgentRuntimeConfig {
+                custom_api: None,
                 camp_fast: None,
                 adapter_kind: AdapterKind::CodexCli,
                 installation_id: "adapter-test-codex".to_string(),
@@ -7508,7 +7734,7 @@ mod tests {
                 &user_envelope(
                     "planned-shutdown-create",
                     None,
-                    CreateCampCommand::for_test_with_members(
+                    CreateThreadCommand::for_test_with_members(
                         workspace.to_string_lossy().to_string(),
                         &["agent_2"],
                         "agent_2",
@@ -7516,14 +7742,17 @@ mod tests {
                 ),
             )
             .unwrap();
-        let camp_id = camp.result.payload["campId"].as_str().unwrap().to_string();
+        let camp_id = camp.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_string();
         collaboration
             .add_camp_member(
                 &mut database,
                 &user_envelope(
                     "planned-shutdown-member",
                     Some(&camp_id),
-                    AddCampMemberCommand {
+                    AddThreadMemberCommand {
                         camp_id: camp_id.clone(),
                         agent_id: "agent_2".to_string(),
                         expected_membership_generation: 1,
@@ -7539,12 +7768,12 @@ mod tests {
                 &user_envelope(
                     "planned-shutdown-send",
                     Some(&camp_id),
-                    TestCampMessageCommand {
+                    TestThreadMessageCommand {
                         camp_id: camp_id.clone(),
                         draft_revision: None,
                         body: "执行关闭语义测试".to_string(),
                         prepared_attachment_ids: Vec::new(),
-                        address: TestCampMessageAddress::Default,
+                        address: TestThreadMessageAddress::Default,
                         reply_to_camp_message_id: None,
                         execution: Some(ExecutionRequest {
                             task_id: None,
@@ -7883,6 +8112,188 @@ mod tests {
             .unwrap();
     }
 
+    // Owns the live Host-loss transaction, which startup and transport-retry
+    // tests do not exercise. Reuse the existing claimed Run/input fixture.
+    #[test]
+    fn runtime_loss_settles_uncertain_input_and_fences_old_or_terminal_executions() {
+        for (input_status, waiting, dispatched, launch_failure) in [
+            ("accepted", false, false, false),
+            ("accepted", true, false, false),
+            ("delivery_unknown", true, false, false),
+            ("prepared", false, true, false),
+            ("not_accepted", false, false, false),
+            ("delivery_unknown", false, true, true),
+        ] {
+            let (directory, mut database, camp_id, _, agent_run_id, execution_epoch) =
+                claimed_run_for_planned_shutdown("required");
+            insert_test_runtime_input(&database, &agent_run_id, execution_epoch, input_status);
+            if dispatched {
+                database.connection().execute(
+                    "UPDATE runtime_input_delivery SET dispatch_started_at = prepared_at WHERE agent_run_id = ?1",
+                    [&agent_run_id],
+                ).unwrap();
+            }
+            if waiting {
+                database.connection().execute(
+                    "UPDATE agent_run SET status = 'waiting', wait_reason = 'delivery_unknown', runtime_recovery_required = 1 WHERE id = ?1",
+                    [&agent_run_id],
+                ).unwrap();
+            }
+            let version: i64 = database
+                .connection()
+                .query_row(
+                    "SELECT version FROM agent_run WHERE id = ?1",
+                    [&agent_run_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let envelope = |epoch, version| CommandEnvelope {
+                command_id: Uuid::new_v4().to_string(),
+                actor: ActorRef::System {
+                    component_id: "runtime-recovery-coordinator".to_string(),
+                },
+                camp_id: Some(camp_id.clone()),
+                expected_versions: Vec::new(),
+                execution_epoch: None,
+                payload: crate::action::ReconcileRuntimeLossCommand {
+                    agent_run_id: agent_run_id.clone(),
+                    expected_version: version,
+                    execution_epoch: epoch,
+                    reason: "codex_host_exited".to_string(),
+                },
+            };
+            let service = crate::action::ActionSafetyService::default();
+            assert_eq!(
+                service
+                    .reconcile_runtime_loss(&mut database, &envelope(execution_epoch - 1, version))
+                    .unwrap()
+                    .result
+                    .code,
+                "runtime_loss.fenced"
+            );
+            database.connection().execute("UPDATE conversation SET native_session_id = 'old-native' WHERE id = (SELECT conversation_id FROM agent_run WHERE id = ?1)", [&agent_run_id]).unwrap();
+            let result = if launch_failure {
+                ExecutionRuntimeService::default().fail_agent_run_without_runtime_terminal(
+                    &mut database,
+                    &adapter_envelope(
+                        "launch-unknown",
+                        &camp_id,
+                        FailAgentRunCommand {
+                            agent_run_id: agent_run_id.clone(),
+                            expected_version: version,
+                            execution_epoch,
+                            error_code: "runtime_launch_failed".into(),
+                            error_detail: None,
+                            failure: None,
+                            manual_retry_allowed: true,
+                            ending_git_observation: None,
+                        },
+                    ),
+                )
+            } else {
+                service.reconcile_runtime_loss(&mut database, &envelope(execution_epoch, version))
+            }
+            .unwrap();
+            if input_status == "not_accepted" {
+                assert_eq!(result.result.code, "agent_run.runtime_loss_reconciled");
+                assert!(
+                    ExecutionRuntimeService::default()
+                        .load_dispatchable_agent_run(&database, &agent_run_id)
+                        .unwrap()
+                        .is_some()
+                );
+            } else {
+                assert_eq!(result.result.code, "agent_run.failed");
+                let binding: Option<String> = database.connection().query_row("SELECT native_session_id FROM conversation WHERE id = (SELECT conversation_id FROM agent_run WHERE id = ?1)", [&agent_run_id], |row| row.get(0)).unwrap();
+                assert!(
+                    binding.is_none(),
+                    "unknown outcome must rotate the old native binding"
+                );
+                let state = database
+                    .connection()
+                    .query_row(
+                        "SELECT status, wait_reason, runtime_recovery_required, last_error_code,
+                            cancel_requested_at IS NOT NULL, cancel_acknowledged_at IS NULL,
+                            execution_epoch, execution_lease_owner, manual_retry_allowed
+                     FROM agent_run WHERE id = ?1",
+                        [&agent_run_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                                row.get::<_, bool>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, bool>(4)?,
+                                row.get::<_, bool>(5)?,
+                                row.get::<_, i64>(6)?,
+                                row.get::<_, Option<String>>(7)?,
+                                row.get::<_, bool>(8)?,
+                            ))
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    state,
+                    (
+                        "failed".into(),
+                        None,
+                        false,
+                        "accepted_input_outcome_unknown".into(),
+                        true,
+                        true,
+                        execution_epoch,
+                        None,
+                        false
+                    )
+                );
+                let preserved: String = database
+                    .connection()
+                    .query_row(
+                        "SELECT status FROM runtime_input_delivery WHERE agent_run_id = ?1",
+                        [&agent_run_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    preserved,
+                    if dispatched {
+                        "delivery_unknown"
+                    } else {
+                        input_status
+                    }
+                );
+                assert!(
+                    ExecutionRuntimeService::default()
+                        .load_dispatchable_agent_run(&database, &agent_run_id)
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    service
+                        .reconcile_runtime_loss(
+                            &mut database,
+                            &envelope(execution_epoch, version + 1)
+                        )
+                        .unwrap()
+                        .result
+                        .code,
+                    "runtime_loss.fenced"
+                );
+                assert_eq!(
+                    ExecutionRuntimeService::default()
+                        .list_cancellation_candidates(&database, 100)
+                        .unwrap()
+                        .iter()
+                        .filter(|run| run.agent_run_id == agent_run_id)
+                        .count(),
+                    1
+                );
+            }
+            drop(database);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
     #[test]
     fn network_recovery_waits_reclaims_and_clears_only_after_input_acceptance() {
         let (directory, mut database, camp_id, _, agent_run_id, execution_epoch) =
@@ -7961,6 +8372,30 @@ mod tests {
                     payload: ArmAgentRunNetworkRecoveryCommand {
                         agent_run_id: agent_run_id.clone(),
                         expected_version: waiting_version,
+                        execution_epoch,
+                        attempt: 1,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            armed.result.code,
+            "agent_run.network_recovery_attempt_admitted"
+        );
+        let armed = service
+            .arm_network_recovery_attempt(
+                &mut database,
+                &CommandEnvelope {
+                    command_id: "network-recovery-readmit-deferred-claim".to_string(),
+                    actor: ActorRef::System {
+                        component_id: "network-recovery-coordinator".to_string(),
+                    },
+                    camp_id: Some(camp_id.clone()),
+                    expected_versions: Vec::new(),
+                    execution_epoch: None,
+                    payload: ArmAgentRunNetworkRecoveryCommand {
+                        agent_run_id: agent_run_id.clone(),
+                        expected_version: armed.result.payload["version"].as_i64().unwrap(),
                         execution_epoch,
                         attempt: 1,
                     },
@@ -8091,7 +8526,14 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(state, ("running".to_string(), None, version));
+        assert_eq!(
+            state,
+            (
+                "running".to_string(),
+                Some("runtime_initializing".to_string()),
+                version
+            )
+        );
         drop(database);
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -8327,7 +8769,9 @@ mod tests {
 
     #[test]
     fn runtime_terminal_provenance_is_not_fabricated_for_core_launch_failures() {
-        for runtime_terminal_observed in [false, true] {
+        for (runtime_terminal_observed, cleanup_required) in
+            [(false, true), (true, false), (true, true)]
+        {
             let (directory, mut database, camp_id, _, agent_run_id, execution_epoch) =
                 claimed_run_for_planned_shutdown("required");
             let execution = ExecutionRuntimeService::default()
@@ -8353,7 +8797,9 @@ mod tests {
                 },
             );
             let service = ExecutionRuntimeService::default();
-            let terminal = if runtime_terminal_observed {
+            let terminal = if runtime_terminal_observed && cleanup_required {
+                service.fail_agent_run_requiring_cleanup(&mut database, &envelope)
+            } else if runtime_terminal_observed {
                 service.fail_agent_run(&mut database, &envelope)
             } else {
                 service.fail_agent_run_without_runtime_terminal(&mut database, &envelope)
@@ -8382,12 +8828,19 @@ mod tests {
                 state.0.as_deref(),
                 runtime_terminal_observed.then_some("runtime_terminal")
             );
-            if runtime_terminal_observed {
+            if !cleanup_required {
                 assert!(state.1.is_none());
                 assert!(state.2.is_none());
             } else {
                 assert!(state.1.is_some());
-                assert_eq!(state.2.as_deref(), Some("runtime_terminal_unconfirmed"));
+                assert_eq!(
+                    state.2.as_deref(),
+                    Some(if runtime_terminal_observed {
+                        "runtime_terminal_host_failed"
+                    } else {
+                        "runtime_terminal_unconfirmed"
+                    })
+                );
             }
             assert!(state.3.is_none());
             assert_eq!(
@@ -9326,7 +9779,7 @@ mod tests {
                 &user_envelope(
                     "runtime-create-camp",
                     None,
-                    CreateCampCommand::for_test_with_members(
+                    CreateThreadCommand::for_test_with_members(
                         workspace.to_string_lossy().to_string(),
                         &["agent_2"],
                         "agent_2",
@@ -9334,14 +9787,17 @@ mod tests {
                 ),
             )
             .unwrap();
-        let camp_id = camp.result.payload["campId"].as_str().unwrap().to_string();
+        let camp_id = camp.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_string();
         collaboration
             .add_camp_member(
                 &mut database,
                 &user_envelope(
                     "runtime-add-member",
                     Some(&camp_id),
-                    AddCampMemberCommand {
+                    AddThreadMemberCommand {
                         camp_id: camp_id.clone(),
                         agent_id: "agent_2".to_string(),
                         expected_membership_generation: 1,
@@ -9360,12 +9816,12 @@ mod tests {
                     &user_envelope(
                         &format!("runtime-turn-{index}"),
                         Some(&camp_id),
-                        TestCampMessageCommand {
+                        TestThreadMessageCommand {
                             camp_id: camp_id.clone(),
                             draft_revision: None,
                             body: format!("执行职责 {index}"),
                             prepared_attachment_ids: Vec::new(),
-                            address: TestCampMessageAddress::Default,
+                            address: TestThreadMessageAddress::Default,
                             reply_to_camp_message_id: None,
                             execution: Some(ExecutionRequest {
                                 task_id: None,
@@ -9624,7 +10080,7 @@ mod tests {
                 &user_envelope(
                     "dispatch-reject-create",
                     None,
-                    CreateCampCommand::for_test_with_members(
+                    CreateThreadCommand::for_test_with_members(
                         workspace.to_string_lossy().to_string(),
                         &["agent_2"],
                         "agent_2",
@@ -9632,14 +10088,17 @@ mod tests {
                 ),
             )
             .unwrap();
-        let camp_id = camp.result.payload["campId"].as_str().unwrap().to_string();
+        let camp_id = camp.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_string();
         collaboration
             .add_camp_member(
                 &mut database,
                 &user_envelope(
                     "dispatch-reject-member",
                     Some(&camp_id),
-                    AddCampMemberCommand {
+                    AddThreadMemberCommand {
                         camp_id: camp_id.clone(),
                         agent_id: "agent_2".to_string(),
                         expected_membership_generation: 1,
@@ -9655,12 +10114,12 @@ mod tests {
                 &user_envelope(
                     "dispatch-reject-send",
                     Some(&camp_id),
-                    TestCampMessageCommand {
+                    TestThreadMessageCommand {
                         camp_id: camp_id.clone(),
                         draft_revision: None,
                         body: "消息必须保留".to_string(),
                         prepared_attachment_ids: Vec::new(),
-                        address: TestCampMessageAddress::Default,
+                        address: TestThreadMessageAddress::Default,
                         reply_to_camp_message_id: None,
                         execution: Some(ExecutionRequest {
                             task_id: None,
@@ -9763,7 +10222,7 @@ mod tests {
                 &user_envelope(
                     "runtime-rebind-create",
                     None,
-                    CreateCampCommand::for_test_with_members(
+                    CreateThreadCommand::for_test_with_members(
                         workspace.to_string_lossy().to_string(),
                         &["agent_2"],
                         "agent_2",
@@ -9771,14 +10230,17 @@ mod tests {
                 ),
             )
             .unwrap();
-        let camp_id = camp.result.payload["campId"].as_str().unwrap().to_string();
+        let camp_id = camp.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_string();
         collaboration
             .add_camp_member(
                 &mut database,
                 &user_envelope(
                     "runtime-rebind-member",
                     Some(&camp_id),
-                    AddCampMemberCommand {
+                    AddThreadMemberCommand {
                         camp_id: camp_id.clone(),
                         agent_id: "agent_2".to_string(),
                         expected_membership_generation: 1,
@@ -9791,24 +10253,11 @@ mod tests {
         let fast_target = crate::camp_fast::target(&database, &camp_id, "agent_2")
             .unwrap()
             .unwrap();
-        let selected_runtime = crate::camp_fast::runtime_for_target(&database, &fast_target)
-            .unwrap()
-            .unwrap();
-        crate::camp_fast::record_eligibility(
-            &database,
-            &fast_target,
-            &selected_runtime,
-            &crate::camp_fast::NativeFastEligibility {
-                eligible: true,
-                runtime_default_fast: Some(false),
-            },
-        )
-        .unwrap();
         let preference = |command_id: &str, enabled| {
             user_envelope(
                 command_id,
                 Some(&camp_id),
-                crate::camp_fast::SetCampMemberFastCommand {
+                crate::camp_fast::SetThreadMemberFastCommand {
                     camp_id: camp_id.clone(),
                     agent_id: "agent_2".into(),
                     expected_runtime_binding_revision: fast_target.runtime_binding_revision.clone(),
@@ -9823,12 +10272,12 @@ mod tests {
                 &user_envelope(
                     "runtime-rebind-send",
                     Some(&camp_id),
-                    TestCampMessageCommand {
+                    TestThreadMessageCommand {
                         camp_id: camp_id.clone(),
                         draft_revision: None,
                         body: "允许可信 Runtime 原地升级".to_string(),
                         prepared_attachment_ids: Vec::new(),
-                        address: TestCampMessageAddress::Default,
+                        address: TestThreadMessageAddress::Default,
                         reply_to_camp_message_id: None,
                         execution: Some(ExecutionRequest {
                             task_id: None,
@@ -9933,7 +10382,16 @@ mod tests {
         assert_eq!(rebound.result.code, "agent_run.runtime_rebound");
         assert_eq!(rebound.result.payload["version"], 2);
 
-        let state: (String, i64, String, String, String, String, i64, String) = database
+        let state: (
+            String,
+            i64,
+            Option<String>,
+            String,
+            Option<String>,
+            String,
+            i64,
+            String,
+        ) = database
             .connection()
             .query_row(
                 r#"
@@ -9961,12 +10419,9 @@ mod tests {
             .unwrap();
         assert_eq!(state.0, "queued");
         assert_eq!(state.1, 2);
-        assert_eq!(Some(state.2.as_str()), frozen.reported_version.as_deref());
+        assert_eq!(state.2.as_deref(), frozen.reported_version.as_deref());
         assert_eq!(state.3, frozen.executable_fingerprint);
-        assert_eq!(
-            Some(state.4.as_str()),
-            effective.reported_version.as_deref()
-        );
+        assert_eq!(state.4.as_deref(), effective.reported_version.as_deref());
         assert_eq!(state.5, effective.executable_fingerprint);
         assert_eq!(state.6, 1);
         let effective_config: Value = serde_json::from_str(&state.7).unwrap();
@@ -10024,7 +10479,7 @@ mod tests {
                 &user_envelope(
                     "run-cancel-create-camp",
                     None,
-                    CreateCampCommand::for_test_with_members(
+                    CreateThreadCommand::for_test_with_members(
                         workspace.to_string_lossy().to_string(),
                         &["agent_2", "agent_1"],
                         "agent_2",
@@ -10032,7 +10487,10 @@ mod tests {
                 ),
             )
             .unwrap();
-        let camp_id = camp.result.payload["campId"].as_str().unwrap().to_string();
+        let camp_id = camp.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_string();
         for agent_id in ["agent_2", "agent_1"] {
             collaboration
                 .add_camp_member(
@@ -10040,7 +10498,7 @@ mod tests {
                     &user_envelope(
                         &format!("run-cancel-add-{agent_id}"),
                         Some(&camp_id),
-                        AddCampMemberCommand {
+                        AddThreadMemberCommand {
                             camp_id: camp_id.clone(),
                             agent_id: agent_id.to_string(),
                             expected_membership_generation: 1,
@@ -10057,12 +10515,12 @@ mod tests {
                 &user_envelope(
                     "run-cancel-send",
                     Some(&camp_id),
-                    TestCampMessageCommand {
+                    TestThreadMessageCommand {
                         camp_id: camp_id.clone(),
                         draft_revision: None,
                         body: "并行处理两项职责".to_string(),
                         prepared_attachment_ids: Vec::new(),
-                        address: TestCampMessageAddress::Explicit {
+                        address: TestThreadMessageAddress::Explicit {
                             agent_ids: vec!["agent_2".to_string(), "agent_1".to_string()],
                         },
                         reply_to_camp_message_id: None,
@@ -10313,7 +10771,7 @@ mod tests {
                 &user_envelope(
                     "fanout-runtime-create-camp",
                     None,
-                    CreateCampCommand::for_test_with_members(
+                    CreateThreadCommand::for_test_with_members(
                         workspace.to_string_lossy().to_string(),
                         &["agent_2", "agent_1"],
                         "agent_2",
@@ -10321,7 +10779,10 @@ mod tests {
                 ),
             )
             .unwrap();
-        let camp_id = camp.result.payload["campId"].as_str().unwrap().to_string();
+        let camp_id = camp.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_string();
         for agent_id in ["agent_2", "agent_1"] {
             collaboration
                 .add_camp_member(
@@ -10329,7 +10790,7 @@ mod tests {
                     &user_envelope(
                         &format!("fanout-runtime-add-{agent_id}"),
                         Some(&camp_id),
-                        AddCampMemberCommand {
+                        AddThreadMemberCommand {
                             camp_id: camp_id.clone(),
                             agent_id: agent_id.to_string(),
                             expected_membership_generation: 1,
@@ -10346,12 +10807,12 @@ mod tests {
                 &user_envelope(
                     "fanout-runtime-message",
                     Some(&camp_id),
-                    TestCampMessageCommand {
+                    TestThreadMessageCommand {
                         camp_id: camp_id.clone(),
                         draft_revision: None,
                         body: "请独立分析并公开各自结论。".to_string(),
                         prepared_attachment_ids: Vec::new(),
-                        address: TestCampMessageAddress::Explicit {
+                        address: TestThreadMessageAddress::Explicit {
                             agent_ids: vec!["agent_2".to_string(), "agent_1".to_string()],
                         },
                         reply_to_camp_message_id: None,
@@ -10486,7 +10947,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(completed.result.status, CommandResultStatus::Applied);
-            assert!(completed.result.payload["campTurnStatus"].is_null());
+            assert!(completed.result.payload["threadTurnStatus"].is_null());
         }
 
         let settled_deliveries: i64 = database

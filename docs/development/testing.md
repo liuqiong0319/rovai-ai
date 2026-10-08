@@ -1,7 +1,7 @@
 ---
 document_type: development-guide
 authority: test-policy-and-command-routing
-last_updated: 2026-09-28
+last_updated: 2026-10-07
 ---
 
 # 测试与 Smoke Test
@@ -90,6 +90,64 @@ Rust owner 分成四个可执行层级；feature gating 只改变日常路由，
 `slow-tests`，则使用 `--features slow-tests`。过滤命令显示 `0 tests` 不构成验证证据，提交前先用
 `-- --list` 确认目标 owner 实际进入清单。
 
+## Run 思考反馈
+
+`runtime_thinking::tests` 拥有两个纯状态 owner：分片短标题的有界解析与清除，以及 root/child/replay/旧 item
+隔离。修复前仅有无文本 phase 推导，既有 owner 没有原生标题解析状态；因此新增最低成本单元测试，
+不新增数据库夹具。最小命令为 `cargo test -p rovai-core --lib runtime_thinking::tests::`。
+
+Claude/Pi 空思考块和 ACP 订阅协商扩展已有 Runtime owner（`--features extended-tests`）；标题不落库复用
+`execution_text::slow_tests::text_blocks_preserve_interleaving_live_reads_and_shutdown_without_fragment_writes`
+（`--features slow-tests`）。前端复用 `App.test.ts`、分页缓存和事件缓冲 owner；
+`node --test scripts/lib/execution-state-transition.test.mjs` 验证真实浏览器布局、旧读取/旧 epoch 隔离与重连恢复。
+
+显式真实模型验收：`node scripts/smoke-runtime-thinking.mjs codex-cli copilot-cli claude-code-cli pi`。
+脚本使用独立 Core data-dir、Skill Library 与 Workspace，只保留 phase/标题长度和终态元数据。
+Pi 默认未开启思考时可用 `ROVAI_THINKING_PI_MODEL` 指定该机器已配置的原生模型 ID，在隔离成员上设置
+`thinking_level=high`；不修改全局配置。可选标题是否实际产生与原生 Runtime/模型有关，未观察到不能报告标题实测成功。
+
+## Member CLI
+
+复用 `team_tool::tests` 的真实 Run/数据库 fixture。新增扩展 owner
+`member_profile_reads_and_patches_preserve_scope_atomicity_and_replay`：既有创建 owner 不拥有
+全局 PATCH 的事务合并、版本、图文原子提交及输出路径边界；修复前这三个操作不存在。
+创建后编辑与原创建者/跨 Thread 限制扩展既有
+`confirmed_user_input_can_create_one_idempotent_member_but_agent_input_cannot`，不新增数据库 fixture。
+图片矩阵扩展 `member_avatar::tests::imports_four_by_five_image_with_lightweight_crop_and_deterministic_identity`；
+封闭输入和 null/空 PATCH 扩展既有 `member_studio` schema owner。
+PATCH owner 同时覆盖相同图片的新请求无版本变化、源文件消失后的持久回放、同路径换图冲突，
+以及已提交资产缺失时不得重建其 ID。Run tmp 轮换删除与图片重取扩展既有
+`builtin_tool_runtime::tests::lease_rotates_fences_and_replays_exact_request`。
+无 Lead 的名单与零写入扩展原 PATCH owner。CLI 的
+`direct_flags_and_input_file_are_mutually_exclusive` 覆盖 create/update 直接参数与 JSON 文件保持原始
+相对／绝对路径。原创建与 PATCH owner 覆盖认证 Run 的文件入口：冻结 execution root 与 Thread
+workspace 不同、同名图片内容不同、失效 epoch／缺失 workspace 拒绝、缺失源仍能解析和回放、
+绝对路径原样保留、symlink 仍由 importer 拒绝。附件 helper 的等价性扩展
+`local_attachment_source::tests::resolver_returns_exact_stored_paths_for_files_and_directories`。
+修复前 update 在 CLI cwd 解析、create 在 Core cwd 解析；本次未新增 Rust owner，沿用已有
+数据库 fixture 验证冻结 Run 的权威，纯路径测试不能证明该 SQL 归属。
+
+最小验证：先 `cargo test -p rovai-core --features extended-tests --lib member_ -- --list` 确认 owner 非零，
+再执行同命令去掉 `-- --list`；租约 owner 使用
+`cargo test -p rovai-core --features extended-tests --lib builtin_tool_runtime::tests::`，
+同样先核对清单；默认 workspace 回归仍执行 `pnpm test:rust:pr`。
+
+## Thread 执行查询
+
+`thread_runs::tests` 拥有新的输入/游标封闭边界与 Unicode 预览语义；现有 owner 没有执行游标或该截断约定，
+故用两个纯函数测试覆盖空值、过滤绑定、状态和 200 码点边界。最小命令为 `cargo test -p rovai-core --lib thread_runs::tests::`。
+`thread_runs::read_tests` 拥有公共 Run/动态队列/冻结输入的 SQL 读取 seam；用最小隔离 SQLite 表验证私有候选排除、
+历史归属、计数不依赖可见性、缺失来源、逻辑状态、游标条目消失和无写入。纯函数不能证明 JOIN、聚合或事务读取，
+现有 claim owner 也不拥有该查询；最小命令为 `cargo test -p rovai-core --features extended-tests --lib thread_runs::read_tests::`。
+其中 `candidate_pages_bound_materialization_and_use_thread_indexes` 复用该夹具，独立拥有长历史查询的候选读取上限与索引访问：
+5 万条目标 Run、5 万条其他 Thread Run 和 2,000 条 waiting Delivery 下，SQL 只返回本页加一条；
+同时验证混合时间格式、纳秒与同刻身份排序、深页游标和完整聚合计数。修复前单页会物化全部 50,002 个候选，
+原可见性测试的小数据集不能证明这个成本边界。执行计划断言只验证现有 Thread/turn/队列索引的访问，
+不声称时间排序或完整等待计数是 O(limit)；不依赖耗时阈值，最小验证命令沿用该 read_tests owner。
+消息 addressing、实时历史范围、Single Chat、Bootstrap 和 Skill 升级复用现有 owner，不另建等价 fixture。
+历史 collection 结果沿用 `execution_evidence` 的既有持久化 owner，验证 inline/blob 原始字节、digest、receipt
+与当前 CLI 的严格 Schema 分离；不放宽新结果合同。
+
 ## 渠道入站附件
 
 本次不新增 Rust fixture owner；扩展 `channel::tests` 的既有附件准入与队列测试为飞书/钉钉矩阵，保留原有
@@ -109,9 +167,32 @@ Open API grant 兑换、独立 CDN 请求无 token、取消与丢失 grant 的 s
 飞书下载测试继续覆盖。Host 既有 fixture 扩展文件成功、folder 明确失败和 receiving Bot 选择，不运行真实模型
 或使用日常账号凭据。真实租户收发与权限验收仍须单独记录。
 
+## 原生连接编辑退役
+
+按 User 2026-10-07 的取消要求，原生连接表单、写回、迁移、Key 编辑和模型目录生成在同一改动中退出，
+对应写路径测试退役。`runtime_custom_api::tests` 保留只读来源、摘要/凭据变化、脱敏、历史快照和原生字节不变，
+其中 SQLite owner 改为证明普通启动字段的 CAS、合并、提交失败回滚及隐藏历史凭据；没有新增数据库夹具。
+`runtime_startup::tests` 扩展封闭输入与旧字段拒绝；Core `runtime_check_environment::tests` 继续验证阻塞读取不妨碍
+本地保存、迟到结果不覆盖新设置，并把旧 API 保存矩阵改为明确拒绝。现有 agent profile owner 保留冻结/重绑定隔离。
+
+最小命令：`cargo test -p rovai-core --features extended-tests --lib runtime_custom_api::`、
+同参数的 `runtime_startup::` 与 `runtime_check_environment::tests::`；冻结 seam 属于 `slow-tests`，
+按既有 owner 单独执行。UI 复用 `pnpm test:settings-workspace`，覆盖两种智能体无连接表单、保存一次请求、
+立即结束加载、失败草稿、主题及缩放。已删除专用 API UI/CLI smoke，原生执行回归仍由 Claude/Codex owner 拥有。
+完整退役清单及证据见 [v1.72 实施计划](../versions/v1.72/implementation-plan.md#2026-10-07-移除自定义-api-配置)。
+
 ## 测试层级
 
 ### DeepSeek Harness ACP
+
+Responses 工具兼容由 `dsh::tests::responses_tool_defaults_preserve_native_overrides_and_private_settings`
+拥有：此前显式 `openai-responses` 路由缺少兼容默认值，工具定义省略 `strict`；测试只用临时 settings，
+覆盖默认投影、Provider / Model 显式开关不复制或改写、其他协议不投影、私有字段不进入 patch、解析错误脱敏。
+既有权限 owner 不拥有 Provider 配置投影，因此增加这一个独立 owner；无需数据库或真实模型。
+最小命令：`cargo test -p rovai-core --lib dsh::tests::`。
+构建 Debug Core/CLI 后运行 `node scripts/smoke-dsh-responses-tools.mjs`，用已安装 DSH 与受控本机 Responses
+端点验证实际 wire `strict: false`、原生 Provider / Model 覆盖优先级、真实 shell 副作用与非法空理由仍拒绝。
+该 Smoke 自动隔离 Core data、Skills、MCP 与 DSH Home，不使用真实凭据或远端模型；模型行为仍需真实调用验证。
 
 新增 owner 均使用临时目录，不读取真实凭据、不启动模型；最小命令为
 `cargo test -p rovai-core --lib dsh` 和
@@ -242,6 +323,40 @@ Electron 回归使用生产 adapter、CampWorkspace 与 CSS，验证空事件下
 
 ### Claude Code 无 Prompt 目录验证
 
+原生审批转换由 `claude_permission::tests::native_permission_ids_and_exact_input_bind_frozen_approval_options`
+拥有最低成本输入矩阵：request_id/tool_use_id 区分、原 input 回填、缺失身份拒绝及重复命令独立绑定；
+原生建议的精确 updatedPermissions、四种 destination、suppression、无效/未支持建议、建议去重与响应 digest
+在同一纯转换 owner 内扩展，不新建 SQLite 或进程 fixture。
+最低成本控制准入由 `claude_control::tests::incompatible_initialization_and_missing_tool_identity_never_admit_permission`
+拥有：初始化错误、模式漂移和可选 tool_use_id 缺失必须拒绝，不能自动放行。
+最小命令：`cargo test -p rovai-core --lib claude_permission::tests::`、
+`cargo test -p rovai-core --lib incompatible_initialization_and_missing_tool_identity`。
+
+控制写入并发与关闭由 `claude_control::tests::native_decisions_are_serialized_by_id_and_close_only_after_the_last_idle_result`
+拥有，覆盖 256 次普通工具后、相同输入的独立 ID、NDJSON 串行化、后台任务与多结果收尾。
+同一 owner 扩展精确记忆响应：范围/目的地篡改、跨请求借用及 suppression 均拒绝；允许的 updatedPermissions
+逐字段保留在原 request_id 的输出中。
+暂停的 Tokio 时钟验证长审批/后台任务不触发结束计时，两个官方任务终态形态均能解除跟踪并重新计时。
+`cancelled_queued_decisions_and_disconnect_never_write_late_allowances` 单独拥有排队响应被撤销的竞态。
+该 owner 使用记忆响应验证取消和断线清理，迟到的永久规则允许也不能写入。
+这两个 seam 无法由 Action 转换纯函数证明，进入 extended-tests；最小命令为
+`cargo test -p rovai-core --features extended-tests --lib claude_control::tests::`。
+`claude::tests::native_permissions_do_not_block_stdout_or_replace_the_last_result` 拥有 reader 与控制通道
+组合边界：未决审批期间普通文本仍可读取，早期 result 不截断后续输出，末轮结果和用量保留。
+writer-only owner 无法覆盖该解析链路，使用 extended-tests 的内存 pipe，不创建进程或数据库；最小命令为
+`cargo test -p rovai-core --features extended-tests --lib native_permissions_do_not_block_stdout`。
+既有慢速 `action::tests::slow_tests::native_request_resolution_is_the_exact_authorization_delivery_ack`
+扩展未决取消矩阵，验证 Codex/Claude 的审批失效由实际 Runtime actor 署名，复用其唯一 SQLite fixture。
+该署名属于同一 native-resolution 事务，纯控制测试不能证明持久状态；最小命令为
+`cargo test -p rovai-core --features slow-tests --lib native_request_resolution_is_the_exact_authorization_delivery_ack`。
+既有 `claude::tests` 进程清理与 stdout owner 改为原生初始化/结构化输入夹具，保留原先的故障、取消、
+多结果和私有文件清理边界。原 Hook/完整工具输入匹配测试随生产路径退出，Git 保留旧实现。
+真实允许、拒绝、取消与 Core receipt 使用 `ROVAI_CLAUDE_APPROVAL_SMOKE=1 node scripts/smoke-claude-runtime.mjs`；
+实际 Desktop 点击由 `node scripts/accept-claude-permission.mjs` 在独立 userData/Skill Library/MCP 下验证。
+允许一次、拒绝之后追加原生记忆点击，核对隔离项目的 settings 只保存选中规则，再执行相同命令验证无新增
+Approval 且有本轮 Core send receipt 和 exact message；记忆按钮、scope 与 CLI 版本随证据保存。
+模型 Smoke 不进入普通 Rust 测试。旧 Hook Smoke 不作为原生协议通过记录。
+
 目录协议与进程生命周期由共享 Core library 的 `health::claude_catalog_tests` owner 验证，正常门禁使用临时
 可执行夹具，不启动真实模型。安装版手工验证使用显式 ignored 测试：
 
@@ -340,6 +455,12 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 pnpm test:rust:full
 ```
+
+Windows Runtime 改动可用 `Full check` 的 `windows-runtime` scope 单独执行既有 Windows 原生 job，
+其中 Fleet 回收凭据及 Codex 释放策略显式启用 `extended-tests`。该 runner 证据不替代实体 Windows 10/11、
+真实 CLI 账号，或仍由 Unix/macOS 条件编译限定的 Codex/Core 集成测试。
+既有 Managed Process 孙进程 owner 用稳定 handle 验证 Job 计数不能抢先确认退出，并覆盖首次观察后
+新增后代、缺失/重复/非法成员通知；Fleet receipt owner 验证跨 Core 仅凭已持久化回执放行。
 
 默认 fast suite 保留纯 parser/serde、确定性 policy、常量和最小原子 regression，并以 400 项作为当前
 反馈预算。`extended-tests` 承担大型模块矩阵、SQLite、子进程、并发与跨边界 owner；`slow-tests`
@@ -484,7 +605,7 @@ Windows x64 job 验证。改动还涉及完整桌面挂载和恢复时，在遵�
 | --- | --- | --- |
 | `pnpm smoke:intake` | Codex | 创建 Git fixture；验证 Camp 消息、连续 Conversation、重启和删除 |
 | `pnpm smoke:acp-runtime` | 已完成接入的 ACP Runtime（含 TRAE、Kimi、Grok） | `ROVAI_ACP_SMOKE_ADAPTER` 可选择单一 Runtime；命令矩阵断言公开 command output 进入 `runtime.action.payload.output`。TRAE 覆盖 warm Host/Session 与 exact `session/load` HistoryRestore；Grok `>= 1.0.0` 覆盖 warm Host/Session 与标准 ACP `session/resume`；Kimi/Grok 的普通 ACP agent text（包括 provider `<think>`）原样进入执行台与 final。Grok 正式 Host 使用官方 `$GROK_HOME/config.toml` 和 mode-0600 `.env`；隔离 Probe/Smoke 使用同一官方布局 |
-| `pnpm smoke:claude-runtime` | Claude Code | 验证原生权限、连续性和 Resume；两次无工具回复必须投影公开 narration；随后强制 `Bash` 固定 `printf`，断言公开 output、原生 tool-use ID 与同 Session/Conversation 关联 |
+| `pnpm smoke:claude-runtime` | Claude Code | 验证原生权限、连续性和 Resume；两次无工具回复必须投影公开 narration；随后强制 `Bash` 固定 `printf`，断言公开 output、原生 tool-use ID 与同 Session/Conversation 关联。`ROVAI_CLAUDE_APPROVAL_SMOKE=1` 追加 `acceptEdits` 下真实 `rovai send` 允许一次、拒绝及待审批取消，核对 Action、Run 和消息效果 |
 | `pnpm smoke:antigravity-runtime` | Antigravity + Codex | 要求 `output.stream_json`，强制原生 `run_command` 固定 `printf` 并断言公开 output/step ID；另覆盖同 Session 续接、私有日志清理和 Antigravity 到 Codex 换绑 |
 | `pnpm smoke:pi-runtime` | Pi 0.84.4+ | 复制官方 Pi auth/settings/models 到临时 0700 `PI_CODING_AGENT_DIR`，隔离 Probe/Native Session/data/workspace；验证 exact cold resume、warm LRU、managed receipt、allow/deny、cancel 无副作用、Action output、locator 隐私与结构化 Usage。自动设置只在 debug Core 有效的 Pi qualification override；结果不是正式平台资格 |
 | `pnpm smoke:action-approval` | Codex | 验证越界动作的 Approval 与唯一副作用 |
@@ -572,6 +693,20 @@ Team Case 可在密封 manifest 中声明 `collaboration` 合同。Runner 将它
 
 ## UI 验收命令
 
+`pnpm test:execution-metrics-ui` 复用 ThreadWorkspace 的隔离 Renderer fixture，独立验证当前指标的
+500 Run 范围读取、可见收起卡片、滚动与展开、面板／页面隐藏、恢复速度基线、有限终态尾读后的
+迟到用量，以及当前 Context 整体换代和删除；夹具数值不是 Runtime 能力证据。
+`ROVAI_KEEP_EXECUTION_METRICS_FIXTURE=1` 保留报告与双主题截图；默认清理本次临时目录。
+最低层 `execution-metrics-reader.test.ts` 拥有确定性时钟、single-flight／trailing、有限重试、引用复用和
+旧代次响应隔离；不通过重复真实网络调用验证刷新次数。
+
+批量 SQL 新增 `monitoring::tests::execution_usage_batch_keeps_requested_scope_collection_and_sparse_fields`：
+该读接口此前没有独立 SQL owner；原有 Context 写入与 Usage 累计测试不拥有请求范围或 collection 过滤。
+一次内存 SQLite 最小表验证跨 Camp／旧 collection 拒绝、指定顺序、空范围、缺失与零、参数化查询及
+终态 batch 通知资格（活动／missing／空范围不命中）；
+不建立完整 Database、迁移或 Runtime fixture。原实现逐 Run 查询的数值结果一致，新增失败语义是批量读取
+改变范围或稀疏语义。最小命令为 `cargo test -p rovai-core --lib execution_usage_batch_keeps_requested_scope`。
+
 `pnpm test:runtime-model-picker` 在隔离 Electron 中挂载生产模型、推理强度、权限与运行时选择组件，
 验证队员页和训练营共享字段的默认值、本地搜索、中文输入法、键盘与焦点、目录失败/迟到响应和双主题布局。
 覆盖 1040×700、1440×920、2560×1440 与 200% 缩放。它属于 `test:desktop:integration`；Linux 使用 `xvfb-run -a`。
@@ -593,8 +728,8 @@ Team Case 可在密封 manifest 中声明 `collaboration` 合同。Runner 将它
 `pnpm test:camp-fast-layout` 使用生产 CampWorkspace/CSS 的独立 Electron fixture，无需打包或 Core。
 关闭的模拟 API 只提供成员偏好与 Draft；临时 userData 与日常 App 完全分离，不调用模型。
 它拥有 Fast 的 1280×720/窄屏/大屏布局、日夜主题、键盘焦点、失败保留、直接静默切换、旧观测不影响偏好与初始默认。
-同一 owner 还验证打开队员浮层后的静默自动检测、正负结果复用、失败重开重试、同成员请求去重、切换绑定自动重测与旧响应隔离；
-其他 Runtime 不检测，非官方认证的拒绝结果不显示入口，菜单不再暴露手动检测。
+同一 owner 验证打开/切换零资格请求、三态保存、同成员保存去重、跨成员并发、绑定与迟到回执隔离；
+Claude/Codex 无历史证据仍有入口，其他 Runtime 不显示，原生反馈在 Run 中展示且不反写偏好。
 `ROVAI_KEEP_FAST_FIXTURE=1` 保留本次临时截图供排错；成功默认自动清理。手动 Full check 的 Linux job 通过 `xvfb-run -a` 执行。
 
 以下命令使用已打包 App 和隔离 `userData`，不调用模型：
@@ -739,3 +874,175 @@ Windows 平台实测独立记录，不能由此 macOS 浏览器结果推断。
 定向验证：`cargo test -p rovai-core --features extended-tests --lib attachment_send_keeps_source_path`、
 `cargo test -p rovai-core --bin rovai`、`node --test scripts/lib/host-web-html.test.mjs scripts/lib/host-web.test.mjs`；
 完整 Core library 与 Context slow suite 继续执行，不用删除旧迁移测试换取通过。
+
+## 原生执行指标 Runtime 验收
+
+2026-10-03 遗漏字段修复沿用 `monitoring::tests::runtime_parsers_emit_sparse_usage_without_antigravity_inference`
+和 `zcode::transport::tests::provider_failure_reaches_core_without_poisoning_the_host` owner：前者增加
+DSH 原生精确 total 与缺失/矛盾分类，后者增加数值 Context、Session 栅栏与终态投递顺序。
+没有新增或退役 Rust owner；最低命令为对应完整测试名的 `cargo test -p rovai-core --features extended-tests --lib`。
+`node --test scripts/lib/dsh-host.test.mjs` 继续验证 bootstrap 的数值白名单和内容隔离。
+实测报告必须独立列出字段可用性，不能用 null/null 的对照通过替代采集完整性。
+
+`node scripts/probe-runtime-execution-metrics.mjs <runtime-kind>` 创建独立 Core、bundled CLI、data-dir、
+Skill Library、MCP 和工作区，执行包含只读工具调用的原生用量／上下文任务，最长观察 8 分钟。
+探针只保存原生字段形态、匿名身份、Token／Gauge 数值、观测时刻及持久化读回，不采集字符数量、
+速度、正文、思考正文或内容哈希；`rendererVerified` 固定为 false，不能作为界面验收。
+
+可选环境变量使用 `ROVAI_METRICS_` 前缀：`CORE` 指定 Core，`MODEL`／`MODEL_OPTIONS` 选择模型，
+`PROMPT_FILE` 指定任务，`THINKING_LEVEL` 配置隔离 Pi／DSH 思考级别，`NATIVE_HOME` 只复制 Grok／DSH
+必要配置到私有夹具，Kimi `SUB2API=1` 使用已授权 Provider 配置。`RESUME=1` 在健康首 Run 后复用同一
+Native Session 再执行一轮；`COLD_RESTART=1` 先关闭隔离 Core，再读回并核对持久化与同一绑定。
+`GROK_COMPACT_AFTER_RESTART=1` 与 Grok 冷恢复一起验证原生压缩。日常 Runtime 配置保持只读。
+证据导出只选 `evidence.json` 和 `native-shapes.jsonl`，不能打包含凭据的整个 fixture。
+
+打包 App 的可重复入口：
+
+```bash
+ROVAI_RUNTIME_ACTIVITY_ACCEPT_METRICS_STREAM_ONLY=1 node scripts/accept-runtime-activity-ui.mjs <packaged-app>
+ROVAI_RUNTIME_ACTIVITY_ACCEPT_METRICS_REAL=1 node scripts/accept-runtime-activity-ui.mjs <packaged-app>
+```
+
+第一项用合成 ACP 流验证途中打开、切历史 Run、运行耗时、终态、迟到 Usage 和私有标记不进入
+数据库、Blob、文件、公开 IPC 或 Renderer。第二项使用 `scripts/fixtures/native-execution-metrics-task.txt`，
+可以用 `ROVAI_METRICS_PROMPT_FILE` 覆盖任务，`ROVAI_METRICS_RUNTIME` 选择 Runtime，
+`ROVAI_METRICS_VERIFY_USAGE=1` 核对落盘四项与气泡，`ROVAI_METRICS_VERIFY_CONTEXT=1` 核对
+已证实的 Session 数值与圆环／气泡。两者均隔离 App/Core，CDP 请求有 30 秒超时，不结束日常 App。
+`ROVAI_METRICS_VERIFY_LIVE_CONTEXT=1` 额外要求新 Run 仍在 running 时，当前 Session 的非零 used
+已落盘且与 Renderer 气泡一致；取值 `used-only` 还要求 window/nativeRatio 保持 null、比例显示未知。
+可搭配 `scripts/fixtures/native-live-context-task.txt` 的独立顺序工具调用与停顿；终态成功不能替代
+运行中证据。仅启用该验收选项时增加测试端的范围读取，不改变产品轮询。
+重启验收使用原隔离 fixture，核对 `monitoring.execution` 的四项／Session modelKey／代次，
+不重新调用模型或修改数据库。原生字段历史证据见[原生 Usage 与 Context 核验](../research/runtime-monitoring/native-usage-context-verification-2026-09-30.md)。
+
+### 测速退役与保留的测试（2026-10-02）
+
+所有 Runtime 的测速生产路径和临时协议一并退出。删除 `observable_output::tests` 的 3 个分类／计数／
+去重测试、Web 数值快照白名单测试，以及 `execution-token-speed.test.ts` 的 5 个显示状态机测试；
+这些合同无 successor，由 Git 历史保留。Claude owner 改为验证私有思考身份和完整块／子 Agent 排除，
+移除仅为测速维护的 UTF-16 游标。Codex ingress 保留当前 turn／旧 turn 栅栏，移除测速 receipt 断言。
+共享根身份检查移入 `runtime::is_root_output`，原有 ACP、Pi、ZCode 与原生 Usage owner 继续覆盖其边界。
+
+原生 Usage／Context、迁移、恢复、权限和内容隔离测试继续执行。`pnpm test:execution-metrics-ui` 保留
+隐藏暂停、恢复刷新、500 Run 范围收敛、稳定终态和迟到用量测试；打包 App 混合验收移除测速断言，
+继续检查四项用量与思考内容不扩散。最低验证命令为 `pnpm typecheck`、`pnpm test:execution-metrics-ui`、
+`pnpm test:rust:pr` 和以下原生 owner 的定向命令。历史测速脚本／环境变量仅适用于 `ee444ab1` 及此前记录。
+
+### 原生 Usage／Context 测试准入（2026-09-30）
+
+2026-10-04 可用性收口继续扩展现有 owner，没有新增/删除/合并/停用 Rust 测试：
+
+- `session_context_rejects_late_observations_after_binding_rotation`：最小 SQLite 拥有未确认输入、绑定/epoch、实际模型及冻结模型配置、窗口省略/撤销/矛盾、下降/新鲜度的持久化边界。
+- `provider_failure_reaches_core_without_poisoning_the_host`：现有 ZCode 双工 RPC owner 暂扣 prompt 最终响应与第一次读取；20 次重复触发只产生一次合并补读，单请求在途、至少两次 Context 在终态前到达 Core，终态旧请求参数不变。
+- Pi `numeric_context_rejects_content_and_stale_run_host_session_or_binding`、Antigravity `native_database_supplements_only_the_current_completed_call` 和 native_usage 既有 owner：独立字段不因缺少分母丢失；显式零窗口交给 latest 层撤下分母，不能继承成旧窗口。
+- `call_normalization_and_request_counts_do_not_depend_on_flush_partition` 保持每调用归一化、未知/零和完整性不受 Context 改动影响。
+
+最低命令为 `pnpm test:rust:pr`，以及 `cargo test -p rovai-core --features extended-tests --lib <owner>`；
+`pnpm test:execution-metrics-ui` 验证隐藏暂停、范围读取、稳定引用和迟到结果，新增时间戳单独变化的引用复用断言。
+打包 App 真实验收使用上述 `METRICS_REAL` 入口；`ROVAI_METRICS_VERIFY_WINDOW_REUSE=1` 在同一 Session 执行两轮，
+`ROVAI_METRICS_MIN_LIVE_UPDATES=2` 强制不同占用至少两次在终态前显示。`ROVAI_METRICS_HELD_FINAL=1` 显式切为
+受控 ACP（不能标成真实 Qwen 样本），验证 prepared 输入、used-only、下降和返回旧数值；
+`ROVAI_METRICS_VERIFY_VISIBILITY=1` 隐藏执行面板 5 秒后重新读取当前值。
+`ROVAI_INTERNAL_CONTEXT_ACCEPTANCE_TRACE=1` 仅与隔离实例标记同时存在时输出固定数字/身份/时间白名单，
+记录事务提交和 ZCode snapshot 次数/耗时；默认关闭，不输出 payload、正文、思考或原始错误。
+脚本报告明确区分原生数值返回、Core 收到、提交后时刻、首次数据库读回和 Renderer 采样时间。
+
+2026-10-03 Claude 运行中 Context 修复扩展既有
+`root_call_usage_is_numeric_and_context_pairs_latest_call_with_its_model`：完整根调用在 result 前即
+发出 used-only，覆盖稀疏字段补齐、显式零、子调用/起始暂定值排除与模型窗口不拼接。
+既有 `session_context_rejects_late_observations_after_binding_rotation` 增加 Claude 数值事件→parser→
+最小 SQLite 的 used-only 读回与原生用量隔离。修复前首个用例缺少运行中 Gauge；持久化用例守住
+下游边界，不另建数据库/进程 owner。没有新增、删除、合并或停用 Rust 测试。
+
+新增 owner 均不调用真实模型；没有删除、合并或停用现有 Rust 测试。
+
+| Owner | 修复前失败输入、单一职责与层级 |
+| --- | --- |
+| `native_usage::tests::native_dialects_select_root_calls_preserve_missing_and_ignore_restated_content` | CodeBuddy／Kimi 的私有 envelope 不被 ACP parser 读取；该纯 DTO owner 拥有根身份、互斥桶、缺失／零、重述排除和真实脱敏帧回放，不能扩展 ACP wire owner 来证明不同来源 |
+| `native_usage::tests::native_cursor_excludes_history_replays_partial_lines_and_file_resets` | 历史行、重复调用、半行、截断／替换或终态之后 75ms 的新 step 可能被错认或漏读；文件 cursor seam 需要最小临时文件与尾写线程，归入 `extended-tests`，纯 DTO 无法证明读取顺序 |
+| `native_usage::tests::opencode_metadata_excludes_old_pending_child_and_repeated_calls` | ACP 终态只有最后调用，历史 pending 完成和子 Session 也不能归属本 Run；使用最小三字段 Session／四字段 Message SQLite fixture，归入 `extended-tests`，不创建完整 Core 数据库；回放实际数字并检查重复 poll |
+| `claude::tests::root_call_usage_is_numeric_and_context_pairs_latest_call_with_its_model` | 起始暂定零或整轮 result 会代替最新调用，且多模型可能拼错窗口；纯 stream state owner 不建立进程，已有公开正文／思考 owner 不拥有私有数值事件；沿用该模块的 `extended-tests` 路由 |
+| `pi::host::tests::numeric_context_rejects_content_and_stale_run_host_session_or_binding` | 旧 Host／Run／Session／绑定或额外内容字段可能穿过私有 status，校验后重新读取 owner 还可能在交接时错贴新 Run；纯封闭 DTO 与 fence owner 同时检查 packet 保留已校验的 Run／epoch／Session／prompt／delivery，现有 session locator owner 不拥有这个新 status 通道；沿用该模块的 `extended-tests` 路由 |
+
+既有 `monitoring` checkpoint／parser owner 扩展 Claude 首调用累计计入、终态不重加、Pi Gauge 与 Kimi
+版本准入；既有 `grouped_acp_models` owner 扩展 CodeBuddy 原生已选 API 模型别名。它们沿用原 fixture。
+本地最低命令：
+
+```bash
+cargo test -p rovai-core --features extended-tests --lib native_usage::tests::
+cargo test -p rovai-core --features extended-tests --lib monitoring::tests::
+cargo test -p rovai-core --features extended-tests --lib root_call_usage_is_numeric_and_context_pairs_latest_call_with_its_model
+cargo test -p rovai-core --features extended-tests --lib numeric_context_rejects_content_and_stale_run_host_session_or_binding
+cargo test -p rovai-core --features extended-tests --lib grouped_acp_models
+```
+
+2026-10-01 继续扩展上述 native DTO／cursor／OpenCode owner：Qoder 自定义来源、隐藏用量、
+比例独立性、旧 pending、重复与半行使用同一文件 seam；OpenCode 增加最新调用占用，不猜窗口。
+既有 `runtime_parsers_emit_sparse_usage_without_antigravity_inference` 增加实际版本 banner、
+Copilot 逐调用／子 Agent／dataOmitted／缺失与终态累计排除，以及 Grok 独立 Context 来源。
+`session_context_rejects_late_observations_after_binding_rotation` 以最小表覆盖比例零／无效值、
+数量清空、输入确认前只保留最新 Gauge、确认后的同源重试和拒绝输入；它不放宽接受栅栏。
+既有 `session_context_migration_upgrades_schema_127_and_rolls_back_atomically` 同时拥有
+已安装 schema 128 → 129 的保留与 179 收据失败回滚。Grok 原生配置 owner 只扩展显式窗口和
+未知模型断言。未新增、删除、合并或停用 Rust owner；实际 App／字段证据见
+[本轮核验](../research/runtime-monitoring/native-context-ratio-verification-2026-10-01.md)。
+
+同日追加的边界验收继续扩展既有 owner：`codex_context_changes_independently_of_cumulative_run_usage`
+回放真实压缩时累计值不变而 last 占用下降的两帧，并重复第二帧，断言独立来源去重与较小 Context；
+原生 DTO／OpenCode SQLite／ACP parser owner 分别回放 9 个 Qoder 调用（真实与受控正值有明确标签）、
+11 个 OpenCode 调用及 Grok 两个终态聚合。原始形态、归一化数字和最终读取同时保留；
+没有新增、删除、合并或停用 Rust owner，亦未为真实网络请求添加单元测试。
+真实原生压缩、四类健康冷恢复、同次 Grok 思考 UI 与 App 重开见[边界证据](../research/runtime-monitoring/native-boundaries-verification-2026-10-01.md)。
+
+
+2026-10-02 合入 Thread 更名时，扩展既有
+`db::thread_names::tests::thread_upgrade_preserves_existing_tables_and_rolls_back_on_receipt_failure`
+owner，覆盖已安装指标 schema 129 和 main Thread schema 128 两条路径、179/180 收据失败回滚、
+冻结 Context 摘要及收据保留、重开后 schema 130 准入。该 owner 使用独立 SQLite 目录及
+`fresh_schema_database_at`，沿用 `extended-tests`；不新增 Rust owner。既有 Session Context 迁移
+owner 继续拥有指标数量保留与 127/128 升级；默认 workspace 与字段级回归另行执行。
+最低命令：`cargo test -p rovai-core --features extended-tests --lib thread_upgrade_preserves_existing_tables_and_rolls_back_on_receipt_failure`。
+
+## Runtime 轻量启动回归 owner
+
+首轮轻量启动改造复用既有 Rust 测试 owner。原 light-ready uniform preflight owner 改为
+`agent_profile::slow_tests::discovered_entry_configures_and_freezes_without_health_evidence`，覆盖无快照配置、
+精确意图及 hash/file identity 不一致拒绝。原 Codex live-model owner 扩展为
+`codex::tests::real_host_validates_before_input_and_executes_in_the_same_process`，以合成协议进程验证启动次数、
+默认模型零目录、version 超时无关，以及初始化/登录/模型选项失败零正文。
+`delivery_queue` 既有 claim owner 扩展历史状态矩阵、公开错误、原终止原因优先、未知错误不公开、失败不循环及修复后新任务；
+`collaboration` 原多目标无 Runtime owner 改为每个目标产生具体失败 Run，保留消息与 Delivery 数量及原子准入断言。
+Antigravity 原取消 owner 同时覆盖初始化期间取消及接收后终止，保留原有进程树和私有日志清理。
+原诊断成功、失败、身份漂移与快照保留测试继续拥有诊断语义，不删除权限、取消、Session 或去重断言。
+最小命令为 `cargo test -p rovai-core --features slow-tests --lib agent_profile::`、
+`cargo test -p rovai-core --features extended-tests --lib codex::`、
+`cargo test -p rovai-core --lib delivery_queue::` 与 `cargo test -p rovai-core --lib antigravity::`。
+完整切片结果记录在当前版本实施计划，合成测试不替代真实账户、CLI 与跨平台验收。
+
+`ROVAI_FAST_CHECK_ONLY=1 pnpm test:camp-fast-layout` 使用原隔离 Electron fixture 验证零资格检查、直接三态保存、
+绑定与迟到响应 fence、保存去重、两处界面共享偏好及原生键鼠/主题/响应式布局。默认无此变量时继续执行原有完整布局与 Stop 回归，
+不将旧夹具的其他失败静默跳过；两种范围的结果分别记录。
+
+PR #642 的身份读取/锁边界修复继续扩展以上 owner：无健康快照和旧指纹快照下必须读取当前文件身份并得到
+`ExecutableIntegrityStatus::Unchanged`，旧 hash 与 Installation 路径漂移仍拒绝；locator 在没有快照或文件身份失效时
+仍可用于重新解析。Windows 既有 `resolved_npm_shim_content_change_invalidates_locator_identity_and_snapshot_key`
+在 `slow-tests` 下增加无快照的目标升级和 npm platform package 搬迁回归，必须在 Windows 执行，不能由 macOS 结果代替。
+Codex 既有真实 Host owner 增加销毁 Host 后的第二次默认模型执行，保留版本命令挂起及每个 Host 仅一次任务输入断言。
+
+新增唯一 owner `application::tests::discovered_runtime_verification_keeps_database_available_and_identity_after_restart`
+拥有文件 worker / 全局数据库锁的异步边界；原同步校验不能在阻塞线程池暂停时让出 executor，或若先取数据库锁再等待 worker，
+并行 SQL 会被挡住。现有纯身份测试和诊断 manager owner 不拥有这项并发合同，因此复用 `runtime_resolution_test_core`
+而单列此 owner；纯函数无法证明真实 Core 锁和持久化重开。测试以单线程阻塞池和 channel 屏障确定顺序，不依赖文件大小、
+磁盘速度、sleep 或性能阈值；并在 Core 重开后验证同一安装身份的元数据快速路径。最小命令为
+`cargo test -p rovai-core --features slow-tests --lib application::tests::discovered_runtime_verification`。
+
+
+Fast v3 复用 `camp_fast::tests` 的持久化/冻结 owner，新增无快照首次写入、receipt 重放不覆盖新选择和旧缓存不准入的输入；
+同一 SQLite fixture 保留绑定切换、模型/权限变化、两 Thread 隔离和冻结摘要验证，并进入 `extended-tests`。
+原 Claude auth/version 与 Codex eligibility parser/metadata 进程测试随其生产资格路径退出；临时 settings 三态映射仍由
+`native_overrides_preserve_three_states_without_qualification` 拥有。通用 schema 诊断测试保留。
+Claude 既有真实进程错误 owner 扩展新建/恢复、显式/默认模型和三态参数矩阵，验证实际临时文件、权限独立、
+version/auth 零调用及一次正文/零重放。Codex 既有真实 Host owner 扩展三态单 Turn、零持久档位、缺失反馈仍执行，
+以及关闭参数被原生协议拒绝时返回错误且不重放。
+最小命令：`cargo test -p rovai-core --features extended-tests --lib camp_fast::`、相同参数的 `claude::`、`codex::`，
+以及 `execution_evidence::tests::` 的字段脱敏、Run/epoch 所属和逻辑执行窗口回归。

@@ -627,8 +627,8 @@ pub(crate) fn builtin_tool_endpoint() -> LocalIpcEndpoint {
 pub(crate) fn request_digest(operation: &str, input: &serde_json::Value) -> Result<String> {
     canonical_json_digest(&json!({
         "domain": "rovai.builtin-tool-request.v1",
-        "operation": operation,
-        "input": input,
+        "operation": crate::thread_compat::stored_operation(operation),
+        "input": crate::thread_compat::stored_builtin_input(operation, input)?,
     }))
 }
 
@@ -780,6 +780,12 @@ mod tests {
 
     #[tokio::test]
     async fn lease_rotates_fences_and_replays_exact_request() {
+        let legacy = json!({"campId":"same-id", "thread":"same-message", "limit":20});
+        let current = json!({"threadId":"same-id", "replyChain":"same-message", "limit":20});
+        let expected = canonical_json_digest(&json!({"domain":"rovai.builtin-tool-request.v1", "operation":"camp.read", "input":legacy})).unwrap();
+        assert_eq!(request_digest("camp.read", &legacy).unwrap(), expected);
+        assert_eq!(request_digest("thread.read", &current).unwrap(), expected);
+        assert!(request_digest("thread.read", &json!({"campId":"a","threadId":"a"})).is_err());
         let root =
             std::env::temp_dir().join(format!("rovai-builtin-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
@@ -798,6 +804,14 @@ mod tests {
         let lease = context.lease.unwrap();
         assert_eq!(Path::new(&lease.execution_root), root);
         assert_eq!(Path::new(&lease.run_tmp), config.run_tmp());
+        let member_image = rovai_core::member_avatar::materialize_member_avatar(
+            &root,
+            config.run_tmp(),
+            rovai_core::member_avatar::LUOKE_AVATAR_REF,
+            true,
+        )
+        .unwrap();
+        assert!(Path::new(&member_image).is_file());
         let frozen_source = root.join("frozen-source");
         fs::create_dir(&frozen_source).unwrap();
         fs::write(frozen_source.join("file.txt"), b"frozen").unwrap();
@@ -820,6 +834,16 @@ mod tests {
         assert!(registry.authenticate(&first).await.is_err());
         assert!(config.run_tmp().is_dir());
         assert!(!config.run_tmp().join("stale-from-first-lease.txt").exists());
+        assert!(!Path::new(&member_image).exists());
+        let reacquired = rovai_core::member_avatar::materialize_member_avatar(
+            &root,
+            config.run_tmp(),
+            rovai_core::member_avatar::LUOKE_AVATAR_REF,
+            true,
+        )
+        .unwrap();
+        assert!(Path::new(&reacquired).is_file());
+
         fs::write(
             config.run_tmp().join("stale-from-rotated-lease.txt"),
             b"stale",

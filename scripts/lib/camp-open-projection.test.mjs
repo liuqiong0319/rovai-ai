@@ -17,6 +17,8 @@ test('business-only CampOpen keeps cards, earlier pages and reading position acr
 test('return to latest is local to the viewport and never toggles failed Run rows', { timeout: 60_000 }, t => runFixture(t, '--return-latest'))
 test('execution text loads sparse history and complete Blob bodies in place with retry', { timeout: 60_000 }, t => runFixture(t, '--text-evidence'))
 test('execution window pages on demand, preserves the anchor and mounts details only on expansion', { timeout: 120_000 }, t => runFixture(t, '--execution-window'))
+test('block pages fill the viewport and expanded commands have independent retryable cursors', { timeout: 90_000 }, t => runFixture(t, '--block-pagination'))
+
 test('terminal Run artifacts retain their authors and layout across themes and widths', { timeout: 60_000 }, t => runFixture(t, '--run-artifacts'))
 test('public message groups follow rendered content height and preserve individual actions', { timeout: 60_000 }, t => runFixture(t, '--message-groups'))
 test('current user avatars and structured mentions open a live, keyboard-accessible profile card', { timeout: 60_000 }, t => runFixture(t, '--current-user-profile'))
@@ -25,6 +27,8 @@ test('formal Camp entry readiness preserves cached-preview execution choices', {
 test('command interaction keeps disclosure anchors through async results and accessible states', { timeout: 120_000 }, t => runFixture(t, '--command-interaction'))
 
 test('public Camp draft survives projection refresh and remount without a private pending queue', { timeout: 60_000 }, t => runFixture(t, '--composer-local-draft'))
+
+test('image menus copy full image pixels, save original bytes and work in the lightbox', { timeout: 90_000 }, t => runFixture(t, '--image-context-menu'))
 
 async function runFixture(t, mode = '--camp-open') {
   if (!admitElectronIntegrationTest(t)) return

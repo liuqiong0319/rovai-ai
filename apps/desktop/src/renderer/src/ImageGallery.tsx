@@ -1,30 +1,33 @@
-import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
-import { AttachmentLocationItems, useAttachmentLocation } from './attachment-location'
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type JSX } from 'react'
+import { useAttachmentLocation } from './attachment-location'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type JSX, type KeyboardEvent, type MouseEvent } from 'react'
+import { createPortal } from 'react-dom'
 import * as Dialog from '@radix-ui/react-dialog'
-import { useCampClient, type CampClient } from './camp-client'
+import { attachmentRevealLabel } from './AttachmentCard'
+import { ImageContextMenu, type ImageAction, type ImageMenuPosition } from './ImageContextMenu'
+import { writeClipboardImage, writeClipboardText } from './clipboard'
+import { useThreadClient, type ThreadClient } from './camp-client'
 import type {
   AgentRunImageContent,
   AgentRunImageView,
-  CampMessageAttachmentView,
+  ThreadMessageAttachmentView,
   LocalAttachmentOwnerLocator
 } from '@contracts'
 import { UiText, uiAttribute } from './interface-language'
 
 export type GalleryImage = {
   kind: 'runtime'
-  campId: string
+  threadId: string
   image: AgentRunImageView
 } | {
   kind: 'attachment'
-  campId: string
+  threadId: string
   locator: LocalAttachmentOwnerLocator
-  image: CampMessageAttachmentView
+  image: ThreadMessageAttachmentView
 }
 
 export type MessageAttachmentGroups = {
-  images: CampMessageAttachmentView[]
-  files: CampMessageAttachmentView[]
+  images: ThreadMessageAttachmentView[]
+  files: ThreadMessageAttachmentView[]
 }
 
 export type ImageGalleryVariant = 'agent-output' | 'user-attachment'
@@ -94,8 +97,8 @@ export class ImagePayloadCache {
 }
 
 type ClientImageState = { payloads: ImagePayloadCache; loading: Map<string, Promise<ImagePayload | null>> }
-let clientImageStates = new WeakMap<CampClient, ClientImageState>()
-function clientImages(client: CampClient): ClientImageState {
+let clientImageStates = new WeakMap<ThreadClient, ClientImageState>()
+function clientImages(client: ThreadClient): ClientImageState {
   let state = clientImageStates.get(client)
   if (!state) {
     state = { payloads: new ImagePayloadCache(MAX_IMAGE_PAYLOAD_CACHE_BYTES), loading: new Map() }
@@ -106,13 +109,13 @@ function clientImages(client: CampClient): ClientImageState {
 
 export function imageCacheKey(source: GalleryImage): string {
   return source.kind === 'runtime'
-    ? `runtime:${source.campId}:${source.image.id}`
-    : `attachment:${source.campId}:${attachmentOwnerKey(source.locator)}:${source.image.id}`
+    ? `runtime:${source.threadId}:${source.image.id}`
+    : `attachment:${source.threadId}:${attachmentOwnerKey(source.locator)}:${source.image.id}`
 }
 
 /** Preserve order within each kind while giving images and files independent layout regions. */
 export function partitionMessageAttachments(
-  attachments: CampMessageAttachmentView[]
+  attachments: ThreadMessageAttachmentView[]
 ): MessageAttachmentGroups {
   const groups: MessageAttachmentGroups = { images: [], files: [] }
   for (const attachment of attachments) {
@@ -145,8 +148,8 @@ export async function decodeImageUrl(bytes: Uint8Array, mediaType: string): Prom
 
 async function readImagePayload(
   source: GalleryImage,
-  client: CampClient,
-  onAttachmentAvailability?: (availability: CampMessageAttachmentView['availability']) => void
+  client: ThreadClient,
+  onAttachmentAvailability?: (availability: ThreadMessageAttachmentView['availability']) => void
 ): Promise<ImagePayload | null> {
   let blob: Blob
   if (source.kind === 'attachment') {
@@ -159,7 +162,7 @@ async function readImagePayload(
     )
   } else {
     const content = await client.request<AgentRunImageContent | null>('agentRunImages.read', {
-      campId: source.campId, imageId: source.image.id
+      threadId: source.threadId, imageId: source.image.id
     })
     if (!content) return null
     try {
@@ -175,8 +178,8 @@ async function readImagePayload(
 /** Always reaches the real source, while sharing an already-running read for the same image. */
 export function fetchImagePayload(
   source: GalleryImage,
-  client: CampClient,
-  onAttachmentAvailability?: (availability: CampMessageAttachmentView['availability']) => void
+  client: ThreadClient,
+  onAttachmentAvailability?: (availability: ThreadMessageAttachmentView['availability']) => void
 ): Promise<ImagePayload | null> {
   const key = imageCacheKey(source)
   const imageLoadCache = clientImages(client).loading
@@ -192,14 +195,14 @@ export function fetchImagePayload(
 /** Uses a completed payload when available; cold callers otherwise share the real source read. */
 export function getOrLoadImagePayload(
   source: GalleryImage,
-  client: CampClient,
-  onAttachmentAvailability?: (availability: CampMessageAttachmentView['availability']) => void
+  client: ThreadClient,
+  onAttachmentAvailability?: (availability: ThreadMessageAttachmentView['availability']) => void
 ): Promise<ImagePayload | null> {
   const cached = clientImages(client).payloads.get(imageCacheKey(source))
   return cached ? Promise.resolve(cached) : fetchImagePayload(source, client, onAttachmentAvailability)
 }
 
-export function cacheDecodedImagePayload(source: GalleryImage, payload: ImagePayload, client: CampClient): void {
+export function cacheDecodedImagePayload(source: GalleryImage, payload: ImagePayload, client: ThreadClient): void {
   clientImages(client).payloads.put(imageCacheKey(source), payload)
 }
 
@@ -228,24 +231,98 @@ export function ImageGallery({
 }
 
 function ImageTile({ source }: { source: GalleryImage }): JSX.Element {
-  const client = useCampClient()
+  const client = useThreadClient()
   const imagePayloadCache = clientImages(client).payloads
   const cacheKey = imageCacheKey(source)
-  const initialAvailability: CampMessageAttachmentView['availability'] = source.kind === 'attachment'
+  const initialAvailability: ThreadMessageAttachmentView['availability'] = source.kind === 'attachment'
     ? source.image.availability
     : 'available'
   const [url, setUrl] = useState<string | null>(null)
   const [failed, setFailed] = useState(false)
-  const [availability, setAvailability] = useState<CampMessageAttachmentView['availability']>(initialAvailability)
+  const [availability, setAvailability] = useState<ThreadMessageAttachmentView['availability']>(initialAvailability)
   const [open, setOpen] = useState(false)
-  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
+  const [menu, setMenu] = useState<ImageMenuPosition | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  const [actionNotice, setActionNotice] = useState<string | null>(null)
+  const [action, setAction] = useState<ImageAction | null>(null)
+  const actionPending = useRef(false)
   const [refreshRevision, setRefreshRevision] = useState(0)
   const fileLocation = useAttachmentLocation(source.kind === 'attachment' ? source.locator : undefined)
   const tile = useRef<HTMLElement>(null)
   const hadCachedPayload = useRef(false)
   const committedUrl = useRef<string | null>(null)
   const ownedUrls = useRef(new Set<string>())
+
+  useEffect(() => {
+    if (!actionNotice || action) return
+    const timer = window.setTimeout(() => setActionNotice(null), 5000)
+    return () => window.clearTimeout(timer)
+  }, [actionNotice, action])
+
+  const runImageAction = async (nextAction: ImageAction): Promise<void> => {
+    if (actionPending.current) return
+    actionPending.current = true
+    setAction(nextAction)
+    setActionNotice(nextAction === 'copy' ? uiAttribute('正在复制图片…') : null)
+    try {
+      if (nextAction === 'copy') {
+        const image = tile.current?.querySelector('img')
+        if (!image) throw new Error('image_unavailable')
+        await writeClipboardImage(image)
+        setActionNotice(uiAttribute('已复制图片'))
+      } else if (nextAction === 'save') {
+        if (!url) throw new Error('image_unavailable')
+        const link = document.createElement('a')
+        link.href = url
+        const extension = ({ 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp',
+          'image/gif': 'gif', 'image/svg+xml': 'svg', 'image/avif': 'avif', 'image/bmp': 'bmp' } as Record<string, string>)[source.image.mediaType ?? '']
+        const name = source.image.displayName.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').trim() || 'image'
+        link.download = extension && !/\.[a-z0-9]+$/i.test(name) ? `${name}.${extension}` : name
+        document.body.appendChild(link)
+        link.click()
+        link.remove()
+      } else if (nextAction === 'path') {
+        if (!fileLocation.location?.path || !await writeClipboardText(fileLocation.location.path)) throw new Error('copy_failed')
+        setActionNotice(uiAttribute('已复制完整路径'))
+      } else if (source.kind === 'attachment' && client.attachments.kind === 'native') {
+        const result = await client.attachments.reveal(source.locator)
+        setAvailability(result.availability)
+        if (result.error) throw new Error('reveal_failed')
+      }
+    } catch {
+      setActionNotice(nextAction === 'copy' ? uiAttribute('未能复制图片，请重试或保存图片。')
+        : nextAction === 'save' ? uiAttribute('未能保存图片，请重试。')
+          : nextAction === 'path' ? uiAttribute('未能复制路径，请重试。')
+            : uiAttribute('无法显示此附件所在位置。'))
+    } finally {
+      actionPending.current = false
+      setAction(null)
+    }
+  }
+
+  const showMenu = (event: MouseEvent<HTMLElement> | KeyboardEvent<HTMLElement>): void => {
+    const keyboard = event.type === 'keydown'
+    if (keyboard && !('key' in event && (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')))) return
+    event.preventDefault()
+    event.stopPropagation()
+    fileLocation.inspect()
+    const origin = event.currentTarget === tile.current ? tile.current.querySelector('button')! : event.currentTarget
+    const bounds = origin.getBoundingClientRect()
+    const pointer = 'clientX' in event && (event.clientX !== 0 || event.clientY !== 0)
+    setMenu({ x: pointer ? event.clientX : bounds.left, y: pointer ? event.clientY : bounds.bottom, origin })
+  }
+
+  const showPreview = (): void => {
+    setMenu(null)
+    setOpen(true)
+    if (source.kind === 'attachment') setRefreshRevision(value => value + 1)
+  }
+
+  const contextMenu = <ImageContextMenu position={menu} onClose={() => setMenu(null)}
+    displayName={source.image.displayName} ready={Boolean(url)} busy={action}
+    hasPath={Boolean(fileLocation.location?.path)}
+    revealLabel={menu && source.kind === 'attachment' && client.attachments.kind === 'native' ? attachmentRevealLabel(client.platform) : undefined}
+    onAction={value => { void runImageAction(value) }} />
 
   const createOwnedUrl = useCallback((blob: Blob): string => {
     const nextUrl = URL.createObjectURL(blob)
@@ -360,41 +437,35 @@ function ImageTile({ source }: { source: GalleryImage }): JSX.Element {
   return (
     <figure className="image-tile" ref={tile} title={fileLocation.label}
       onMouseEnter={fileLocation.inspect} onFocus={fileLocation.inspect}
-      onContextMenu={source.kind === 'attachment' ? event => { event.preventDefault(); fileLocation.inspect(); setMenu({ x: event.clientX, y: event.clientY }) } : undefined}>
+      onContextMenu={showMenu}>
       <button type="button" className="image-tile-preview"
-        disabled={!url}
+        aria-disabled={!url}
         aria-label={uiAttribute("查看大图 {0}", String(source.image.displayName))}
         aria-busy={loading}
-        onClick={() => { setOpen(true); if (source.kind === 'attachment') setRefreshRevision(value => value + 1) }}
-        onKeyDown={event => { if (source.kind === 'attachment' && (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10'))) { event.preventDefault(); fileLocation.inspect(); const bounds = event.currentTarget.getBoundingClientRect(); setMenu({ x: bounds.left, y: bounds.bottom }) } }}>
+        onClick={() => { if (url) showPreview() }}
+        onKeyDown={showMenu}>
         {url ? <img src={url} alt={source.image.displayName} />
           : <span className="image-tile-placeholder">
               {failed ? unavailableLabel : uiAttribute("正在读取图片…")}
             </span>}
       </button>
       {notice && <figcaption className="image-tile-notice" role="status">{notice}</figcaption>}
-      {source.kind === 'attachment' && <DropdownMenu.Root open={menu !== null} onOpenChange={value => { if (!value) setMenu(null) }}>
-        <DropdownMenu.Trigger asChild><span className="attachment-context-anchor" style={{ left: menu?.x ?? 0, top: menu?.y ?? 0 }} /></DropdownMenu.Trigger>
-        <DropdownMenu.Portal><DropdownMenu.Content className="attachment-context-menu" aria-label={uiAttribute("附件操作：{0}", String(source.image.displayName))} onCloseAutoFocus={event => event.preventDefault()}>
-          <DropdownMenu.Label className="attachment-context-menu-label">{source.image.displayName}</DropdownMenu.Label>
-          <AttachmentLocationItems path={fileLocation.location?.path} label={fileLocation.label} onNotify={setNotice} />
-          {client.attachments.kind === 'native' && <DropdownMenu.Item className="attachment-context-menu-item attachment-context-menu-text" onSelect={() => {
-            if (client.attachments.kind === 'native') void client.attachments.reveal(source.locator).then(result => { if (result.error) setNotice(uiAttribute('无法显示此附件所在位置。')) }).catch(() => setNotice(uiAttribute('无法显示此附件所在位置。')))
-          }}><UiText zh={"在文件夹中显示"} /></DropdownMenu.Item>}
-          <DropdownMenu.Item className="attachment-context-menu-item attachment-context-menu-text" onSelect={() => setRefreshRevision(value => value + 1)}><UiText zh={"刷新图片"} /></DropdownMenu.Item>
-        </DropdownMenu.Content></DropdownMenu.Portal>
-      </DropdownMenu.Root>}
+      {!open && contextMenu}
+      {actionNotice && createPortal(<div className="image-action-notice" role="status" aria-hidden={open || undefined}>{actionNotice}</div>, document.body)}
       {url && (
         <Dialog.Root open={open} onOpenChange={setOpen}>
           <Dialog.Portal>
             <Dialog.Overlay className="attachment-lightbox-overlay" />
             <Dialog.Content className="attachment-lightbox image-gallery-lightbox" aria-describedby={undefined}
+              onContextMenu={showMenu} onKeyDown={showMenu}
               onCloseAutoFocus={(event) => { event.preventDefault() }}>
               <Dialog.Title className="sr-only"><UiText zh={"图片预览"} /></Dialog.Title>
+              <span className="sr-only" role="status">{actionNotice}</span>
               <img src={url} alt={source.image.displayName} />
               <Dialog.Close className="attachment-lightbox-close" aria-label={uiAttribute("关闭图片预览")}>
                 <svg viewBox="0 0 18 18" aria-hidden="true"><path d="m5 5 8 8M13 5l-8 8" /></svg>
               </Dialog.Close>
+              {open && contextMenu}
             </Dialog.Content>
           </Dialog.Portal>
         </Dialog.Root>

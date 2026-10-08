@@ -1,3 +1,5 @@
+mod native_metrics;
+
 use std::{
     collections::{HashMap, HashSet},
     error::Error as StdError,
@@ -229,7 +231,7 @@ impl AntigravityAppRuntimeAdapter {
     async fn run_process(
         &self,
         request: &AntigravityRunRequest,
-        interrupted: oneshot::Receiver<()>,
+        mut interrupted: oneshot::Receiver<()>,
         launch_handoff: Option<oneshot::Sender<()>>,
     ) -> Result<AntigravityRunResult> {
         let requested_execution_root = Path::new(&request.workspace.execution_root);
@@ -311,6 +313,37 @@ impl AntigravityAppRuntimeAdapter {
             );
             return Err(internal.context(RuntimeFailureError::new(failure)));
         }
+        let verified_identity =
+            rovai_core::agent_runtime_adapter::observe_executable_file_identity(executable)?;
+        let preflight = tokio::select! {
+            biased;
+            _ = &mut interrupted => anyhow::bail!("Antigravity was interrupted during initialization"),
+            preflight = crate::health::antigravity_launch_preflight_at(executable) => preflight,
+        };
+        anyhow::ensure!(
+            preflight.result.executable_fingerprint.as_deref()
+                == Some(&request.runtime.executable_fingerprint)
+                && rovai_core::agent_runtime_adapter::observe_executable_file_identity(executable)?
+                    == verified_identity,
+            "Antigravity executable changed during initialization; retry with the updated entry"
+        );
+        if preflight.result.status != crate::health::AgentRuntimeProbeStatus::Ready {
+            if let Some(failure) = preflight.result.failure {
+                return Err(anyhow::Error::new(RuntimeFailureError::new(failure)));
+            }
+            anyhow::bail!(
+                "Antigravity initialization failed: {}",
+                preflight.result.detail.unwrap_or_default()
+            );
+        }
+        if request.runtime.model.source == "explicit" {
+            let models = rovai_core::agent_runtime_adapter::antigravity_models(preflight.models);
+            rovai_core::agent_runtime_adapter::validate_live_model_selection(
+                &models,
+                &request.runtime.model.model_id,
+                &request.runtime.model.options,
+            )?;
+        }
         let log_path = self.log_dir.join(format!(
             "{}-{}-{}.log",
             request.agent_run_id,
@@ -367,8 +400,8 @@ impl AntigravityAppRuntimeAdapter {
             OsString::from("--log-file"),
             log_path.as_os_str().to_os_string(),
         ];
-        let structured_output = request
-            .runtime
+        let structured_output = preflight
+            .result
             .capabilities
             .iter()
             .any(|capability| capability == "output.stream_json");
@@ -417,6 +450,17 @@ impl AntigravityAppRuntimeAdapter {
         #[cfg(windows)]
         command.env("GIT_CONFIG_GLOBAL", "NUL");
         command.current_dir(execution_root);
+        if !matches!(
+            interrupted.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ) {
+            anyhow::bail!("Antigravity was interrupted before input delivery");
+        }
+        anyhow::ensure!(
+            rovai_core::agent_runtime_adapter::observe_executable_file_identity(executable)?
+                == verified_identity,
+            "Antigravity executable changed before input delivery"
+        );
         let launch_result: Result<ManagedProcess> = (|| {
             let spec = ManagedProcessLaunchSpec::capture(
                 &command,
@@ -427,6 +471,7 @@ impl AntigravityAppRuntimeAdapter {
             )?;
             ManagedProcess::spawn(spec)
         })();
+        let native_metrics_root = native_metrics::root_for_command(command.as_std());
         let mut child = launch_result.map_err(|error| {
             let raw_detail = error.to_string();
             let failure = antigravity_public_failure(
@@ -465,6 +510,7 @@ impl AntigravityAppRuntimeAdapter {
                     resumable_native_session_id.as_deref(),
                     runtime_events.as_ref(),
                     &image_log_path,
+                    native_metrics_root,
                 )
                 .await
                 .map(|capture| AntigravityStdoutCapture::Structured(Box::new(capture)))
@@ -477,7 +523,6 @@ impl AntigravityAppRuntimeAdapter {
             })
         };
         let stderr_task = tokio::spawn(capture_bounded(stderr));
-        tokio::pin!(interrupted);
         let mut was_interrupted = false;
         let mut acceptance_emitted = false;
         let mut acceptance_poll = tokio::time::interval(Duration::from_millis(50));
@@ -967,6 +1012,10 @@ struct AntigravityStreamCapture {
     conversation_id: Option<String>,
     final_result: Option<AntigravityJsonResult>,
     model_observation_emitted: bool,
+    usage_input_step: Option<u64>,
+    observed_usage_steps: HashSet<u64>,
+    observed_native_calls: HashSet<u64>,
+    native_metrics_root: Option<PathBuf>,
     started_tools: HashSet<String>,
     terminal_tools: HashSet<String>,
     started_shell_commands: HashMap<String, String>,
@@ -986,13 +1035,17 @@ async fn capture_antigravity_stream<R>(
     expected_session_id: Option<&str>,
     runtime_events: Option<&mpsc::UnboundedSender<AntigravityRuntimeEvent>>,
     log_path: &Path,
+    native_metrics_root: Option<PathBuf>,
 ) -> Result<AntigravityStreamCapture>
 where
     R: AsyncRead + Unpin,
 {
     let mut line = Vec::new();
     let mut buffer = [0_u8; 16 * 1024];
-    let mut capture = AntigravityStreamCapture::default();
+    let mut capture = AntigravityStreamCapture {
+        native_metrics_root,
+        ..Default::default()
+    };
     loop {
         let read = reader.read(&mut buffer).await?;
         if read == 0 {
@@ -1069,6 +1122,51 @@ async fn process_antigravity_stream_line(
                 .and_then(Value::as_str)
                 .context("Antigravity step_update omitted conversation_id")?;
             observe_antigravity_conversation(capture, expected_session_id, conversation_id)?;
+            if step["step_type"] == "user_input"
+                && step["state"] == "DONE"
+                && rovai_core::runtime::is_root_output(step)
+                && capture.usage_input_step.is_none()
+            {
+                capture.usage_input_step = step["step_index"].as_u64();
+            }
+            if let Some(input_step) = capture.usage_input_step
+                && let Some(index) = step["step_index"]
+                    .as_u64()
+                    .filter(|index| *index > input_step)
+                && capture.observed_usage_steps.len() < 8192
+                && !capture.observed_usage_steps.contains(&index)
+                && let Some(usage) = crate::monitoring::parse_antigravity_step_usage(step)
+                && let Some(sender) = runtime_events
+            {
+                capture.observed_usage_steps.insert(index);
+                // Select one observation for this call. A native supplement
+                // must replace the sparse stream observation before buffering,
+                // never add a second copy of its output/cache-read counters.
+                let native = if let Some(root) = &capture.native_metrics_root {
+                    native_metrics::read(root, input_step, index, &usage).await
+                } else {
+                    None
+                };
+                let observations = if let Some(native) = native {
+                    if capture.observed_native_calls.insert(native.call_index) {
+                        std::iter::once(native.usage)
+                            .chain(native.context)
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    vec![usage]
+                };
+                // Numeric projection only. result.usage is Session cumulative
+                // and must never be added to these completed native calls.
+                for observation in observations {
+                    let _ = sender.send(AntigravityRuntimeEvent {
+                        event_type: "runtime.antigravity.usage",
+                        payload: serde_json::to_value(observation)?,
+                    });
+                }
+            }
             if let Some(runtime_event) = normalize_antigravity_tool_step(step, capture)?
                 && let Some(sender) = runtime_events
             {
@@ -1729,6 +1827,100 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    // New lowest-cost owner: the streaming input boundary, numeric-only handoff,
+    // and Session-cumulative terminal suppression do not belong to image tests.
+    #[tokio::test]
+    async fn structured_usage_is_numeric_and_bound_to_current_input_step() {
+        let session = "0bdd2166-d420-40c6-94be-70b93eb290c5";
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut capture = AntigravityStreamCapture::default();
+        let log = Path::new("/nonexistent/unused-native-log");
+        let frames = [
+            serde_json::json!({"step_index":1,"state":"DONE","step_type":"agent_response","usage":{"output_tokens":9}}),
+            serde_json::json!({"step_index":3,"state":"DONE","step_type":"user_input"}),
+            serde_json::json!({"step_index":1,"state":"DONE","step_type":"agent_response","usage":{"output_tokens":9}}),
+            serde_json::json!({"step_index":5,"state":"ACTIVE","step_type":"agent_response","usage":{"output_tokens":2}}),
+            serde_json::json!({"step_index":5,"state":"DONE","step_type":"agent_response","text_delta":"PRIVATE_AGY_CANARY","usage":{"output_tokens":133,"cache_read_tokens":12206}}),
+            serde_json::json!({"step_index":5,"state":"DONE","step_type":"agent_response","usage":{"output_tokens":133,"cache_read_tokens":12206}}),
+        ];
+        for mut step in frames {
+            step["conversation_id"] = serde_json::json!(session);
+            let frame = serde_json::json!({"event":"step_update","step_update":step});
+            process_antigravity_stream_line(
+                frame.to_string().as_bytes(),
+                Some(session),
+                Some(&sender),
+                &mut capture,
+                log,
+            )
+            .await
+            .unwrap();
+        }
+        let final_frame = serde_json::json!({"event":"result","result":{"conversation_id":session,"status":"SUCCESS",
+            "response":"final","usage":{"output_tokens":237,"cache_read_tokens":12206}}});
+        process_antigravity_stream_line(
+            final_frame.to_string().as_bytes(),
+            Some(session),
+            Some(&sender),
+            &mut capture,
+            log,
+        )
+        .await
+        .unwrap();
+        let event = receiver.try_recv().unwrap();
+        assert_eq!(event.event_type, "runtime.antigravity.usage");
+        assert_eq!(event.payload["fields"]["outputTokens"], 133);
+        assert!(!event.payload.to_string().contains("PRIVATE_AGY_CANARY"));
+        assert!(receiver.try_recv().is_err());
+        let witness: Value = serde_json::from_str(include_str!(
+            "../../../docs/research/runtime-monitoring/fixtures/round8-native-format-compatibility.json"
+        )).unwrap();
+        let entry = witness["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["runtime"] == "antigravity-app")
+            .unwrap();
+        for run in entry["runs"].as_array().unwrap() {
+            let mut capture = AntigravityStreamCapture::default();
+            for raw in run["sourceRecords"].as_array().unwrap() {
+                let mut frame = raw.clone();
+                let body = if frame["event"] == "result" {
+                    "result"
+                } else {
+                    "step_update"
+                };
+                frame[body]["conversation_id"] = serde_json::json!(session);
+                if body == "result" {
+                    // The numerical witness omits text; add a synthetic terminal
+                    // envelope only so the real adapter can complete its state.
+                    frame[body]["status"] = serde_json::json!("SUCCESS");
+                    frame[body]["response"] = serde_json::json!("");
+                }
+                process_antigravity_stream_line(
+                    frame.to_string().as_bytes(),
+                    Some(session),
+                    Some(&sender),
+                    &mut capture,
+                    log,
+                )
+                .await
+                .unwrap();
+            }
+            let mut output = 0;
+            let mut read = 0;
+            while let Ok(event) = receiver.try_recv() {
+                assert_eq!(event.event_type, "runtime.antigravity.usage");
+                output += event.payload["fields"]["outputTokens"].as_i64().unwrap();
+                read += event.payload["fields"]["cacheReadInputTokens"]
+                    .as_i64()
+                    .unwrap();
+            }
+            assert_eq!(output, run["expectedRunProjection"]["outputTokens"]);
+            assert_eq!(read, run["expectedRunProjection"]["cacheReadTokens"]);
+        }
+    }
+
     #[test]
     fn structured_init_exposes_only_an_explicit_nonempty_model() {
         assert_eq!(
@@ -1867,6 +2059,7 @@ mod tests {
                 },
                 permission_semantics: PermissionSemantics::CoreEnforcedV1,
                 runtime: FrozenAgentRuntimeConfig {
+                    custom_api: None,
                     camp_fast: None,
                     adapter_kind: AdapterKind::AntigravityApp,
                     installation_id: "smoke".to_string(),
@@ -2055,6 +2248,7 @@ mod tests {
             },
             permission_semantics: PermissionSemantics::RuntimeManagedV2,
             runtime: FrozenAgentRuntimeConfig {
+                custom_api: None,
                 camp_fast: None,
                 adapter_kind: AdapterKind::AntigravityApp,
                 installation_id: "agy-test".to_string(),
@@ -2063,7 +2257,10 @@ mod tests {
                 executable_path: executable.to_string_lossy().to_string(),
                 auth_scope: "test".to_string(),
                 reported_version: Some("test".to_string()),
-                executable_fingerprint: "sha256:test".to_string(),
+                executable_fingerprint: rovai_core::agent_runtime_adapter::executable_fingerprint(
+                    executable,
+                )
+                .unwrap(),
                 capabilities: vec!["cli.print".to_string()],
                 protocol_version: "antigravity-app-cli-v1".to_string(),
                 model: ResolvedModelSelection {
@@ -2110,6 +2307,11 @@ mod tests {
         std::fs::write(
             &executable,
             r#"#!/bin/sh
+case "$1" in
+  --version) echo 'version query must not run' >&2; exit 99 ;;
+  --help) printf '%s\n' '--print --conversation --model --mode --sandbox --add-dir --log-file --print-timeout'; exit 0 ;;
+  models) printf '%s\n' 'test-model'; exit 0 ;;
+esac
 printf '%s\n' "$@" > .agy-args
 log_file=""
 while [ "$#" -gt 0 ]; do
@@ -2193,6 +2395,11 @@ echo "finished"
         std::fs::write(
             &executable,
             r#"#!/bin/sh
+case "$1" in
+  --version) echo 'version query must not run' >&2; exit 99 ;;
+  --help) printf '%s\n' '--print --conversation --model --mode --sandbox --add-dir --log-file --print-timeout --output-format stream-json'; exit 0 ;;
+  models) printf '%s\n' 'test-model'; exit 0 ;;
+esac
 printf '%s\n' "$@" > .agy-args
 log_file=""
 while [ "$#" -gt 0 ]; do
@@ -2341,6 +2548,11 @@ printf '%s\n' '{"event":"result","result":{"conversation_id":"0bdd2166-d420-40c6
             std::fs::create_dir_all(&workspace).expect("workspace should be created");
             let executable = root.join("fake-agy");
             let script = r#"#!/bin/sh
+case "$1" in
+  --version) echo 'version query must not run' >&2; exit 99 ;;
+  --help) printf '%s\n' '--print --conversation --model --mode --sandbox --add-dir --log-file --print-timeout --output-format stream-json'; exit 0 ;;
+  models) printf '%s\n' 'test-model'; exit 0 ;;
+esac
 log_file=""
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--log-file" ]; then
@@ -2400,6 +2612,11 @@ printf '%s\n' '{"event":"result","result":{"conversation_id":"0bdd2166-d420-40c6
         std::fs::write(
             &executable,
             r#"#!/bin/sh
+case "$1" in
+  --version) echo 'version query must not run' >&2; exit 99 ;;
+  --help) printf '%s\n' '--print --conversation --model --mode --sandbox --add-dir --log-file --print-timeout'; exit 0 ;;
+  models) printf '%s\n' 'test-model'; exit 0 ;;
+esac
 log_file=""
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--log-file" ]; then
@@ -2459,6 +2676,11 @@ exit 7
         std::fs::write(
             &executable,
             r#"#!/bin/sh
+case "$1" in
+  --version) echo 'version query must not run' >&2; exit 99 ;;
+  --help) printf '%s\n' '--print --conversation --model --mode --sandbox --add-dir --log-file --print-timeout'; exit 0 ;;
+  models) printf '%s\n' 'test-model'; exit 0 ;;
+esac
 log_file=""
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--log-file" ]; then
@@ -2485,6 +2707,7 @@ echo "Created conversation 0bdd2166-d420-40c6-94be-70b93eb290c5" > "$log_file"
                 },
                 permission_semantics: PermissionSemantics::RuntimeManagedV2,
                 runtime: FrozenAgentRuntimeConfig {
+                    custom_api: None,
                     camp_fast: None,
                     adapter_kind: AdapterKind::AntigravityApp,
                     installation_id: "delivered-failure-test".to_string(),
@@ -2493,7 +2716,9 @@ echo "Created conversation 0bdd2166-d420-40c6-94be-70b93eb290c5" > "$log_file"
                     executable_path: executable.to_string_lossy().to_string(),
                     auth_scope: "local_user".to_string(),
                     reported_version: Some("test".to_string()),
-                    executable_fingerprint: "test-fingerprint".to_string(),
+                    executable_fingerprint:
+                        rovai_core::agent_runtime_adapter::executable_fingerprint(&executable)
+                            .unwrap(),
                     capabilities: vec!["cli.print".to_string()],
                     protocol_version: "antigravity-app-cli-v1".to_string(),
                     model: ResolvedModelSelection {
@@ -2556,6 +2781,11 @@ echo "Created conversation 0bdd2166-d420-40c6-94be-70b93eb290c5" > "$log_file"
         std::fs::write(
             &executable,
             r#"#!/bin/sh
+case "$1" in
+  --version) echo 'version query must not run' >&2; exit 99 ;;
+  --help) printf '%s\n' '--print --conversation --model --mode --sandbox --add-dir --log-file --print-timeout'; exit 0 ;;
+  models) printf '%s\n' 'test-model'; exit 0 ;;
+esac
 log_file=""
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--log-file" ]; then
@@ -2588,6 +2818,7 @@ exec sleep 30
             },
             permission_semantics: PermissionSemantics::CoreEnforcedV1,
             runtime: FrozenAgentRuntimeConfig {
+                custom_api: None,
                 camp_fast: None,
                 adapter_kind: AdapterKind::AntigravityApp,
                 installation_id: "agy-test".to_string(),
@@ -2596,7 +2827,10 @@ exec sleep 30
                 executable_path: executable.to_string_lossy().to_string(),
                 auth_scope: "test".to_string(),
                 reported_version: Some("test".to_string()),
-                executable_fingerprint: "sha256:test".to_string(),
+                executable_fingerprint: rovai_core::agent_runtime_adapter::executable_fingerprint(
+                    &executable,
+                )
+                .unwrap(),
                 capabilities: vec!["cli.print".to_string()],
                 protocol_version: "antigravity-app-cli-v1".to_string(),
                 model: ResolvedModelSelection {
@@ -2651,6 +2885,79 @@ exec sleep 30
                 .expect("private log directory should exist")
                 .next()
                 .is_none()
+        );
+        // Cancellation during the prompt-free exception must never spawn --print.
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+case "$1" in
+  --help) touch "$(dirname "$0")/preflight-started"; exec sleep 30 ;;
+  *) touch "$(dirname "$0")/unexpected-task-input"; exit 99 ;;
+esac
+"#,
+        )
+        .unwrap();
+        let cancelled_run_id = uuid::Uuid::new_v4().to_string();
+        let mut request =
+            fake_antigravity_request(&workspace, &executable, cancelled_run_id.clone());
+        let (accepted_sender, mut accepted_receiver) = mpsc::unbounded_channel();
+        request.input_accepted = Some(accepted_sender);
+        let running_adapter = adapter.clone();
+        let task = tokio::spawn(async move { running_adapter.run(request).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !root.join("preflight-started").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("preflight must start before cancellation");
+        assert!(adapter.interrupt(&cancelled_run_id, 1).await);
+        let error = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("preflight cancellation must settle promptly")
+            .unwrap()
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("interrupted"));
+        assert!(!root.join("unexpected-task-input").exists());
+        assert!(accepted_receiver.recv().await.is_none());
+        let changing_script = r#"#!/bin/sh
+case "$1" in
+  --help)
+    touch "$0.preflight"
+    while [ ! -e "$0.release" ]; do /bin/sleep 0.01; done
+    printf '%s\n' '--print --conversation --model --mode --sandbox --add-dir --log-file --print-timeout'
+    ;;
+  models) printf '%s\n' 'test-model' ;;
+  --print) touch "$0.input" ;;
+esac
+"#;
+        std::fs::write(&executable, changing_script).unwrap();
+        let request =
+            fake_antigravity_request(&workspace, &executable, uuid::Uuid::new_v4().to_string());
+        let running_adapter = adapter.clone();
+        let task = tokio::spawn(async move { running_adapter.run(request).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !executable.with_extension("preflight").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::write(
+            &executable,
+            format!("{changing_script}\n# replaced entry\n"),
+        )
+        .unwrap();
+        std::fs::write(executable.with_extension("release"), b"release").unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("executable changed"));
+        assert!(
+            !executable.with_extension("input").exists(),
+            "replacement must not receive task input"
         );
         std::fs::remove_dir_all(root).expect("test directory should be removed");
     }

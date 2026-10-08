@@ -22,9 +22,7 @@ use crate::{
         AdapterCapabilitySnapshot, AdapterKind, AdapterPermissionConfig, ModelDescriptor,
         ModelOptionDescriptor, PermissionOptionDescriptor, RuntimeOptionScope, ValueChoice,
     },
-    builtin_tool_transport::{
-        BUILTIN_TOOL_CONTRACT_VERSION, BUILTIN_TOOL_RUNTIME_CAPABILITY, builtin_tool_catalog_digest,
-    },
+    builtin_tool_transport::BUILTIN_TOOL_RUNTIME_CAPABILITY,
     command::canonical_json_digest,
     context_contract::{
         CODEX_SESSION_GUIDANCE_REVISION,
@@ -1095,14 +1093,9 @@ impl AgentRuntimeAdapterRegistry {
         }
     }
 
-    pub fn light_ready_snapshot(
-        &self,
-        kind: AdapterKind,
-        reported_version: Option<String>,
-        executable_fingerprint: String,
-        observed_at: String,
-    ) -> Result<AdapterCapabilitySnapshot> {
-        let permission_options = match kind {
+    /// Shipped permission vocabulary, independent of diagnostic observations.
+    pub fn permission_options(&self, kind: AdapterKind) -> Vec<PermissionOptionDescriptor> {
+        match kind {
             AdapterKind::CodexCli => codex_permission_options(),
             AdapterKind::Pi => pi_permission_options(),
             AdapterKind::OpencodeCli => opencode_permission_options(),
@@ -1119,7 +1112,17 @@ impl AgentRuntimeAdapterRegistry {
             AdapterKind::GrokBuild => grok_permission_options(),
             AdapterKind::DeepseekHarness => dsh_permission_options(),
             AdapterKind::ZcodeApp => zcode_permission_options(),
-        };
+        }
+    }
+
+    pub fn light_ready_snapshot(
+        &self,
+        kind: AdapterKind,
+        reported_version: Option<String>,
+        executable_fingerprint: String,
+        observed_at: String,
+    ) -> Result<AdapterCapabilitySnapshot> {
+        let permission_options = self.permission_options(kind);
         let permission_schema_digest = adapter_permission_schema_digest(kind, &permission_options)?;
         let grok_version_unsupported = kind == AdapterKind::GrokBuild
             && !grok_build_minimum_version_satisfied(reported_version.as_deref());
@@ -1404,6 +1407,76 @@ impl CodexCliAdapterPolicy {
     }
 }
 
+/// Validate saved intent against evidence from the Host that will receive the input.
+/// Diagnostic catalogs must never substitute for this check.
+#[derive(Debug)]
+pub struct LiveModelValidationError {
+    pub code: &'static str,
+    pub model_id: String,
+    pub detail: String,
+}
+
+impl std::fmt::Display for LiveModelValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} for explicit model {}: {}",
+            self.code, self.model_id, self.detail
+        )
+    }
+}
+
+impl std::error::Error for LiveModelValidationError {}
+
+pub fn validate_live_model_selection(
+    models: &[ModelDescriptor],
+    model_id: &str,
+    options: &Value,
+) -> std::result::Result<(), LiveModelValidationError> {
+    let failure = |code, detail: String| LiveModelValidationError {
+        code,
+        model_id: model_id.to_string(),
+        detail,
+    };
+    let model = models
+        .iter()
+        .find(|model| model.id == model_id && !model.hidden && !model.deprecated)
+        .ok_or_else(|| {
+            failure(
+                "runtime_model_unavailable",
+                "the current Host did not advertise the selected model".to_string(),
+            )
+        })?;
+    let options = options.as_object().ok_or_else(|| {
+        failure(
+            "runtime_model_options_invalid",
+            "model options must be an object".to_string(),
+        )
+    })?;
+    for (key, value) in options {
+        let descriptor = model
+            .options
+            .iter()
+            .find(|option| option.key == *key)
+            .ok_or_else(|| {
+                failure(
+                    "runtime_model_option_unknown",
+                    format!("unadvertised model option: {key}"),
+                )
+            })?;
+        if !value
+            .as_str()
+            .is_some_and(|value| descriptor.values.iter().any(|choice| choice.value == value))
+        {
+            return Err(failure(
+                "runtime_model_option_invalid",
+                format!("unsupported value for model option {key}: {value}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn codex_models(catalog: &Value) -> Result<Vec<ModelDescriptor>> {
     let values = catalog
         .get("data")
@@ -1637,9 +1710,10 @@ impl CopilotCliAdapterPolicy {
     }
 }
 
+// Persisted capability name; both native control requests establish the same evidence.
 pub const CLAUDE_MODEL_CATALOG_CAPABILITY: &str = "model.catalog.initialize";
 
-/// Normalize the model list from the matching SDK initialize control response.
+/// Normalize the model list from a matching SDK list_models or initialize response.
 /// Native selection values remain opaque: aliases and resolved IDs are not interchangeable.
 pub fn claude_code_models(response: &Value) -> Result<Vec<ModelDescriptor>> {
     let rows = response
@@ -1647,7 +1721,7 @@ pub fn claude_code_models(response: &Value) -> Result<Vec<ModelDescriptor>> {
         .and_then(Value::as_array)
         .filter(|rows| !rows.is_empty())
         .context(
-            "claude_model_catalog_incompatible: initialize did not return a non-empty models array",
+            "claude_model_catalog_incompatible: model query did not return a non-empty models array",
         )?;
     let mut seen = std::collections::BTreeSet::new();
     let mut models = vec![ModelDescriptor {
@@ -2237,7 +2311,7 @@ fn acp_capability_snapshot(
     let session_result = observation.session_result.as_ref();
     let mut models = if ready {
         let session = session_result.context("ready ACP probe did not create a session")?;
-        match acp_model_catalog_from_session(session) {
+        match acp_model_catalog_for_adapter(adapter_kind, session) {
             Ok(models) => models,
             Err(_)
                 if matches!(
@@ -2555,6 +2629,37 @@ pub fn acp_model_catalog_from_session(session_result: &Value) -> Result<Vec<Mode
             .cmp(&left.is_default)
             .then_with(|| left.display_name.cmp(&right.display_name))
     });
+    Ok(models)
+}
+
+pub fn acp_model_catalog_for_adapter(
+    adapter_kind: AdapterKind,
+    session_result: &Value,
+) -> Result<Vec<ModelDescriptor>> {
+    let mut models = acp_model_catalog_from_session(session_result)?;
+    if adapter_kind == AdapterKind::CodebuddyCli
+        && let Some(current) = acp_runtime_model_id_from_session(session_result)
+        && !models.iter().any(|model| model.id == current)
+    {
+        // CodeBuddy's selected custom-local or API-environment model can be
+        // absent from an ACP options list containing only built-in IDs.
+        models.push(ModelDescriptor {
+            description: None,
+            runtime_metadata: None,
+            id: current.clone(),
+            display_name: current,
+            is_default: true,
+            hidden: false,
+            deprecated: false,
+            options: Vec::new(),
+        });
+        models.sort_by(|left, right| {
+            right
+                .is_default
+                .cmp(&left.is_default)
+                .then_with(|| left.display_name.cmp(&right.display_name))
+        });
+    }
     Ok(models)
 }
 
@@ -3024,7 +3129,7 @@ fn resolve_pi_runtime(
         "runtimeEntrypoint": runtime_entrypoint_compatibility(&input)?,
         "authScope": input.auth_scope,
         "protocolVersion": protocol_version,
-        "managedExtension": "rovai-pi-host-v7",
+        "managedExtension": "rovai-pi-host-v8",
     }))?;
     Ok(AdapterRuntimeProjection {
         protocol_version,
@@ -3280,8 +3385,8 @@ impl AgentRuntimeAdapter for AntigravityAppAdapterPolicy {
         let binding_compatibility_digest = antigravity_binding_compatibility_digest(
             input.installation_id,
             &protocol_version,
-            BUILTIN_TOOL_CONTRACT_VERSION,
-            &builtin_tool_catalog_digest()?,
+            NATIVE_BINDING_TOOL_COMPATIBILITY_VERSION,
+            NATIVE_BINDING_TOOL_COMPATIBILITY_DIGEST,
         )?;
         let host_config_digest = canonical_json_digest(&json!({
             "adapterKind": self.kind(),
@@ -3303,6 +3408,12 @@ impl AgentRuntimeAdapter for AntigravityAppAdapterPolicy {
         })
     }
 }
+
+// Tool names and input aliases changed in v33; native protocol/session semantics did not.
+// Keep the exact v32 identity used by existing bindings. Live discovery uses the current catalog.
+const NATIVE_BINDING_TOOL_COMPATIBILITY_VERSION: u32 = 32;
+const NATIVE_BINDING_TOOL_COMPATIBILITY_DIGEST: &str =
+    "sha256:f3a80021f106afb84a02db2eb0eaa5f81d4936df46a8aaa131f3c15127fb70c1";
 
 fn antigravity_binding_compatibility_digest(
     installation_id: &str,
@@ -3428,6 +3539,30 @@ mod tests {
         assert!(acp_model_catalog_from_session(&malformed).is_err());
         malformed["configOptions"][0]["options"][0]["options"] = Value::Null;
         assert!(acp_model_catalog_from_session(&malformed).is_err());
+
+        let codebuddy = json!({"configOptions":[{"id":"model","currentValue":"custom-local:gpt-6-sol","options":[{"value":"glm-5.2","name":"GLM"}]}]});
+        assert!(
+            !acp_model_catalog_from_session(&codebuddy)
+                .unwrap()
+                .iter()
+                .any(|model| model.is_default)
+        );
+        let configured =
+            acp_model_catalog_for_adapter(AdapterKind::CodebuddyCli, &codebuddy).unwrap();
+        assert_eq!(configured[0].id, "custom-local:gpt-6-sol");
+        assert!(configured[0].is_default);
+        let mut api_environment = codebuddy.clone();
+        api_environment["configOptions"][0]["currentValue"] = json!("gpt-6.1-sol");
+        let configured =
+            acp_model_catalog_for_adapter(AdapterKind::CodebuddyCli, &api_environment).unwrap();
+        assert_eq!(configured[0].id, "gpt-6.1-sol");
+        assert!(configured[0].is_default);
+        assert!(
+            !acp_model_catalog_for_adapter(AdapterKind::QoderCli, &codebuddy)
+                .unwrap()
+                .iter()
+                .any(|model| model.is_default)
+        );
     }
 
     #[cfg(unix)]
@@ -4438,23 +4573,37 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_catalog_upgrade_replaces_the_native_conversation_binding() {
-        let current_catalog = builtin_tool_catalog_digest().unwrap();
+    fn antigravity_catalog_rename_preserves_binding_but_protocol_changes_do_not() {
+        let baseline = antigravity_binding_compatibility_digest(
+            "agy-local",
+            "antigravity-app-cli-v1",
+            32,
+            "sha256:f3a80021f106afb84a02db2eb0eaa5f81d4936df46a8aaa131f3c15127fb70c1",
+        )
+        .unwrap();
         let current = antigravity_binding_compatibility_digest(
             "agy-local",
             "antigravity-app-cli-v1",
-            BUILTIN_TOOL_CONTRACT_VERSION,
-            &current_catalog,
+            NATIVE_BINDING_TOOL_COMPATIBILITY_VERSION,
+            NATIVE_BINDING_TOOL_COMPATIBILITY_DIGEST,
         )
         .unwrap();
-        let legacy = antigravity_binding_compatibility_digest(
-            "agy-local",
-            "antigravity-app-cli-v1",
-            7,
-            &format!("sha256:{}", "0".repeat(64)),
-        )
-        .unwrap();
-        assert_ne!(current, legacy);
+        assert_eq!(current, baseline);
+        for (installation, protocol) in [
+            ("agy-other", "antigravity-app-cli-v1"),
+            ("agy-local", "antigravity-app-cli-v2"),
+        ] {
+            assert_ne!(
+                current,
+                antigravity_binding_compatibility_digest(
+                    installation,
+                    protocol,
+                    NATIVE_BINDING_TOOL_COMPATIBILITY_VERSION,
+                    NATIVE_BINDING_TOOL_COMPATIBILITY_DIGEST,
+                )
+                .unwrap()
+            );
+        }
     }
 
     #[test]

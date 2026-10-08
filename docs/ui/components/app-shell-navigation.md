@@ -2,7 +2,7 @@
 document_type: ui-component-contract
 authority: renderer-app-shell-navigation
 status: accepted
-last_updated: 2026-09-26
+last_updated: 2026-10-05
 ---
 
 # App Shell 与统一侧栏
@@ -33,9 +33,10 @@ last_updated: 2026-09-26
 偏好持久化、内容挂载与草稿保留；`ROVAI_KEEP_NAVIGATION_FIXTURE=1` 保留截图，不连接 Core、Runtime 或日常 userData。
 
 普通侧栏依次显示置顶内容和 Project。每个 Project 行负责展开/折叠，不显示独立折叠图标；
-右侧仅保留项目级 `＋` 与三点菜单。标题与“查看更多 / 收起”不显示 Camp 数量。当前 Project
+右侧保留沿用 New Chat 的笔记本与笔图标及三点菜单；两者默认隐藏，悬浮、键盘可见焦点或菜单打开时显示，
+当前 Project 也遵循此规则。Projects 分区的添加目录 `＋` 保留。标题与“查看更多 / 收起”不显示 Camp 数量。当前 Project
 使用中性文字与既有选择底色。选中 Camp 保留 `--surface-selected`，移除左侧竖线；侧栏 `--rail` 底色不变。
-完成且有新回复的提示点使用 `--conversation-unread`，仍只表达未读回复，打开会话后按既有规则清除。
+未读提示点使用 `--conversation-unread`，表达未查看回复或用户显式保留的未读提醒。
 Hover 不能是发现行操作的唯一方式。
 
 Sidecar Project 行在升级后保持稳定位置。合法旧偏好第一次进入时按用户当时看到的 Project 顺序冻结；
@@ -49,15 +50,26 @@ Camp（包括快速对话）按最近一条已发布用户消息排序，桌面�
 没有用户消息的 Camp 使用创建时间作为稳定初始位置，未发送草稿的编辑或附件准备不推进排序。
 置顶项和已保存的 Project 顺序继续由本机偏好拥有。
 
-Camp 行显示稳定标题和必要状态。三点菜单是置顶/取消置顶、重命名、复制会话 ID 和删除的唯一
-入口；复制只写稳定 Camp ID 原文。Camp 顶栏不得重复这些操作。
+Camp 行显示稳定标题和必要状态。右键、三点按钮、Shift+F10 / ContextMenu 键及触屏长按打开同一份菜单，
+提供置顶/取消置顶、标记未读/已读、重命名、复制会话 ID 和删除；复制只写稳定 Camp ID 原文。
+右键不打开 Camp 或折叠 Project。鼠标菜单靠点击位置，三点和键盘菜单靠行末入口，均限制在窗口内；
+Escape、点击外部、滚动或窗口失焦关闭。Camp 顶栏不得重复这些操作。
+Project 菜单提供 New Chat、置顶、重命名、Reveal in Finder（Windows 使用文件管理器文案）、复制项目路径、移除项目。
+Finder 定位真实目录，由 Desktop Main 校验存在后调用原生系统；目录失效提示重新选择。远程 Web 不提供原生定位项。
 Desktop 与宽屏 WebUI 的置顶 Camp 在标题左侧显示 17px 对话图标；置顶项目标题、置顶项目内 Camp、
 普通项目内 Camp 与独立置顶 Camp 共用文字轴。Project 子 Camp 只用层级缩进，不渲染空图标或左侧状态占位。
-每个 Camp 行右侧始终保留 12×12px 状态槽：正在打开或运行时显示 loading，否则有新回复时显示 7px
-`--conversation-unread` 蓝点，无状态时留空；loading 与未读同时成立时只显示 loading，未读事实及可访问名称继续保留。
-状态变化不得移动标题或改变长标题的可用宽度。MobileUI 使用同一状态 DOM，蓝点为 6px，并沿用 20px
+每个 Camp 行右侧保留固定 44px 的状态/操作区域：默认靠最右侧展示未读蓝点与灰色运行环，二者同时成立时并列显示，
+每个状态槽 12×12px，蓝点 7px，槽间距 6px。运行环使用中性 `--conversation-route-accent`。
+悬浮、键盘可见焦点或菜单打开时隐藏整个状态簇，并在最右侧展示三点按钮；离开后恢复，不改变状态事实。
+选中 Camp 不常驻三点入口。状态或操作切换不得移动标题或改变长标题的可用宽度。
+无 Hover 的触屏使用独立操作位置，MobileUI 继续使用同一状态 DOM、长按与键盘入口，蓝点为 6px，并沿用 20px
 列表会话图标、44px 会话行与 48px Project 行；手机入口由统一左侧抽屉承载，不再显示底栏。
 会话图标统一采用 24×24 画布、1.7 描边的横向圆角气泡与短尾，单线条、无填充、无阴影；其他导航图标不变。
+
+显式标记未读属于本机提醒，当前打开的 Camp 也可以保留；聚焦、悬浮、背景刷新和 Run 结束不清除。
+显式成功打开完整会话或选择“标记已读”才清除提醒；打开失败或只显示缓存预览必须保留。
+标记已读只覆盖操作时已知的新回复，之后到达的回复仍产生蓝点；不得倒退或伪造 Core 的真实查看水位。
+提醒随导航偏好持久化，Desktop 同步到其他窗口，Web 限定于当前主机与浏览器展示偏好。
 
 自动生成的 Camp 标题不把开头连续的真实队员 Mention / 所有队员 Mention 当作标题内容；只保留
 首段正文开始后的文字，正文中后部的 Mention 和手写 `@文字` 继续作为普通标题文字。Camp 行不把
@@ -151,7 +163,7 @@ macOS 在根层读取 mouseup 的 button=3/4；Windows 互斥使用宿主 `app-c
 完整 ID 经短暂防抖调用 Desktop `navigation.findCamp({ campId })`；Core 再通过 `CampId` 校验，按
 `camp.id` 主键等值读取，返回单个 `NavigationCampTarget`（ID、标题、渠道来源、激活状态、项目绑定类型和路径）或
 `null`。该路径覆盖未进入最近五条列表的旧会话，不加载消息或聚合活动历史，不改变已读状态。
-Active Camp 和有正文或附件的 Pending Camp 可被查询；空 Pending Camp 与不存在的 ID 返回无结果。
+Active Camp 和带当前 Desktop 客户端 presence 的 Pending Camp 可被查询；空 Pending Camp 与不存在的 ID 返回无结果。
 
 查询期间显示加载反馈，失败与未命中分别呈现；修改输入或关闭搜索后丢弃旧请求结果。方向键选择和回车
 打开沿用现有会话激活入口。普通文字输入不会调用 ID 查询，标题过滤与 ID 查找互斥。
@@ -165,6 +177,11 @@ Project 领域实体。它没有 Project 菜单；其 Camp 行与目录 Project 
 Quick Chat 首页不提供 Composer。普通“新对话”先原子创建 Active Camp；一键入口先取得
 Core-owned Pending Camp 并进入同一 Composer，第一条消息成功后再原子激活。界面不得用静态
 演示数据伪造日期、阶段或创建结果。
+
+普通一键 Pending 的非空正文、附件、引用或 reply 保存后显示“草稿”行；同一项目可保留多份。切换、刷新和
+普通重启后可从侧栏分别恢复。清空输入后隐藏，发送成功后转为普通对话；保存失败时沿用输入框错误反馈与离开保护。
+行高、名称和 draft badge 使用已有 Pending 行，不增加常驻说明。规则见
+[Pending Camp Activation v4](../../contracts/pending-camp-activation-v4.md)。
 
 无对话首页以“开始一段协作”和“选好队员，写下你想完成的事。”引导，使用浅色底“新对话”入口。
 有最近对话时直接显示“最近对话”列表，并将轻量“新对话”动作放在列表标题右侧；不把所有最近对话称为未完成。
@@ -235,8 +252,10 @@ App 前台可见时使用约 20 秒低频安全刷新修复偶发丢失事件；
 [Mobile WebUI](../host-web-mobile.md)。
 
 返回 App 后恢复原一级页面；当前 Main Window Session 内记住最后设置分类，全新安装默认“通用”。更新
-徽标的临时深链不覆盖该记忆；“关于与更新”行在有可操作 release 时显示同语义、非交互的状态徽标。设置
-页面的局部构图见
+徽标的临时深链不覆盖该记忆；进入后选择候选版本日志，聚焦日志标题，并仅就近滚动使标题可见。
+普通侧栏更新入口使用透明背景、34px 点击高度和 11.5px 状态文字；英文 200px 窄栏可另起一行。
+“关于与更新”行显示同语义、非交互的 11px 状态，图标槽和状态的宽度规则分别归属，不能挤压或重叠。
+下载中同时显示动作与百分比；下载/安装失败显示失败状态，页面才提供对应重试操作。设置页面的局部构图见
 [`settings-workspace` surface brief](../../../apps/desktop/.impeccable/surfaces/settings-workspace.md)。
 
 队员页继续显示普通全局侧栏和 Project / Camp 导航，不再用队员名册覆盖该槽位，也不提供独立的
@@ -254,6 +273,16 @@ Automation 工作区即将因全局导航卸载时，App 同样等待该工作�
 正常 App 退出也复用该 guard，但由 Main quit coordinator 在 Core shutdown 前请求；App Shell 不增加退出状态或 Draft
 保存实现。保存失败时 Main 放弃本次退出，当前 Camp 保持可见且 Composer 恢复交互；成功后才进入既有
 `runtime.state = shutting_down` 全局等待面。
+
+### 原生连接设置
+
+Claude Code / Codex 的自定义 API 配置功能已退出。启动页只显示程序路径、检查状态、环境变量及
+保存/放弃操作；没有官方/API 单选、登录状态、地址、Key 或自定义模型表单。目录中的原有登录与
+安装指南继续可用；不增加替代说明或停用开关。
+
+保存收到本地回执即更新基线、结束加载并显示“已保存”，不追加观察或列表刷新。
+普通字段冲突继续按项选择并保留草稿。已有本机原生配置不删除、不重写，连接由原生 CLI 使用；
+完整边界见 [Runtime Launch v52](../../contracts/runtime-launch-and-verification-v52.md)。
 
 ## 宿主平台交互
 
@@ -275,8 +304,8 @@ macOS 保留 hidden title bar 与受控 drag region；新对话、设置、队�
 全局 rail 默认 270px，按上文规则调宽或完全收起。队员内容区名册默认 256px，可显式收起到 76px。最小 `1040×700` 下内容区自行
 重排，不能让 rail、名册、菜单或主要操作被裁切。
 Project/Camp 行、菜单、临时提醒和设置返回均可键盘操作，Icon-only 控件有可访问名称；选中、展开和
-未读状态不能只靠颜色。Camp 行“有新回复”只在真正打开该会话、窗口可见且拥有焦点后消除；后台
-Snapshot 刷新、设置/记忆页和应用失焦均不得提前清除。
+未读状态不能只靠颜色。Core 真实查看确认只在完整会话已展示、窗口可见且拥有焦点后推进；显式“标记已读”
+只改变本机意图。后台 Snapshot 刷新、设置/记忆页和应用失焦均不得提前清除未读。
 
 页面缩放继续使用标准 `CommandOrControl + / - / 0` 快捷键；App 拦截 Electron 的默认倍率阶梯，
 与设置页统一采用 [Chrome 桌面缩放档位](../themes/README.md#外观与阅读偏好)，按方向切换相邻档位，

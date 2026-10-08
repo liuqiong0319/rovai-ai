@@ -12,7 +12,10 @@ use crate::{
         DomainCommandGateway, EntityReference, canonical_json_digest, sealed,
     },
     db::Database,
-    runtime::{PermissionSemantics, recompute_camp_turn, settle_abortive_agent_run_in_tx},
+    runtime::{
+        PermissionSemantics, fail_lost_agent_run_in_tx, pump_target_after_run_terminal,
+        recompute_camp_turn, settle_abortive_agent_run_in_tx,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2550,13 +2553,20 @@ impl ActionSafetyService {
                             SET status = 'cancelled',
                                 decision_json = '{"reason":"native_request_resolved"}',
                                 resolved_by_type = 'system',
-                                resolved_by_id = 'runtime-adapter:codex',
+                                resolved_by_id = ?3,
                                 resolution_code = 'native_request_resolved',
                                 version = version + 1,
                                 resolved_at = ?2, updated_at = ?2
                             WHERE id = ?1 AND status = 'pending'
                             "#,
-                            params![approval_id, now],
+                            params![
+                                approval_id,
+                                now,
+                                match &envelope.actor {
+                                    ActorRef::System { component_id } => component_id,
+                                    _ => unreachable!("Runtime adapter actor was admitted above"),
+                                }
+                            ],
                         )?;
                     }
                     resolution = "request_closed_without_delivery";
@@ -2615,7 +2625,7 @@ impl ActionSafetyService {
         database: &mut Database,
         envelope: &CommandEnvelope<ReconcileRuntimeLossCommand>,
     ) -> Result<CommandExecution> {
-        self.gateway.execute(database, envelope, |transaction| {
+        let execution = self.gateway.execute(database, envelope, |transaction| {
             if !matches!(
                 &envelope.actor,
                 ActorRef::System { component_id }
@@ -2695,6 +2705,24 @@ impl ActionSafetyService {
                     }),
                     Some(entity_ref("agent_run", &envelope.payload.agent_run_id)),
                 ));
+            }
+            // This command is entered after the matching Host's exit. An input
+            // that may have executed has no remaining owner and cannot be replayed.
+            let input_may_have_executed: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM runtime_input_delivery
+                 WHERE agent_run_id = ?1
+                   AND (status IN ('accepted', 'delivery_unknown')
+                     OR (status = 'prepared' AND dispatch_started_at IS NOT NULL)))",
+                [&envelope.payload.agent_run_id],
+                |row| row.get(0),
+            )?;
+            if input_may_have_executed {
+                return fail_lost_agent_run_in_tx(
+                    transaction,
+                    &envelope.payload.agent_run_id,
+                    &envelope.actor,
+                    &envelope.payload.reason,
+                );
             }
             let actions_marked_unknown = transaction.execute(
                 r#"
@@ -2873,7 +2901,11 @@ impl ActionSafetyService {
                 }),
                 Some(entity_ref("agent_run", &envelope.payload.agent_run_id)),
             ))
-        })
+        })?;
+        if !execution.replayed && execution.result.code == "agent_run.failed" {
+            pump_target_after_run_terminal(database, &envelope.payload.agent_run_id)?;
+        }
+        Ok(execution)
     }
 
     pub fn fail_runtime_delivery(
@@ -3716,8 +3748,8 @@ mod tests {
     use crate::read_model::ReadModelService;
     use crate::{
         collaboration::{
-            AddCampMemberCommand, CollaborationService, CreateCampCommand, ExecutionRequest,
-            TestCampMessageAddress, TestCampMessageCommand,
+            AddThreadMemberCommand, CollaborationService, CreateThreadCommand, ExecutionRequest,
+            TestThreadMessageAddress, TestThreadMessageCommand,
         },
         command::CommandResultStatus,
     };
@@ -3772,7 +3804,7 @@ mod tests {
                 &user_envelope(
                     "create-camp",
                     None,
-                    CreateCampCommand::for_test_with_members(
+                    CreateThreadCommand::for_test_with_members(
                         workspace.to_string_lossy().to_string(),
                         &["agent_2"],
                         "agent_2",
@@ -3780,7 +3812,7 @@ mod tests {
                 ),
             )
             .unwrap();
-        let camp_id = created.result.payload["campId"]
+        let camp_id = created.result.payload["threadId"]
             .as_str()
             .unwrap()
             .to_string();
@@ -3790,7 +3822,7 @@ mod tests {
                 &user_envelope(
                     "add-muwa",
                     Some(&camp_id),
-                    AddCampMemberCommand {
+                    AddThreadMemberCommand {
                         camp_id: camp_id.clone(),
                         agent_id: "agent_2".to_string(),
                         expected_membership_generation: 1,
@@ -3806,12 +3838,12 @@ mod tests {
                 &user_envelope(
                     "start-run",
                     Some(&camp_id),
-                    TestCampMessageCommand {
+                    TestThreadMessageCommand {
                         camp_id: camp_id.clone(),
                         draft_revision: None,
                         body: "执行一个受限动作".to_string(),
                         prepared_attachment_ids: Vec::new(),
-                        address: TestCampMessageAddress::Default,
+                        address: TestThreadMessageAddress::Default,
                         reply_to_camp_message_id: None,
                         execution: Some(ExecutionRequest {
                             task_id: None,
@@ -5650,6 +5682,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, ("acked".to_string(), "running".to_string()));
+        // The same native-resolution transaction must close an unanswered
+        // request and attribute cancellation to its actual Runtime adapter.
+        for component in ["runtime-adapter:codex", "runtime-adapter:claude-code-cli"] {
+            let action_id = format!("action-pending-{component}");
+            let request_id = format!("request-pending-{component}");
+            let prepare = intercepted_prepare_envelope(&fixture, &action_id, &request_id);
+            service
+                .prepare_action(&mut fixture.database, &prepare)
+                .unwrap();
+            let confirmed = service
+                .confirm_runtime_request_resolved(
+                    &mut fixture.database,
+                    &system_envelope(
+                        &format!("confirm-{request_id}"),
+                        &fixture.camp_id,
+                        component,
+                        ConfirmRuntimeRequestResolvedCommand {
+                            agent_run_id: fixture.agent_run_id.clone(),
+                            execution_epoch: 1,
+                            native_thread_id: "thread-1".to_string(),
+                            native_request_id: json!(request_id),
+                        },
+                    ),
+                )
+                .unwrap();
+            assert_eq!(confirmed.result.status, CommandResultStatus::Applied);
+            let state: (String, String, String) = fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT action_execution.status, approval.status, approval.resolved_by_id
+                     FROM action_execution JOIN approval ON approval.action_id = action_execution.id
+                     WHERE action_execution.id = ?1",
+                    [&action_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                state,
+                ("not_executed".into(), "cancelled".into(), component.into())
+            );
+        }
         drop(fixture.database);
         std::fs::remove_dir_all(fixture.directory).unwrap();
     }

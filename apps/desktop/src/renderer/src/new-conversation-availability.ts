@@ -1,14 +1,14 @@
-import type { CampCreationPreflight } from '@contracts'
+import type { ThreadCreationPreflight } from '@contracts'
 import { uiAttribute } from './interface-language'
 
 type ConversationCandidate = Pick<
-  CampCreationPreflight['presentMembers'][number],
+  ThreadCreationPreflight['presentMembers'][number],
   'runtimeConfigured' | 'runtimeReadiness'
 >
 
 export function isNewConversationMemberAvailable(member: ConversationCandidate): boolean {
   return member.runtimeConfigured
-    && (member.runtimeReadiness === 'ready' || member.runtimeReadiness === 'light_ready')
+    && (member.runtimeReadiness === 'ready' || member.runtimeReadiness === 'light_ready' || member.runtimeReadiness === 'installed_unverified')
 }
 
 export function newConversationMemberStatus(member: ConversationCandidate): string {

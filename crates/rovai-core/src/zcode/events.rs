@@ -62,6 +62,7 @@ struct BackgroundTool {
 pub(super) struct Translated {
     pub messages: Vec<Value>,
     pub terminal: Option<Result<Value>>,
+    pub context_refresh: bool,
 }
 
 impl SessionEvents {
@@ -219,6 +220,7 @@ impl SessionEvents {
             && !operation.is_empty()
             && !boundary.is_empty()
         {
+            translated.context_refresh = self.input.is_some();
             translated.messages.push(json!({"method":"_zcode/compaction","params":{
                 "sessionId":session,"operationId":boundary,"nativeOperationId":operation,"status":"completed",
                 "trigger":payload["trigger"],"phase":payload["phase"]}}));
@@ -266,6 +268,15 @@ impl SessionEvents {
         if !self.owns_turn(event["turnId"].as_str()) {
             return Ok(translated);
         }
+        // Official ModelComplete arrives as session.updated with native Usage;
+        // it is a model-call boundary, before tools and the prompt terminal.
+        // A Session snapshot provides occupancy; Usage itself is not reused as it.
+        translated.context_refresh = kind == "session.updated"
+            && payload.get("usage").is_some()
+            && payload
+                .get("querySource")
+                .and_then(Value::as_str)
+                .is_none_or(|source| source == "main_turn");
         match (kind, payload["kind"].as_str()) {
             ("model.streaming", Some("text_delta")) => {
                 let delta = payload["delta"]
@@ -288,7 +299,28 @@ impl SessionEvents {
                     "messageId":message,"content":{"type":"text","text":delta}}),
                 ));
             }
-            // Reasoning and partial tool input are not public assistant text.
+            ("model.streaming", Some("reasoning_delta"))
+                if crate::runtime::is_root_output(event) =>
+            {
+                // Native seq is already de-duplicated above and owns this exact
+                // input/turn. Forward only genuine increments; complete parts,
+                // signatures and tool input never become public evidence.
+                if let (Some(message), Some(delta)) = (
+                    payload["assistantMessageId"]
+                        .as_str()
+                        .filter(|id| !id.is_empty()),
+                    payload["delta"].as_str(),
+                ) {
+                    translated.messages.push(update(
+                        session,
+                        json!({
+                            "sessionUpdate": "agent_thought_chunk", "messageId": message,
+                            "content": {"type": "text", "text": delta}
+                        }),
+                    ));
+                }
+            }
+            // Partial tool input is not public assistant text.
             ("model.streaming", Some("tool_call")) => {
                 let id = payload["toolCallId"]
                     .as_str()
@@ -587,6 +619,53 @@ mod tests {
             "_zcode/inputAccepted"
         );
         assert!(state.receive(&start).unwrap().messages.is_empty());
+        let thought = event(
+            12,
+            "t1",
+            "model.streaming",
+            json!({"kind":"reasoning_delta","assistantMessageId":"m1","delta":"PRIVATE_THOUGHT"}),
+        );
+        // Replayed native seq is rejected before translation, including thought.
+        assert!(state.receive(&thought).unwrap().messages.is_empty());
+        let mut thinking = SessionEvents::new(0);
+        thinking.begin("thought-input").unwrap();
+        thinking
+            .receive(&event(
+                1,
+                "thought-turn",
+                "turn.started",
+                json!({"inputId":"thought-input"}),
+            ))
+            .unwrap();
+        let increment = event(
+            2,
+            "thought-turn",
+            "model.streaming",
+            json!({
+                "kind":"reasoning_delta", "assistantMessageId":"thought-message", "delta":"PRIVATE_THOUGHT"
+            }),
+        );
+        let translated = thinking.receive(&increment).unwrap();
+        assert_eq!(
+            translated.messages[0]["params"]["update"]["sessionUpdate"],
+            "agent_thought_chunk"
+        );
+        assert_eq!(
+            translated.messages[0]["params"]["update"]["messageId"],
+            "thought-message"
+        );
+        assert!(thinking.receive(&increment).unwrap().messages.is_empty());
+        assert!(thinking.receive(&event(3, "old-turn", "model.streaming", json!({
+            "kind":"reasoning_delta", "assistantMessageId":"thought-message", "delta":"OLD_THOUGHT"
+        }))).unwrap().messages.is_empty());
+        assert!(thinking.receive(&event(4, "thought-turn", "model.streaming", json!({
+            "kind":"reasoning_end", "assistantMessageId":"thought-message", "delta":"COMPLETE_THOUGHT"
+        }))).unwrap().messages.is_empty());
+        assert!(thinking.receive(&event(5, "thought-turn", "model.streaming", json!({
+            "kind":"reasoning_delta", "assistantMessageId":"child-message", "delta":"CHILD_THOUGHT",
+            "parentSessionId":"child-session"
+        }))).unwrap().messages.is_empty());
+
         assert!(
             state
                 .receive(&event(

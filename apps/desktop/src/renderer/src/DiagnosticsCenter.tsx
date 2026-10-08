@@ -1,4 +1,4 @@
-import { useCampClient, type CampClient } from './camp-client'
+import { useThreadClient, type ThreadClient } from './camp-client'
 import { newCommandId } from '../../shared/command-id'
 import { readErrorMessage } from './error-message'
 import { useEffect, useMemo, useState } from 'react'
@@ -13,7 +13,7 @@ import type {
 import { SettingsPageHeader } from './SettingsPageHeader'
 import { revealInFileManagerLabel } from './renderer-platform'
 import { requestProductRuntimeCheck } from './runtime-check'
-import { UiText, uiAttribute } from './interface-language'
+import { UiText, getInterfaceLanguage, uiAttribute } from './interface-language'
 
 export type DiagnosticFilter = 'all' | DiagnosticStatus
 type Notice = {
@@ -68,7 +68,7 @@ export function DiagnosticsCenter({
   onNavigate(section: 'mcp' | 'runtime', runtimeKind?: AdapterKind): void
   platform?: NodeJS.Platform
 }): React.JSX.Element {
-  const client = useCampClient()
+  const client = useThreadClient()
   const [report, setReport] = useState<DiagnosticsReport | null>(null)
   const [loading, setLoading] = useState(true)
   const [running, setRunning] = useState(false)
@@ -584,7 +584,7 @@ function factLabel(key: string): string {
     diagnosticCode: '诊断代码',
     lastSuccessfulProbeAt: '最近成功检查'
   }
-  return labels[key] ?? key
+  return labels[key] ? uiAttribute(labels[key]) : key
 }
 
 function summarySentence(report: DiagnosticsReport): string {
@@ -596,7 +596,7 @@ function formatTimestamp(value: string | null | undefined): string {
   if (!value) return '—'
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return value
-  return new Intl.DateTimeFormat('zh-CN', {
+  return new Intl.DateTimeFormat(getInterfaceLanguage() === 'en' ? 'en-US' : 'zh-CN', {
     month: '2-digit',
     day: '2-digit',
     hour: '2-digit',
@@ -606,13 +606,13 @@ function formatTimestamp(value: string | null | undefined): string {
   }).format(date)
 }
 
-async function readReport(client: CampClient): Promise<DiagnosticsReport> {
+async function readReport(client: ThreadClient): Promise<DiagnosticsReport> {
   const report = await client.request<DiagnosticsReport>('diagnostics.check')
   if (report.schemaVersion !== 1) throw new Error(uiAttribute('诊断报告版本不兼容。'))
   return report
 }
 
-async function waitForRuntimeResult(checkId: string, client: CampClient): Promise<DiagnosticsReport> {
+async function waitForRuntimeResult(checkId: string, client: ThreadClient): Promise<DiagnosticsReport> {
   let latest = await readReport(client)
   for (let attempt = 0; attempt < 24; attempt += 1) {
     const check = latest.checks.find((candidate) => candidate.id === checkId)
