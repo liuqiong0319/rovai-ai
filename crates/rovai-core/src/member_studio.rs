@@ -207,7 +207,7 @@ pub fn resolve_member_avatar_input(
 /// previewId handle. The confirmation credential is only issued by confirm.
 pub fn preview_member_create(
     database: &mut Database,
-    data_dir: &Path,
+    _data_dir: &Path,
     authenticated_run: &AuthenticatedTeamToolRun,
     input: MemberCreateDraft,
 ) -> Result<MemberCreatePreviewOutcome> {
@@ -381,7 +381,7 @@ pub fn confirm_member_create(
         scope_id,
         card_digest,
         source_run_id,
-        creation_key,
+        _creation_key,
         preview_expires,
     )) = preview
     else {

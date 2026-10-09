@@ -28,12 +28,15 @@ app.whenReady().then(async () => {
     const bounds = element.getBoundingClientRect()
     return { x: Math.round(bounds.x + bounds.width / 2), y: Math.round(bounds.y + bounds.height / 2) }
   })()`, true)
-  const click = async selector => {
+  const click = async (selector, button = 'left') => {
     const point = await pointFor(selector)
     assert(point, `No pointer target for ${selector}`)
+    const zoom = window.webContents.getZoomFactor()
+    point.x = Math.round(point.x * zoom)
+    point.y = Math.round(point.y * zoom)
     window.webContents.sendInputEvent({ type: 'mouseMove', ...point })
-    window.webContents.sendInputEvent({ type: 'mouseDown', ...point, button: 'left', clickCount: 1 })
-    window.webContents.sendInputEvent({ type: 'mouseUp', ...point, button: 'left', clickCount: 1 })
+    window.webContents.sendInputEvent({ type: 'mouseDown', ...point, button, clickCount: 1 })
+    window.webContents.sendInputEvent({ type: 'mouseUp', ...point, button, clickCount: 1 })
   }
   const wheel = async selector => {
     const point = await pointFor(selector)
@@ -41,6 +44,12 @@ app.whenReady().then(async () => {
     await window.webContents.debugger.sendCommand('Input.dispatchMouseEvent', { type: 'mouseWheel', ...point, deltaX: 0, deltaY: 1000 })
   }
   const settle = () => window.webContents.executeJavaScript('new Promise(resolve => setTimeout(resolve, 250))', true)
+  if (mode === 'mention-pointer') {
+    await require('./mention-pointer.cjs')({ window, userData, waitFor, click, wheel, settle })
+    console.log(JSON.stringify({ ok: true, cases: ['Mission mention candidates are visible and selectable with native input'] }))
+    app.exit(0)
+    return
+  }
   if (mode === 'editor-pointer') {
     window.webContents.debugger.attach('1.3')
     window.setContentSize(1040, 700)
@@ -162,6 +171,7 @@ app.whenReady().then(async () => {
     assert(narrow.minimumLaneWidth >= 277, `Narrow Mission lanes collapsed to ${narrow.minimumLaneWidth}px`)
     stage = 'narrow lane navigation'
     await window.webContents.executeJavaScript("document.querySelector('.mission-lane-nav button:last-child')?.click()", true)
+    await settle()
     await waitFor("(() => { const host = document.querySelector('.mission-board-scroll'); const button = document.querySelector('.mission-lane-nav button:last-child'); return !!host && !!button && host.scrollLeft > 20 && button.getAttribute('aria-pressed') === 'true' })()", 'Narrow status control did not move the horizontal board viewport')
     narrowLayout = { narrowLaneWidth: Math.round(narrow.minimumLaneWidth), narrowBoardScrollable: narrow.boardWidth > narrow.hostWidth }
     stage = 'desktop restore'
@@ -169,7 +179,7 @@ app.whenReady().then(async () => {
     await waitFor('window.innerWidth === 1440 && window.innerHeight === 920', 'Mission fixture did not restore its desktop size')
     await window.webContents.executeJavaScript("document.querySelector('.mission-board-scroll')?.scrollTo({ left: 0, behavior: 'auto' })", true)
   }
-  const acceptance = mode === 'large-diff'
+  const acceptance = mode === 'mentions' ? 'window.missionQA.runMentions()' : mode === 'large-diff'
     ? 'window.missionQA.runLargeDiff()'
     : mode === 'checkout-view' ? 'window.missionQA.runCheckoutView()'
       : mode === 'delete-trace' ? 'window.missionQA.runDeleteTrace()' : 'window.missionQA.run()'
@@ -181,7 +191,14 @@ app.whenReady().then(async () => {
     app.exit(1)
     return
   }
-  if (mode === 'large-diff' || mode === 'checkout-view' || mode === 'delete-trace') {
+  if (mode === 'mentions') {
+    for (const theme of ['day', 'night']) {
+      await window.webContents.executeJavaScript(`document.documentElement.dataset.theme = '${theme}'`, true)
+      await settle()
+      writeFileSync(join(dirname(userData), `mission-mentions-${theme}.png`), (await window.webContents.capturePage()).toPNG())
+    }
+  }
+  if (mode === 'mentions' || mode === 'large-diff' || mode === 'checkout-view' || mode === 'delete-trace') {
     console.log(JSON.stringify(report)); app.exit(report.ok ? 0 : 1); return
   }
   report.layouts = narrowLayout

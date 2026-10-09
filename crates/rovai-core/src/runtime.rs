@@ -744,6 +744,7 @@ impl ExecutionRuntimeService {
         &self,
         database: &mut Database,
     ) -> Result<Vec<String>> {
+        let changes_before = database.connection().total_changes();
         let transaction = database
             .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -795,6 +796,9 @@ impl ExecutionRuntimeService {
             cancelled.push(agent_run_id);
         }
         transaction.commit()?;
+        if database.connection().total_changes() != changes_before {
+            database.execution_wake.execution_changed();
+        }
         Ok(cancelled)
     }
 
@@ -994,6 +998,7 @@ impl ExecutionRuntimeService {
         if disposition != NativeSessionResumeDisposition::Controlled {
             return Ok(disposition);
         }
+        let changes_before = database.connection().total_changes();
         let transaction = database.connection_mut().transaction()?;
         let existing = transaction
             .query_row(
@@ -1056,6 +1061,9 @@ impl ExecutionRuntimeService {
             Some(_) => anyhow::bail!("Native Session resume attempt has an invalid status"),
         };
         transaction.commit()?;
+        if database.connection().total_changes() != changes_before {
+            database.execution_wake.execution_changed();
+        }
         Ok(disposition)
     }
 
@@ -1097,6 +1105,7 @@ impl ExecutionRuntimeService {
         continuation: &str,
         failure: NativeSessionResumeFailure,
     ) -> Result<()> {
+        let changes_before = database.connection().total_changes();
         let transaction = database.connection_mut().transaction()?;
         append_domain_event(
             &transaction,
@@ -1123,7 +1132,56 @@ impl ExecutionRuntimeService {
             }),
         )?;
         transaction.commit()?;
+        if database.connection().total_changes() != changes_before {
+            database.execution_wake.execution_changed();
+        }
         Ok(())
+    }
+
+    /// A failed replacement has no authority to erase the previous session
+    /// reference. Retain it under the new binding; never restore old credentials
+    /// or clear any accepted/unknown input evidence.
+    pub(crate) fn retain_session_after_failed_replacement(
+        &self,
+        database: &mut Database,
+        execution: &AgentRunExecution,
+    ) -> Result<bool> {
+        let Some(session_id) = execution.native_session_id.as_deref() else {
+            return Ok(false);
+        };
+        let tx = database.connection_mut().transaction()?;
+        let changed = tx.execute(
+            "UPDATE conversation SET native_session_id=?2,
+                native_adapter_installation_id=?3, native_binding_compatibility_digest=?4,
+                native_installation_generation=?5, native_session_compatibility_key=?6,
+                version=version+1, updated_at=?9
+             WHERE id=?1 AND native_session_id IS NULL AND native_binding_id IS NOT NULL
+               AND EXISTS(SELECT 1 FROM agent_run WHERE id=?7 AND conversation_id=?1
+                   AND execution_epoch=?8 AND status IN ('running','waiting') AND cancel_requested_at IS NULL)
+               AND EXISTS(SELECT 1 FROM event_log WHERE entity_type='agent_run' AND entity_id=?7
+                   AND execution_epoch=?8 AND event_type='agent_run.native_session_continuity_lost')
+               AND NOT EXISTS(SELECT 1 FROM runtime_input_delivery WHERE agent_run_id=?7
+                   AND (status IN ('accepted','delivery_unknown') OR dispatch_started_at IS NOT NULL))",
+            params![execution.conversation_id, session_id, execution.native_adapter_installation_id,
+                execution.native_binding_compatibility_digest, execution.native_installation_generation,
+                execution.native_session_compatibility_key, execution.agent_run_id, execution.execution_epoch,
+                chrono::Utc::now().to_rfc3339()],
+        )?;
+        if changed != 0 {
+            append_domain_event(
+                &tx,
+                "agent_run.native_session_reference_retained",
+                &execution.camp_id,
+                ("agent_run", &execution.agent_run_id),
+                &ActorRef::System {
+                    component_id: "runtime-adapter:session-continuation".into(),
+                },
+                Some(execution.execution_epoch),
+                &json!({"conversationId": execution.conversation_id, "nativeSessionId": session_id}),
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed != 0)
     }
 
     pub fn expire_elapsed_camp_turn_execution_budgets(
@@ -1138,6 +1196,7 @@ impl ExecutionRuntimeService {
         }
         let budget_now = observed_budget_now.to_rfc3339();
         let audit_now = audit_now.to_rfc3339();
+        let changes_before = database.connection().total_changes();
         let transaction = database
             .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1188,6 +1247,9 @@ impl ExecutionRuntimeService {
             }
         }
         transaction.commit()?;
+        if database.connection().total_changes() != changes_before {
+            database.execution_wake.execution_changed();
+        }
         Ok(expired)
     }
 
@@ -1198,6 +1260,7 @@ impl ExecutionRuntimeService {
         expected_version: i64,
         command_id: &str,
     ) -> Result<std::result::Result<Vec<Value>, CommandHandlerResult>> {
+        let changes_before = database.connection().total_changes();
         let transaction = database.connection_mut().transaction()?;
         let version: Option<i64> = transaction
             .query_row("SELECT version FROM camp WHERE id = ?1", [camp_id], |row| {
@@ -1216,6 +1279,9 @@ impl ExecutionRuntimeService {
         let blockers =
             self.settle_camp_deletion_in_transaction(&transaction, camp_id, command_id)?;
         transaction.commit()?;
+        if database.connection().total_changes() != changes_before {
+            database.execution_wake.execution_changed();
+        }
         Ok(Ok(blockers))
     }
 
@@ -1354,6 +1420,15 @@ impl ExecutionRuntimeService {
         database: &Database,
         limit: i64,
     ) -> Result<Vec<AgentRunCancellationCandidate>> {
+        self.list_cancellation_candidates_page(database, limit, 0)
+    }
+
+    pub(crate) fn list_cancellation_candidates_page(
+        &self,
+        database: &Database,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AgentRunCancellationCandidate>> {
         if !(1..=100).contains(&limit) {
             anyhow::bail!("AgentRun cancellation limit must be between 1 and 100");
         }
@@ -1375,11 +1450,11 @@ impl ExecutionRuntimeService {
               AND agent_run.cancel_acknowledged_at IS NULL
               AND agent_run.status IN ('succeeded', 'failed', 'cancelled')
             ORDER BY agent_run.updated_at, agent_run.id
-            LIMIT ?1
+            LIMIT ?1 OFFSET ?2
             "#,
         )?;
         Ok(statement
-            .query_map([limit], |row| {
+            .query_map([limit, offset], |row| {
                 Ok(AgentRunCancellationCandidate {
                     agent_run_id: row.get(0)?,
                     camp_id: row.get(1)?,
@@ -1420,6 +1495,15 @@ impl ExecutionRuntimeService {
         limit: i64,
     ) -> Result<Vec<QueuedAgentRunCandidate>> {
         self.list_dispatchable_agent_runs_scoped(database, limit, 0, "non_batch", None)
+    }
+
+    pub(crate) fn list_dispatchable_non_batch_agent_runs_page(
+        &self,
+        database: &Database,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<QueuedAgentRunCandidate>> {
+        self.list_dispatchable_agent_runs_scoped(database, limit, offset, "non_batch", None)
     }
 
     pub fn load_dispatchable_agent_run(
@@ -2961,7 +3045,7 @@ impl ExecutionRuntimeService {
         agent_run_id: &str,
         execution_epoch: i64,
     ) -> Result<()> {
-        database.connection().execute(
+        let changed = database.connection().execute(
             "UPDATE agent_run SET cancel_acknowledged_at = ?3, updated_at = ?3
              WHERE id = ?1 AND execution_epoch = ?2
                AND status IN ('succeeded', 'failed', 'cancelled')
@@ -2972,6 +3056,10 @@ impl ExecutionRuntimeService {
                 chrono::Utc::now().to_rfc3339()
             ],
         )?;
+        if changed > 0 {
+            database.execution_wake.runs.notify_one();
+            database.execution_wake.delivery.notify_one();
+        }
         Ok(())
     }
 
@@ -4347,6 +4435,7 @@ impl ExecutionRuntimeService {
         if !matches!(protocol_version, 2 | 3) {
             anyhow::bail!("controlled shutdown cycle requires protocol version 2 or 3");
         }
+        let changes_before = database.connection().total_changes();
         let transaction = database
             .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -4368,6 +4457,9 @@ impl ExecutionRuntimeService {
             anyhow::bail!("controlled shutdown cycle has a conflicting protocol version");
         }
         transaction.commit()?;
+        if database.connection().total_changes() != changes_before {
+            database.execution_wake.execution_changed();
+        }
         Ok(())
     }
 
@@ -4442,6 +4534,7 @@ impl ExecutionRuntimeService {
         complete_cycle: bool,
         prior_settlement_counts: (usize, usize),
     ) -> Result<ControlledShutdownCycleSettlement> {
+        let changes_before = database.connection().total_changes();
         let transaction = database
             .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -4468,6 +4561,9 @@ impl ExecutionRuntimeService {
         }
         if cycle.1.is_some() {
             transaction.commit()?;
+            if database.connection().total_changes() != changes_before {
+                database.execution_wake.execution_changed();
+            }
             crate::execution_text::flush_settled(database)?;
             return Ok(ControlledShutdownCycleSettlement {
                 core_generation: core_generation.to_string(),
@@ -4592,6 +4688,9 @@ impl ExecutionRuntimeService {
             }
         }
         transaction.commit()?;
+        if database.connection().total_changes() != changes_before {
+            database.execution_wake.execution_changed();
+        }
         crate::execution_text::flush_settled(database)?;
         Ok(ControlledShutdownCycleSettlement {
             core_generation: core_generation.to_string(),
@@ -4620,6 +4719,7 @@ impl ExecutionRuntimeService {
             anyhow::bail!("planned shutdown terminal permit does not match the terminal target");
         }
 
+        let changes_before = database.connection().total_changes();
         let transaction = database
             .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -4645,6 +4745,9 @@ impl ExecutionRuntimeService {
                 )?
             };
             transaction.commit()?;
+            if database.connection().total_changes() != changes_before {
+                database.execution_wake.execution_changed();
+            }
             crate::execution_text::flush_settled(database)?;
             return Ok(PlannedShutdownTerminalSettlement {
                 agent_run_id: target.agent_run_id,
@@ -4775,6 +4878,9 @@ impl ExecutionRuntimeService {
             )?
         };
         transaction.commit()?;
+        if database.connection().total_changes() != changes_before {
+            database.execution_wake.execution_changed();
+        }
         crate::execution_text::flush_settled(database)?;
         pump_target_after_run_terminal(database, &terminal.agent_run_id)?;
         Ok(PlannedShutdownTerminalSettlement {
@@ -4857,6 +4963,14 @@ fn settle_failed_agent_run_in_tx(
     if updated != 1 {
         anyhow::bail!("AgentRun changed inside its failure transaction");
     }
+    let native_turn_id: Option<String> = if terminal_resolution_source == Some("runtime_terminal") {
+        transaction.query_row(
+            "SELECT native_input_id FROM runtime_input_delivery WHERE agent_run_id=?1 AND execution_epoch=?2 AND status='accepted'",
+            params![target.agent_run_id, failure.execution_epoch], |row| row.get(0),
+        ).optional()?.flatten()
+    } else {
+        None
+    };
     append_domain_event(
         transaction,
         "agent_run.failed",
@@ -4871,6 +4985,7 @@ fn settle_failed_agent_run_in_tx(
             "manualRetryAllowed": failure.manual_retry_allowed,
             "endingGitObservation": failure.ending_git_observation,
             "terminalResolutionSource": terminal_resolution_source,
+            "nativeTurnId": native_turn_id,
         }),
     )?;
     settle_materialized_delivery_for_agent_run(
@@ -5535,6 +5650,7 @@ fn persist_recipient_free_agent_publication(
             "recipientFree": true,
         }),
     )?;
+    crate::message_changes::record(transaction, &target.camp_id, false, &[]);
     Ok(message_id)
 }
 
@@ -5733,6 +5849,7 @@ fn planned_shutdown_abortive_terminal_facts(
 /// Repair only obsolete manual-retry waits, after startup has settled Run and Delivery recovery.
 /// Run history and pending inputs stay unchanged; the scheduler still owns queue publication.
 pub fn settle_legacy_retry_waits(database: &mut Database) -> Result<()> {
+    let changes_before = database.connection().total_changes();
     let transaction = database.connection_mut().transaction()?;
     let now = chrono::Utc::now().to_rfc3339();
     let turns = {
@@ -5777,6 +5894,9 @@ pub fn settle_legacy_retry_waits(database: &mut Database) -> Result<()> {
         recompute_camp_turn(&transaction, &camp_id, &turn_id, &actor, None, &now)?;
     }
     transaction.commit()?;
+    if database.connection().total_changes() != changes_before {
+        database.execution_wake.execution_changed();
+    }
     Ok(())
 }
 
@@ -6102,6 +6222,7 @@ pub fn recover_legacy_pending_cancellations(database: &mut Database) -> Result<(
     }
 
     let now = chrono::Utc::now().to_rfc3339();
+    let changes_before = database.connection().total_changes();
     let transaction = database.connection_mut().transaction()?;
     let mut settled_run_ids = Vec::new();
     for camp_id in camp_ids {
@@ -6112,6 +6233,9 @@ pub fn recover_legacy_pending_cancellations(database: &mut Database) -> Result<(
         )?);
     }
     transaction.commit()?;
+    if database.connection().total_changes() != changes_before {
+        database.execution_wake.execution_changed();
+    }
     settled_run_ids.sort();
     settled_run_ids.dedup();
     pump_targets_after_runs_terminal(database, &settled_run_ids)?;
@@ -7220,7 +7344,7 @@ mod tests {
                 params![
                     turn_id,
                     crate::execution_budget::CAMP_TURN_EXECUTION_BUDGET_SCHEMA_VERSION,
-                    crate::execution_budget::PRODUCT_MAX_EXECUTION_ELAPSED_SECONDS,
+                    crate::execution_budget::LEGACY_EXECUTION_ELAPSED_SECONDS,
                     crate::execution_budget::PRODUCT_MAX_AGENT_RUN_RESPONSIBILITIES,
                     crate::execution_budget::PRODUCT_MAX_ACCEPTED_A2A,
                     run_ids.len() as i64,
@@ -8765,6 +8889,95 @@ mod tests {
                 panic!("terminal remained ordinary after launch closure")
             }
         }
+    }
+
+    // Distinct regression owner: preserving an old reference must not restore
+    // its credential, overwrite a replacement, or reinterpret dispatched input.
+    #[test]
+    fn failed_session_replacement_retains_reference_without_reviving_old_binding() {
+        let (directory, mut database, _, _, run_id, epoch) =
+            claimed_run_for_planned_shutdown("required");
+        let service = ExecutionRuntimeService::default();
+        let binding = crate::team_tool::TeamToolService::default()
+            .prepare_binding_credential(&mut database, &run_id, epoch, false)
+            .unwrap();
+        database.connection().execute("UPDATE conversation SET native_session_id='recoverable-old-session' WHERE id=(SELECT conversation_id FROM agent_run WHERE id=?1)", [&run_id]).unwrap();
+        let execution = service
+            .load_agent_run_execution(&database, &run_id, epoch)
+            .unwrap()
+            .unwrap();
+        service
+            .record_native_session_continuity_lost(
+                &mut database,
+                &execution,
+                "native_resume",
+                NativeSessionResumeFailure::Ambiguous,
+            )
+            .unwrap();
+        let replacement = crate::team_tool::TeamToolService::default()
+            .prepare_binding_credential(&mut database, &run_id, epoch, true)
+            .unwrap();
+        assert_ne!(replacement.native_binding_id, binding.native_binding_id);
+        assert_ne!(replacement.binding_credential, binding.binding_credential);
+        assert!(
+            service
+                .retain_session_after_failed_replacement(&mut database, &execution)
+                .unwrap()
+        );
+        let retained: (String, String, i64) = database.connection().query_row(
+            "SELECT native_session_id,native_binding_id,native_binding_generation FROM conversation WHERE id=?1",
+            [&execution.conversation_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(
+            retained,
+            (
+                "recoverable-old-session".into(),
+                replacement.native_binding_id,
+                replacement.native_binding_generation
+            )
+        );
+        assert!(
+            !service
+                .retain_session_after_failed_replacement(&mut database, &execution)
+                .unwrap(),
+            "never overwrite a bound session"
+        );
+        // An old epoch has no authority over the current binding, even if empty.
+        database
+            .connection()
+            .execute(
+                "UPDATE conversation SET native_session_id=NULL WHERE id=?1",
+                [&execution.conversation_id],
+            )
+            .unwrap();
+        let mut stale = execution.clone();
+        stale.execution_epoch += 1;
+        assert!(
+            !service
+                .retain_session_after_failed_replacement(&mut database, &stale)
+                .unwrap()
+        );
+        insert_test_runtime_input(&database, &run_id, epoch, "delivery_unknown");
+        assert!(
+            !service
+                .retain_session_after_failed_replacement(&mut database, &execution)
+                .unwrap(),
+            "dispatched unknown input cannot be reinterpreted as failed activation"
+        );
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET status='cancelled',ended_at=datetime('now') WHERE id=?1",
+                [&run_id],
+            )
+            .unwrap();
+        assert!(
+            !service
+                .retain_session_after_failed_replacement(&mut database, &execution)
+                .unwrap()
+        );
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

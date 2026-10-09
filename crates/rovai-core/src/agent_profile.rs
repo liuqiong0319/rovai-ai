@@ -2593,9 +2593,7 @@ impl AgentProfileService {
                     display_name: identity.display_name.clone(),
                     avatar_ref: envelope.payload.avatar_ref.clone(),
                     team_role: identity.team_role.clone(),
-                    professional_responsibilities: identity
-                        .professional_responsibilities
-                        .clone(),
+                    professional_responsibilities: identity.professional_responsibilities.clone(),
                     personality_traits: identity.personality_traits.clone(),
                     creator_agent_id: source.agent_id.clone(),
                     creator_display_name,

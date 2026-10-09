@@ -3,7 +3,7 @@ document_type: version-decisions
 version: v1.72
 authority: decision-rationale
 lifecycle: current
-last_updated: 2026-10-05
+last_updated: 2026-10-09
 ---
 
 # v1.72 版本决定
@@ -355,3 +355,96 @@ D14 的原生来源权威继续保留；用户进一步撤回“保存官方后�
 保存官方后，再用 API 可能需要重新填写，这换取了单一原生配置权威和更少的版本／认证兼容分支。OAuth 不删除，
 共享配置影响如实说明；无法写回的已知有效覆盖在保存时报告。拒绝继续保留两条路径及运行时覆盖，也不采用
 启动前写文件、退出后还原的方案，避免并发进程互相改变配置。前端保存前往返切换必须无损，失败保留全部草稿。
+
+<a id="v1-72-d16"></a>
+## V1.72-D16：继续执行是新的 User 授权，接入现有 Delivery lane
+
+- 状态：accepted
+- 日期：2026-10-07
+- 当前权威：[AgentRun Continuation v2](../../contracts/agent-run-continuation-v2.md)、[Accepted Input Recovery v8](../../contracts/accepted-input-recovery-v8.md)、[Message Delivery v11](../../contracts/message-delivery-v11.md)、[AgentRun Recovery](../../architecture/agent-run-recovery.md)
+
+### 背景与选择
+
+停止不代表效果回滚；旧 Run 的 accepted/unknown 投递不能当作未执行。User 希望保留原目标、工作区，
+由一次明确点击开始新执行，同一失败 Run 可多次尝试且状态独立。选择在命令事务中保存新授权，引用原
+业务输入，并重用当前上下文 builder、命令幂等与唯一队列。一次续做有明确批次边界，不引入新生命周期。
+
+### 后果与替代方案
+
+需要增量迁移表示一条授权 Delivery 对应原多条业务输入，并保留其单 Run 归属约束。旧输入事实不改写，
+清理门禁不放宽。拒绝重置旧 Run、复制冻结投递或单后继链，也不建设恢复协调器、效果对账系统或语义审批器。
+提示词不追加来源 ID、证据和恢复指令。2026-10-08 User 明确要求可用性优先与默认降级，
+替代早期显式新会话确认：继续即授权，兼容时优先恢复，已知不适用则自动新建；实际恢复失败在本次
+输入尚未投递时允许一次新会话尝试。清理和接受后不重放的边界不变，不增加另一套恢复流程。
+
+<a id="v1-72-d17"></a>
+## V1.72-D17：Pending 首条消息原子邀请队外队员
+
+- 状态：accepted
+- 日期：2026-10-08
+- 当前权威：[Pending Camp Activation v5](../../contracts/pending-camp-activation-v5.md)、[Camp Message Send v26](../../contracts/camp-message-send-v26.md)与[Public Camp Composer](../../architecture/camp-composer-draft.md#发送)
+
+User 确认一键草稿也应允许队外 Mention。延伸 D05 的编辑交互，在首消息事务中复用成员写入，
+同时完成邀请、激活与发布；命令正常拒绝也显式撤销暂写成员，再保存拒绝回执。Active 路径仍按 D05。
+
+直接放开 Pending 的单独成员命令会改变空草稿清理和放弃语义；先激活再邀请会留下零消息正式会话。
+选择首消息原子提交保住现有生命周期，也把邀请权限限定在 User inline 输入；并发败方按当前 Active
+名册重验。代价是发送准入与成员写入在事务内组合，须用数据库回归证明拒绝、异常与回放无残留。
+
+
+<a id="v1-72-d18"></a>
+## V1.72-D18：使命提及复用稳定身份，保存与入队原子提交
+
+- 状态：accepted
+- 日期：2026-10-08
+- 当前权威：[Mission v12](../../contracts/mission-v12.md)、[Mission 架构](../../architecture/missions.md#inline-member-references)、[使命板 UI](../../ui/components/mission-board.md#description-member-mentions)
+
+### 背景与选择
+
+User 确认交互稿及模型仍读取 `@名字` 文字后，授权实现、创建 PR 并合入 main。使命描述需要保留每次提及的
+位置与稳定身份，同时允许保存时邀请队外队员。采用文本/个人引用片段，在 Core 同一事务内保存描述与成员关系；
+编辑器复用现有 Composer，模型接口继续返回原有 description 字符串。
+
+### 后果与替代方案
+
+需要一次增量迁移；旧字符串按字面迁移，重命名不会重绑身份。未采用按显示名解析，避免同名、改名和纯文本粘贴
+产生隐式邀请。未复用会话先入队再发消息的跨命令流程，因为使命保存失败必须保持原队伍。成员准入与事件仍复用
+现有 Camp owner；不引入第二套队伍、执行路由或模型正文数组。
+
+<a id="v1-72-d19"></a>
+## V1.72-D19：Mention 只统一模型消息元数据，格式按 Run 冻结
+
+- 状态：accepted
+- 日期：2026-10-09
+- 当前权威：[Message Mentions v1](../../contracts/message-mentions-v1.md)、[ContextManifest v33](../../contracts/context-manifest-evidence-v33.md)、[Camp History v12](../../contracts/camp-history-v12.md)
+
+公开自动输入与 read 需要向模型提供完整目标身份，但两者已有不同的正文、作者字段和恢复证据。
+选择共用已保存目标的 Mention 投影，保留各入口正文；格式切换沿用 Run 的冻结版本，旧回执原样回放。
+这样已有 Session 的后续 Run 能直接生效，旧 Run 未物化的中间态仍可按原格式恢复。
+
+重解析 @文字或查询当前 Lead/队伍会改变历史目标；把切换绑到 Session 会扩大升级、轮换与上下文成本。
+本次均不采用。代价是保留旧 Run formatter 与旧回执的封闭输出分支，并在既有数据库约束中准入新版本；
+不建设第二套名称、预算或格式协商机制。
+
+<a id="v1-72-d20"></a>
+## V1.72-D20：Windows 以当前 Job 活跃数归零解除后继执行门禁
+
+- 状态：accepted
+- 日期：2026-10-09
+- 当前权威：[Managed Runtime Process v2](../../contracts/managed-runtime-process-v2.md#4-ownership-and-termination)、[Windows Desktop Platform](../../architecture/windows-desktop-platform.md#3-managed-processes-and-shutdown)、[Cancellation Settlement v2](../../contracts/cancellation-settlement-v2.md#后续执行与清理)、[Camp 会话工作区](../../ui/components/conversation-workspace.md#public-camp-v160-当前边界)
+
+### 背景与选择
+
+非队长 Claude 完成后，Windows 收尾曾要求 Job 的生命周期累计成员数、完成端口通知和逐成员退出句柄
+全部吻合。普通 Job 通知可能丢失；现场可出现 `ActiveProcesses=0` 而累计 91、通知 90 的状态，
+使已完成 Run 的下一条 Delivery 长期 waiting，直到重启。现改为本次持有的有效 Job 成功查询
+`ActiveProcesses == 0` 即完成资源收尾，提交 ACK 并唤醒现有调度器。用户停止和正常结束使用
+同一判据；查询失败或仍有活动成员只在一次有界预算内重试，并通过现有 worker 局部恢复。
+
+### 后果与替代方案
+
+这是可用性优先的边界：不额外等待所有历史进程对象和在途 I/O 完成；可信原生业务结果
+与 Job 清理分别结算，临时启动文件删除错误不延迟后继执行。保留原子 Job 所有权、
+`KILL_ON_JOB_CLOSE`、精确 Run/epoch 持久回执和会话恢复规则。
+未保留累计计数与通知对账，也未改用 PID 枚举或逐进程句柄补扫；前者依赖不保证送达的消息，
+后两者重新引入历史身份与等待门禁。macOS、Linux 进程管理不随此决定改变。

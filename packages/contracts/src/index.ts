@@ -2518,6 +2518,48 @@ export interface ThreadMessageAroundSnapshot {
   anchorMessageId: string
   sourceAvailable: boolean
   messages: ThreadMessageView[]
+  /** Actual next public row after this bounded window; null means no later row at the read watermark. */
+  nextMessageSequence: number | null
+}
+
+/** Scoped Host invalidation metadata; never a replay of private Core events. */
+export interface ThreadMessageChange {
+  threadId: string
+  indexChanged: boolean
+  unavailableMessageIds?: string[]
+  throughGlobalSequence: number
+}
+export interface ThreadReadInvalidation {
+  resync?: boolean
+  messages?: ThreadMessageChange[]
+}
+
+export interface ThreadUserAnchorIndexParams { threadId: string }
+export type ThreadUserAnchorPreviewParams = ThreadMessageAroundParams
+
+export interface ThreadUserAnchorIndex {
+  schemaVersion: 1
+  threadId: string
+  throughGlobalSequence: number
+  totalCount: number
+  items: ThreadUserAnchor[]
+}
+
+export interface ThreadUserAnchor {
+  messageId: string
+  sequence: number
+  title: string
+  messageVersion: number
+}
+
+export interface ThreadUserAnchorPreview {
+  schemaVersion: 1
+  threadId: string
+  messageId: string
+  throughGlobalSequence: number
+  sourceAvailable: boolean
+  /** Earliest valid direct child Agent reply; null does not imply the question was unanswered. */
+  firstReply: { messageId: string; sequence: number; summary: string; messageVersion: number } | null
 }
 
 export interface ThreadMessageAroundParams {
@@ -2551,6 +2593,7 @@ export interface ThreadMessageFindParams {
 }
 
 interface MessageDeliveryBaseView {
+  continuationRequest?: boolean
   id: string
   messageId: string
   threadTurnId: string | null
@@ -4203,12 +4246,15 @@ export type CoreMethod =
   | 'singleChat.pendingInputs.addSourceAttachmentFromPath'
   | 'singleChat.pendingInputs.edit'
   | 'agentRuns.cancel'
+  | 'agentRuns.continue'
   | 'agentRuns.diagnostic.get'
   | 'executionTrace.export'
   | 'threads.snapshot'
   | 'agentRunFileChanges.get'
   | 'agentRunImages.read'
   | 'thread.messages.page'
+  | 'thread.messages.anchors'
+  | 'thread.messages.anchorPreview'
   | 'thread.messages.around'
   | 'thread.messages.find'
   | 'thread.messages.withdraw'
@@ -4335,12 +4381,16 @@ export interface RovaiApi {
   platform: NodeJS.Platform
 }
 
+export type MissionDescriptionContent = Array<
+  | { kind: 'text'; text: string }
+  | { kind: 'member_mention'; agentId: string }
+>
 export type MissionStatus = 'needs_you' | 'not_started' | 'in_progress' | 'completed'
 export interface MissionInfo { missionId: string; title: string; description: string; status: MissionStatus; sourceMessageId: string | null }
 export interface MissionWorkspaceCleanupView { state: 'cleaning' | 'failed' | 'cleaned'; worktreeRemoved: boolean; branchRemoved: boolean; diagnostic: string | null }
-export interface MissionRecord extends MissionInfo { number: number; hasUnread: boolean; threadId: string; projectPath: string; projectBindingKind: ProjectBindingKind; detailsVersion: number; tags: string[]; attachments: LocalAttachmentSourceView[]; createdAt: string; updatedAt: string; memberAgentIds: string[]; defaultLeadAgentId: string | null; runningAgentIds: string[]; startAvailable: boolean; workspaceEverCreated: boolean; workspaceResourcesPresent: boolean; cleanupAvailable: boolean; workspaceCleanup?: MissionWorkspaceCleanupView }
-export interface MissionCreate { title: string; description: string; projectPath: string; projectBindingKind: ProjectBindingKind; memberAgentIds: string[]; defaultLeadAgentId: string; tags: string[] }
-export interface MissionUpdate { missionId: string; title?: string; description?: string; tags?: string[]; expectedDetailsVersion?: number }
+export interface MissionRecord extends MissionInfo { descriptionContent?: MissionDescriptionContent; number: number; hasUnread: boolean; threadId: string; projectPath: string; projectBindingKind: ProjectBindingKind; detailsVersion: number; tags: string[]; attachments: LocalAttachmentSourceView[]; createdAt: string; updatedAt: string; memberAgentIds: string[]; defaultLeadAgentId: string | null; runningAgentIds: string[]; startAvailable: boolean; workspaceEverCreated: boolean; workspaceResourcesPresent: boolean; cleanupAvailable: boolean; workspaceCleanup?: MissionWorkspaceCleanupView }
+export interface MissionCreate { descriptionContent?: MissionDescriptionContent; title: string; description: string; projectPath: string; projectBindingKind: ProjectBindingKind; memberAgentIds: string[]; defaultLeadAgentId: string; tags: string[] }
+export interface MissionUpdate { descriptionContent?: MissionDescriptionContent; missionId: string; title?: string; description?: string; tags?: string[]; expectedDetailsVersion?: number }
 export interface MissionAttachmentDraft { id: string; file: File; kindHint: 'file' | 'directory' }
 export interface MissionAttachmentsApi {
   create(commandId: string, command: MissionCreate, attachments: MissionAttachmentDraft[]): Promise<StoredCommandResult>

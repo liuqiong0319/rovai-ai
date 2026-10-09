@@ -222,6 +222,10 @@ pub enum Operation {
     Messages,
     #[serde(rename = "thread.messages.around", alias = "camp.messages.around")]
     MessagesAround,
+    #[serde(rename = "thread.messages.anchors")]
+    UserAnchors,
+    #[serde(rename = "thread.messages.anchorPreview")]
+    UserAnchorPreview,
     #[serde(rename = "thread.messages.find", alias = "camp.messages.find")]
     FindMessages,
     #[serde(rename = "tasks.list")]
@@ -276,6 +280,8 @@ pub enum Operation {
     Approval,
     #[serde(rename = "agentRuns.cancel")]
     CancelRun,
+    #[serde(rename = "agentRuns.continue")]
+    ContinueRun,
     #[serde(rename = "commands.reconcile")]
     Reconcile,
     #[serde(rename = "threads.create", alias = "camps.create")]
@@ -500,6 +506,7 @@ impl Operation {
             Self::WithdrawMessage => "camp.messages.withdraw",
             Self::Approval => "action.approvals.resolve",
             Self::CancelRun => "agentRuns.cancel",
+            Self::ContinueRun => "agentRuns.continue",
             Self::Reconcile => "commands.reconcile",
             Self::CampCreate => "camps.create",
             Self::CampCreationDefaults => "camps.creationPreflight",
@@ -534,6 +541,8 @@ impl Operation {
             Self::CampExists => "camps.exists",
             Self::Messages => "camp.messages.page",
             Self::MessagesAround => "camp.messages.around",
+            Self::UserAnchors => "camp.messages.anchors",
+            Self::UserAnchorPreview => "camp.messages.anchorPreview",
             Self::FindMessages => "camp.messages.find",
             Self::Tasks => "tasks.list",
             Self::Task => "tasks.get",
@@ -676,5 +685,22 @@ mod tests {
         let withdraw = serde_json::from_value::<Operation>(json!("camp.messages.withdraw"))
             .expect("User message withdrawal should be admitted by the Web Host");
         assert_eq!(withdraw.method(), "camp.messages.withdraw");
+        for (public, internal) in [
+            ("thread.messages.anchors", "camp.messages.anchors"),
+            (
+                "thread.messages.anchorPreview",
+                "camp.messages.anchorPreview",
+            ),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<Operation>(json!(public))
+                    .unwrap()
+                    .method(),
+                internal
+            );
+        }
+        let continuation =
+            serde_json::from_value::<Operation>(json!("agentRuns.continue")).unwrap();
+        assert_eq!(continuation.method(), "agentRuns.continue");
     }
 }

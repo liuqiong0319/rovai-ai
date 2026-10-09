@@ -1,3 +1,4 @@
+import { useThreadUserAnchorCache } from './useThreadUserAnchors'
 import { hasPendingThreadDraftInput } from './pending-thread-draft'
 import { memberCreationHelper, memberCreationInitialDraft, navigationWithMemberCreationDrafts, type MemberCreationDraft } from './member-creation-flow'
 import { navigationThreadReadState } from './navigation-unread'
@@ -46,6 +47,7 @@ import type {
   MissionAttachmentDraft,
   MissionRecord,
   MissionCreate,
+  MissionDescriptionContent,
   NavigationThreadItem,
   NavigationThreadTarget,
   NavigationThreadRows,
@@ -172,6 +174,7 @@ import { appendLiveRuntimeEventBatch, createLiveRuntimeEventBuffer } from './liv
 export { allNavigationThreads }
 
 const ACTIVE_CAMP_INVALIDATION_EVENTS = new Set([
+  'thread.messages.changed',
   'thread.memberCreated',
   'thread.member.fast.updated',
   'camp.member_added',
@@ -180,6 +183,7 @@ const ACTIVE_CAMP_INVALIDATION_EVENTS = new Set([
   'camp.membership_reconciliation_completed',
   'camp.default_lead_reconciled',
   'agent_run.cancelled',
+  'agent_run.continuation_requested',
   'agent_run.recovery_blocker_resolved',
   'agent_run.runtime_model_observed',
   'agent_run.terminal',
@@ -1018,6 +1022,7 @@ export function BusinessApp({
   startupFeedbackDelayElapsed?: boolean
 }): React.JSX.Element {
   const { client, preferences: uiPreferences, desktop } = environment
+  const userAnchorNavigationFor = useThreadUserAnchorCache(client)
   const interfaceLanguage = useInterfaceLanguage()
   const onboardingLanguageRequest = useRef(0)
   const mobile = useMobileViewport(!desktop)
@@ -1924,7 +1929,7 @@ export function BusinessApp({
       }
       return false
     }
-  }, [clearThreadOpenFeedback, navigationRefreshCoordinator, requestThreadProjection, setThreadSnapshot])
+  }, [clearThreadOpenFeedback, navigationRefreshCoordinator, requestThreadProjection, setThreadSnapshot, userAnchorNavigationFor])
 
   const activateThread = useCallback(async (
     threadId: string,
@@ -2324,6 +2329,7 @@ export function BusinessApp({
     loadNavigation,
     loadOverview,
     requestThreadProjection,
+    userAnchorNavigationFor,
     setThreadSnapshot,
     startupPrerequisitesReady,
     startupSnapshot
@@ -2549,7 +2555,7 @@ export function BusinessApp({
       if (event.method === 'preferences.new_conversation_changed') {
         void uiPreferences.generalPreferences.get().then(setGeneralPreferences).catch((e) => setError(errorMessage(e)))
       }
-      if (event.method === 'members.invalidated' && viewRef.current === 'members') {
+      if (event.method === 'members.invalidated' && (viewRef.current === 'members' || viewRef.current === 'camp')) {
         void loadAgents().catch((nextError) => setError(errorMessage(nextError)))
       }
       if (event.method === 'agent_run.terminal') liveEvents.flush()
@@ -4075,9 +4081,9 @@ export function BusinessApp({
   const missionSource = (messageId: string): void => {
     setNotificationFocus({ requestId: ++notificationFocusSequence.current, kind: 'camp_message', threadTurnId: null, messageId, active: true })
   }
-  async function createMission(draft: Omit<CreateThreadRequest, 'commandId' | 'activationState'>, saveTeam: boolean, definition?: {description: string; start: boolean; tags: string[]; attachments: MissionAttachmentDraft[]}): Promise<void> {
+  async function createMission(draft: Omit<CreateThreadRequest, 'commandId' | 'activationState'>, saveTeam: boolean, definition?: {description: string; descriptionContent: MissionDescriptionContent; start: boolean; tags: string[]; attachments: MissionAttachmentDraft[]}): Promise<void> {
     if (!definition) throw new Error(uiAttribute('缺少使命定义'))
-    const command: MissionCreate = { title: draft.name ?? '', description: definition.description, memberAgentIds: draft.memberAgentIds, defaultLeadAgentId: draft.defaultLeadAgentId, projectBindingKind: draft.workspace ? 'directory' : 'quick_chat', projectPath: draft.workspace?.projectPath ?? '', tags: definition.tags }
+    const command: MissionCreate = { title: draft.name ?? '', description: definition.description, descriptionContent: definition.descriptionContent, memberAgentIds: draft.memberAgentIds, defaultLeadAgentId: draft.defaultLeadAgentId, projectBindingKind: draft.workspace ? 'directory' : 'quick_chat', projectPath: draft.workspace?.projectPath ?? '', tags: definition.tags }
     const attachmentSignature = JSON.stringify(definition.attachments.map(({ id, file, kindHint }) => [id, file.name, file.size, file.lastModified, file.type, kindHint]))
     // Unknown transport outcomes retry the exact command. A different draft cannot
     // accidentally create a second Mission while the first result is unresolved.
@@ -4392,6 +4398,7 @@ export function BusinessApp({
               generalPreferences.executionConsolePlacement
             )}
             snapshot={visibleThreadSnapshot}
+            userAnchorNavigation={userAnchorNavigationFor(activeThreadId)}
             memberCreation={memberCreationDrafts.has(activeThreadId)}
             initialComposerDraft={memberCreationDrafts.get(activeThreadId)?.draft ?? campSnapshotState.initialComposerDraft}
             onPendingDraftChange={updateMemberCreationDraft}

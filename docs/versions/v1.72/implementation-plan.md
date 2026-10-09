@@ -3,7 +3,7 @@ document_type: implementation-plan
 version: v1.72
 authority: version-implementation-and-acceptance
 status: in_progress
-last_updated: 2026-10-07
+last_updated: 2026-10-09
 ---
 
 # v1.72 实施与验收
@@ -1154,3 +1154,93 @@ API 专用 UI/CLI fixture 退役，启动页 UI 回归由既有 settings-workspa
   旧版备份为 `/Applications/Rovai AI.backup-before-remove-custom-api-20261007-9e09d4b1.app`，保留不删除。
 - 日常 App/Helper/Host PID `39161/39165/39166/39167/39168` 安装后均存活，日常数据未改动。
   新版本已安装，当前会话仍运行旧版；退出后应从规范安装路径显式打开新版，不从备份启动。
+
+
+## 2026-10-08 移除 Core legacy heartbeat
+
+用户授权范围为完整迁移消费者并删除全局 500ms 循环，保持既有事务、执行、恢复和渠道重试语义。
+替代入口、保留计时器、测试 owner 和实际结果统一记录在[验收记录](heartbeat-removal-verification.md)。
+普通 batch Scheduler 的 claim owner 与 30 秒恢复入口继续保留；没有新增通用 Job 表、事件总线或持久状态机。
+
+## 2026-10-08 取消普通执行默认 24 小时上限
+
+- 基线为 heartbeat 移除提交 `3e6c22fc`，任务分支 `rovai/unbounded-default-execution`。
+- 公共 `freeze_camp_turn_execution_budget` 对缺省预算与显式 null 均冻结为 schema 2、无 deadline；
+  有限时长保持请求值，正数、时长范围和截止时间溢出仍拒绝。Run/A2A 数量限制继续使用原上限。
+- 核对生产创建路径：Single Chat 直接发送与 Pending 发布共用 `admit_single_chat_message`；
+  普通 batch 消息及其排队发布不创建 CampTurn 预算。没有其他入口补回普通 24 小时默认值。
+- 历史 migration 的 86,400 秒常量改名为 `LEGACY_EXECUTION_ELAPSED_SECONDS`，数值与迁移逻辑不变。
+  不新增 migration、不改写历史或已冻结预算。Automation、评测显式策略及操作超时不变。
+- `process_execution_budgets` 生产逻辑没有修改：继续等待有效 deadline；没有 deadline 时仅等通知。
+- 测试扩展既有 owner，没有新增独立测试：公共预算 owner 验证缺省/null、两天时长、数量上限与溢出；
+  Single Chat 发送、私有终态和 FIFO owner 验证新 queued/running Run 推进两天仍无时间取消；
+  FIFO fixture 的显式两天预算在一天未到期、两天时结算并隔离 Run 一次；原 driver 空闲 owner 在 active
+  schema-2 Turn 下验证两天内任务 poll 与 SQLite VM 操作均无增量。原手动停止、恢复、取消、Automation 超时和
+  v47 历史迁移 owner 用作回归。
+- 隔离回归通过：`pnpm test:rust:pr` 453 项通过、1 项既有真实 Runtime smoke 按声明忽略；
+  `cargo test -p rovai-core --features slow-tests --lib <owner>` 覆盖公共预算 3、Single Chat 9、driver 2、
+  Automation 9、Runtime 34、legacy execution budget 2、Camp Open 3，共 62 项；额外使用
+  `--features legacy-migration-tests` 运行 v47 冻结 owner 1 项，总计 63 项不同定向用例通过。
+  所有定向命令先核对 `-- --list` 非零，重复回归不重复计数。
+- `node --test scripts/lib/qualification-evaluation.test.mjs` 22 项通过；`pnpm docs:test` 10 项通过；
+  `cargo fmt --all --check`、`git diff --check` 通过。
+- 文档门禁使用同基线、包含完整改动的干净验证 worktree，执行 `pnpm docs:check` 与
+  `DOCS_BASE_REF=3e6c22fc pnpm docs:check:ci`；日常工作区的本机原型保持原样。
+  仅使用隔离测试 fixture，不启动日常 App 或真实模型；48 小时推进使用确定性测试时间，并非实机连续运行两天。
+
+
+## 一键草稿邀请队外队员
+
+- Work item：Pending Composer outsider invitations；User 2026-10-08 已确认实现、PR 与合入 main。
+- Worktree：`/Users/murray.xue/VSCodeProjects/opensource/rovai-ai-pending-composer-invitations`。
+- Branch：`rovai/pending-composer-invitations`；Base：`a77b537d59d7cc8c01d520d9fd1d0174a194e1e7`；Governance：none（同 PR 同步当前权威）。
+- Status：ready；前端复用候选/提示，Pending 首发直接提交，Core 复用成员写入并用局部 savepoint 撤销业务拒绝。
+- Rust 新增唯一 owner `collaboration::pending_invitation_tests::pending_invitations_commit_with_first_message_and_roll_back_every_failure`：
+  修复前当前 inline 入口拒绝队外 Atom；既有 legacy Draft 激活 owner 无法覆盖这一入口。此 owner 拥有成员与首发布
+  的跨表原子性，需隔离 SQLite 来证明业务拒绝、SQL 错误、presence trigger、回放和串行首发竞争；归入 `extended-tests`。
+  最小命令：`cargo test -p rovai-core --features extended-tests --lib pending_invitation_tests`。没有删除或停用 Rust owner。
+- Renderer 验收使用生产 ThreadWorkspace 与隔离 Electron transport，覆盖候选、失败保留、本机恢复、成功清空、Active 邀请顺序；
+  不启动 Core 或真实 Runtime。事务事实由上述 SQLite owner 拥有。
+- 规格审查发现成功回执早于名册投影时会丢失续发目标，已修复并补回归：延迟 Active 投影时先清空、保留 continuation，
+  输入、清空、离开及重挂载不再写 Pending presence/discard；投影前阻止误发，投影后无 @ 续发仍指向新队员。
+  激活事实只按成功回执在 transport 生命周期内缓存，不复制成员权威，也不修改本机持久格式。
+- Validation：`pnpm typecheck`、`pnpm test`（Node 334 通过、2 项 Windows 跳过）、
+  最终 `pnpm exec vitest run`（238 文件、2606 项通过）、
+  `cargo test --workspace`（455 通过、1 项既有忽略）、上述定向 Rust owner（1 通过）、
+  `cargo test -p rovai-core --features slow-tests --lib collaboration::slow_tests::`（46 通过）、
+  `pnpm test:composer-input`（28 项既有编辑用例 + 新增生产 Composer 流程）、`pnpm build:desktop`、
+  `DOCS_BASE_REF=a77b537d59d7cc8c01d520d9fd1d0174a194e1e7 pnpm docs:check:ci` 全部通过。
+  同步 main `7f1562f3` 后完整 Rust、JavaScript、类型、构建与文档门再次通过；最终文档 diff 基线为该提交。
+  隔离 Electron 验收覆盖 1040×700 日夜主题及键盘选择；未调用真实模型，也不宣称 Windows 真机验收。
+- Next：review、推送 PR、CI 与合入后清理。
+
+## 2026-10-09 消息 Mention 元数据
+
+按[确认稿 r1](model-context-change-message-mentions.md)实施公开 batch/read 的公共目标投影，
+复用名称与正文、原版本恢复、封闭 Schema、预算与摘要。仅 Agent Output 升至 10；
+Transport/CLI、Bootstrap、非 batch 与 Binding 兼容身份保持。验证记录统一追加在确认稿，避免多份验收状态。
+
+## 2026-10-09 Windows Claude 后继任务排队修复
+
+本节按 [V1.72-D20](decisions.md#v1-72-d20) 取代上文 2026-10-07 Windows Job 回收证明的当前执行要求；
+旧段落保留当时的实现和验收记录，不再要求累计计数、完成端口通知及逐后代句柄退出。
+Windows Managed Process 现在只以本次有效 Job 查询 `ActiveProcesses == 0` 放行。
+Claude 的可信原生成功或失败先结算业务，未确认的 Job 清理保留精确 Run/epoch 门禁并唤醒现有 worker；
+启动临时文件删除失败仅记录诊断，启动时对本 Core 私有 `claude-inputs` 做限定范围的尽力回收。
+用户 Stop 在 Windows 使用五秒单次总预算与既有局部重试；直接排队请求在清理期间保留，
+执行台以清理中／清理未确认重试中代替普通排队提示。macOS/Linux 原有预算保持。
+
+验收以隔离 Windows Core、Thread 和工作区中第二条非队长 Claude 消息实际执行为准，另查
+Stop 后续做、真实工具停止、Job 活跃成员、暂时查询失败、文件删除错误及持久回执门禁。
+定向 owner 为 `managed_process::tests::windows_job_contains_an_immediate_grandchild_after_leader_exit`
+和 `claude::tests::cmd_and_native_roots_keep_both_files_until_the_job_descendants_exit`；真实模型复测
+及未覆盖环境须在合入前记录，不把测试函数返回当作队列验收结果。
+
+隔离实测使用 Windows 10 22H2（19045）、Core 0.4.6 开发构建、Claude Code 2.1.288、
+本机已有的 Claude 默认模型配置；新建独立 Core 数据目录、Thread 和 Git 工作区，没有操作日常 Core。
+非队长 Claude 的第一条执行期间提交第二条：正常结束时两条 Run 均 succeeded，第二条无需重启即启动；
+Stop 场景中取消命令在两次实测中分别用时 26 和 23 毫秒，第一条 cancelled，第二条自动 succeeded，等待 22 秒后
+被取消工具预定的延迟写入没有出现。两组原始报告保存在本次会话附件的
+`claude-final-normal-report.json` 与 `claude-final-stop-report.json`（另保留先前构建的对照报告）。
+这两次真实模型试验使用环境现有的 `bypassPermissions` 默认值；修复没有改变权限配置。
+Windows 11、打包版和其他模型／权限模式尚未在本机验收，Job 查询持续失败需在现场诊断中观察。

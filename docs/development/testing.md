@@ -1,7 +1,7 @@
 ---
 document_type: development-guide
 authority: test-policy-and-command-routing
-last_updated: 2026-10-07
+last_updated: 2026-10-09
 ---
 
 # 测试与 Smoke Test
@@ -89,6 +89,26 @@ Rust owner 分成四个可执行层级；feature gating 只改变日常路由，
 修改 feature-gated owner 时，定向命令必须显式加 `--features extended-tests`；若 owner 同时标为
 `slow-tests`，则使用 `--features slow-tests`。过滤命令显示 `0 tests` 不构成验证证据，提交前先用
 `-- --list` 确认目标 owner 实际进入清单。
+
+## 续做可靠性回归
+
+复用 `managed_process::tests::cancellation_reaps_captured_detached_children_after_parent_exit`，将既有 Linux
+owner 扩展到 macOS，证明捕获后脱离进程组的子进程被回收、无关进程仍存活。Claude 既有初始化失败和
+stdin 中断 owner 增加缺失会话、投递门禁取消；ACP 模型目录 owner 增加恢复成功后的配置 RPC 拒绝。
+`delivery_queue::tests::continuation_rechecks_scope_and_selects_safe_session_at_claim` 增加可信失败终态和
+binding/epoch/native turn 不匹配矩阵；既有 unknown、取消、Task 关联和整批范围断言保留。
+
+新增 `runtime::tests::failed_session_replacement_retains_reference_without_reviving_old_binding` 拥有替代启动
+失败后的持久引用恢复：修复前旧引用清空；须同时验证凭证不复活、旧 epoch/unknown 不准入和新会话不覆盖。
+已有会话选择 owner 不拥有凭证轮换事务，故复用最小 claimed-run SQLite fixture，纯函数不足以证明该 seam。
+新增 `antigravity::tests::stream_input_waits_for_exact_session_and_dispatch_authority` 拥有真实 pipe 的初始化／
+输入边界；输出 parser owner 无法证明输入尚未发送，覆盖明确缺失、非缺失身份冲突、门禁取消、调用方 abort
+和释放后原始字节。使用本地受控子进程，不访问模型或真实用户数据，属于扩展层。
+
+最小命令：`cargo test -p rovai-core --features extended-tests --lib` 后分别过滤以上 owner，以及
+`managed_process::`、`claude::`、`antigravity::`、`acp::`、`planned_shutdown::`、`continuation_`。
+真实模型、透明代理终止原生进程和隔离数据目录的验收单列于
+[续做可靠性验收](../versions/v1.72/continuation-reliability-verification.md)，不以协议夹具替代真实结果。
 
 ## Run 思考反馈
 
@@ -459,8 +479,9 @@ pnpm test:rust:full
 Windows Runtime 改动可用 `Full check` 的 `windows-runtime` scope 单独执行既有 Windows 原生 job，
 其中 Fleet 回收凭据及 Codex 释放策略显式启用 `extended-tests`。该 runner 证据不替代实体 Windows 10/11、
 真实 CLI 账号，或仍由 Unix/macOS 条件编译限定的 Codex/Core 集成测试。
-既有 Managed Process 孙进程 owner 用稳定 handle 验证 Job 计数不能抢先确认退出，并覆盖首次观察后
-新增后代、缺失/重复/非法成员通知；Fleet receipt owner 验证跨 Core 仅凭已持久化回执放行。
+既有 Managed Process 孙进程 owner 验证根进程退出后仍有活跃后代时继续阻塞，以及
+`ActiveProcesses` 归零时直接放行；完成端口通知、累计计数与后代句柄不再是必需条件。
+Fleet receipt owner 继续验证精确 Run/epoch 的持久化回执与跨 Core 恢复边界。
 
 默认 fast suite 保留纯 parser/serde、确定性 policy、常量和最小原子 regression，并以 400 项作为当前
 反馈预算。`extended-tests` 承担大型模块矩阵、SQLite、子进程、并发与跨边界 owner；`slow-tests`
@@ -1046,3 +1067,17 @@ version/auth 零调用及一次正文/零重放。Codex 既有真实 Host owner 
 以及关闭参数被原生协议拒绝时返回错误且不重放。
 最小命令：`cargo test -p rovai-core --features extended-tests --lib camp_fast::`、相同参数的 `claude::`、`codex::`，
 以及 `execution_evidence::tests::` 的字段脱敏、Run/epoch 所属和逻辑执行窗口回归。
+
+
+### 模型消息 Mention 测试准入（2026-10-09）
+
+`camp_content::model_mention_tests` 拥有保存目标的顺序、去重与一次投影名称复用。此前只有正文渲染 owner，
+无法发现正文之外的显式目标丢失或离队目标被过滤；使用三行 profile 的内存 SQLite，不创建完整 Core。
+`context::slow_tests::claimed_legacy_batch_keeps_its_format_after_mention_upgrade` 拥有已领取、未物化 Run 的升级恢复，
+单纯 formatter 断言不能证明数据库新约束允许旧版本物化；复用既有 Run fixture，检查重试字节和摘要。
+`db::message_mentions::tests` 拥有 schema 136 → 137 的 DDL 回滚和冻结证据保留；纯投影测试无法证明事务原子性。
+其余作者、三种 read 模式、旧回执、封闭 Schema、输入大小和非 batch 字段扩展既有 owner，不删除或停用测试。
+
+最小命令为 `cargo test -p rovai-core --lib model_mention_tests`、
+`cargo test -p rovai-core --features slow-tests --lib claimed_legacy_batch_keeps_its_format_after_mention_upgrade`、
+`cargo test -p rovai-core --features extended-tests --lib db::message_mentions::`。

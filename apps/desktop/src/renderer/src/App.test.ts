@@ -2548,6 +2548,8 @@ describe('task event projections', () => {
       }
     }
     expect(composerDraftNeedsContinuationRepair(draft, members, true)).toBe(true)
+    expect(composerDraftNeedsContinuationRepair(draft, [], true)).toBe(true)
+    expect(composerDraftNeedsContinuationRepair(draft, [{ ...members[0], profilePresence: 'present' }], true)).toBe(false)
     expect(composerDraftNeedsContinuationRepair(draft, members, false)).toBe(false)
     expect(composerDraftNeedsContinuationRepair({
       ...draft,
@@ -4065,6 +4067,13 @@ describe('task event projections', () => {
       agentId: 'agent_2',
       messageIds: ['message-waiting-1', 'message-waiting-2']
     }])
+    expect(executionDeliveryQueueBatches([waitingDelivery, { ...secondWaitingDelivery, continuationRequest: true },
+      { ...secondWaitingDelivery, id: 'after', createdAt: '2026-07-28T06:04:00Z' }])).toHaveLength(3)
+    expect(executionDeliveryQueueBatches([
+      { ...waitingDelivery, id: 'a-normal' },
+      { ...waitingDelivery, id: 'z-continuation', continuationRequest: true },
+      { ...waitingDelivery, id: 'b-normal' }
+    ])).toHaveLength(3)
     expect(executionDeliveryQueueBatches([{
       ...waitingDelivery,
       dispatchDisposition: 'gather_captured'

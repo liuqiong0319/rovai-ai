@@ -1,3 +1,4 @@
+import { ContinueAgentRunButton } from './ContinueAgentRunButton'
 import { PendingThreadDraftPersistence } from './pending-thread-draft'
 import { MessageModelSummary, ModelSummaryText, ProfileModelFields } from './ThreadModelInformation'
 import { memberRuntimeConfigurationPresentation, modelSummary, runtimeAdapterLabel } from './runtime-model-presentation'
@@ -26,7 +27,8 @@ import { markdownInlineContentPrefix } from './safe-markdown-model'
 import { ExecutionLatestContext, ExecutionReadingContext, useExecutionWindow } from './useExecutionWindow'
 import { ReturnToLatest } from './ReturnToLatest'
 import { UserMessageAnchors } from './UserMessageAnchors'
-import { userMessageAnchors } from './user-message-anchors'
+import { useThreadUserAnchors } from './useThreadUserAnchors'
+import { mergeNavigationMessages, type ThreadUserAnchorNavigation } from './thread-user-anchor-navigation'
 import { prefersReducedMotion } from './reduced-motion'
 import { isFileFindTarget, useOptionalFileFind } from './FilePreviewFind'
 import { readErrorMessage } from './error-message'
@@ -1630,6 +1632,7 @@ function RevealNotificationConversation({ active, onHidePreview }: { active: boo
 
 export function ThreadWorkspace({
   snapshot,
+  userAnchorNavigation,
   missionBoard = null,
   previewTabsInPane = false,
   suppressExecutionAutoOpen = false,
@@ -1689,6 +1692,7 @@ export function ThreadWorkspace({
   onNotifyError
 }: {
   snapshot: ThreadSnapshot
+  userAnchorNavigation?: ThreadUserAnchorNavigation
   missionBoard?: React.ReactNode
   previewTabsInPane?: boolean
   suppressExecutionAutoOpen?: boolean
@@ -1874,7 +1878,9 @@ export function ThreadWorkspace({
           }
         }
         const continuation = draft.continuationIntent
-        if (continuation) {
+        // A Pending projection can lag an accepted first-send invitation. Only
+        // the Active roster can establish whether that recipient is unavailable.
+        if (continuation && activationStateRef.current === 'active') {
           const member = activeSnapshotRef.current.members.find(
             ({ agentId }) => agentId === continuation.recipient.agentId
           )
@@ -1935,6 +1941,7 @@ export function ThreadWorkspace({
   const attachmentPreparationQueue = useRef<Promise<void>>(Promise.resolve())
   const workspaceShellRef = useRef<HTMLElement>(null)
   const timelineScrollRef = useRef<HTMLDivElement>(null)
+  const historyLoaderRef = useRef<HTMLDivElement>(null)
   const earlierMessageLoadInFlightRef = useRef(false)
   const conversationFindSurfaceRef = useRef<HTMLDivElement>(null)
   const conversationFindInputRef = useRef<HTMLInputElement>(null)
@@ -2196,7 +2203,7 @@ export function ThreadWorkspace({
     })),
     [snapshot.members]
   )
-  const canInviteFromComposer = snapshot.thread.activationState === 'active' && Boolean(onAddMembers)
+  const canInviteFromComposer = snapshot.thread.activationState === 'pending' || Boolean(onAddMembers)
   const composerMentionCandidates = useMemo(() => {
     if (!canInviteFromComposer) return composerRosterMembers
     const activeIds = new Set(snapshot.members
@@ -2448,21 +2455,21 @@ export function ThreadWorkspace({
     () => new Map(executionProcesses.map((process) => [process.agentId, process])),
     [executionProcesses]
   )
-  const visibleThreadMessages = useMemo(() => {
-    const messages = new Map<string, ThreadMessageView>()
-    for (const message of anchoredMessages) {
-      if (!message.missionStart) messages.set(message.id, message)
-    }
-    for (const message of snapshot.messages) {
-      if (!message.missionStart) messages.set(message.id, message)
-    }
-    for (const message of optimisticMessages) {
-      if (!message.missionStart && !messages.has(message.id)) messages.set(message.id, message)
-    }
-    return [...messages.values()].sort((left, right) =>
-      left.sequence - right.sequence || left.id.localeCompare(right.id)
-    )
-  }, [anchoredMessages, optimisticMessages, snapshot.messages])
+  const anchorText = useCallback((message: ThreadMessageView) => message.content?.length
+    ? structuredThreadContentPlainText(message.content, snapshot.members, currentUserName)
+    : message.body, [snapshot.members, currentUserName])
+  const anchorNavigation = useThreadUserAnchors(snapshot.thread.id, client, snapshot.messages, optimisticMessages,
+    JSON.stringify([currentUserName, snapshot.members.map(member => [member.agentId, agents.find(agent => agent.agentId === member.agentId)?.displayName ?? member.displayName])]), anchorText, userAnchorNavigation, workspaceEntrySnapshotReady)
+  const visibleThreadMessages = useMemo(() => mergeNavigationMessages(
+    anchoredMessages, anchorNavigation.navigation.windowMessages(), optimisticMessages, snapshot.messages
+  ).filter(message => !message.missionStart),
+  [anchoredMessages, anchorNavigation.window, anchorNavigation.anchors, anchorNavigation.navigation, optimisticMessages, snapshot.messages])
+  const normalStart = messageHistory?.oldestLoadedSequence ?? snapshot.messages[0]?.sequence ?? null
+  const anchorWindowEnd = anchorNavigation.window?.messages.at(-1)?.sequence ?? null
+  const hasAnchorGap = normalStart !== null && anchorWindowEnd !== null && anchorWindowEnd < normalStart
+    && anchorNavigation.window?.nextMessageSequence != null && anchorNavigation.window.nextMessageSequence < normalStart
+  const anchorWindowStart = anchorNavigation.window?.messages[0]?.sequence ?? null
+  const anchorWindowBeforeNormal = normalStart !== null && anchorWindowStart !== null && anchorWindowStart < normalStart
   const visibleMessageById = useMemo(
     () => new Map(visibleThreadMessages.map((message) => [message.id, message])),
     [visibleThreadMessages]
@@ -2494,6 +2501,8 @@ export function ThreadWorkspace({
       visibleThreadMessages
     ]
   )
+  const historyBoundaryId = anchorWindowBeforeNormal
+    ? conversationTimeline.find(item => item.kind === 'camp_message' && item.message.sequence >= normalStart!)?.id : null
   const latestAgentMessageId = useMemo(() => {
     for (let index = conversationTimeline.length - 1; index >= 0; index -= 1) {
       const item = conversationTimeline[index]
@@ -2503,18 +2512,14 @@ export function ThreadWorkspace({
     }
     return null
   }, [conversationTimeline])
-  const userAnchors = useMemo(() => userMessageAnchors(
-    conversationTimeline.flatMap(item => item.kind === 'camp_message' ? [item.message] : []),
-    snapshot.agentRuns,
-    snapshot.turns,
-    message => message.content?.length
-      ? structuredThreadContentPlainText(message.content, snapshot.members, currentUserName)
-      : message.body
-  ), [conversationTimeline, snapshot.agentRuns, snapshot.turns, snapshot.members, currentUserName])
+  const userAnchors = anchorNavigation.anchors
   const groupingFollowsLatest = useCallback(() => !conversationFind.open
     && (timelineReadingPosition.current?.threadId !== snapshot.thread.id
       || timelineReadingPosition.current.position.followingLatest !== false),
   [conversationFind.open, snapshot.thread.id])
+  useEffect(() => {
+    if (conversationView !== 'conversation' || notificationFocus?.active) anchorNavigation.navigation.cancelNavigation()
+  }, [conversationView, notificationFocus?.requestId, notificationFocus?.active, anchorNavigation.navigation])
   const shortPublicMessages = usePublicMessageLayout(
     timelineScrollRef, conversationTimeline, snapshot.thread.id,
     conversationView === 'conversation', groupingFollowsLatest
@@ -2698,6 +2703,7 @@ export function ThreadWorkspace({
       const flushed = await composerHandle?.flush()
       const draft = flushed?.draft ?? await draftCoordinator.waitForIdle()
       const settlePending = activationStateRef.current === 'pending'
+        && !pendingDraftPersistence.current!.isActivated(snapshot.thread.id)
         ? pendingThreadLeaveRef.current
         : undefined
       let completed = false
@@ -2719,7 +2725,7 @@ export function ThreadWorkspace({
       setComposerPersistenceError(normalized)
       throw normalized
     }
-  }, [draftCoordinator, draftLoadState.state])
+  }, [draftCoordinator, draftLoadState.state, snapshot.thread.id])
 
   useLayoutEffect(() => {
     const threadId = snapshot.thread.id
@@ -2937,6 +2943,7 @@ export function ThreadWorkspace({
   }, [client, focusConversationFindInput, snapshot.thread.id])
 
   const openConversationFind = useCallback((): void => {
+    anchorNavigation.navigation.cancelNavigation()
     if (!conversationFind.open) {
       const timeline = timelineScrollRef.current
       const storedPosition = timelineReadingPosition.current?.threadId === snapshot.thread.id
@@ -2973,7 +2980,7 @@ export function ThreadWorkspace({
       setConversationView('conversation')
     }
     focusConversationFindInput(true)
-  }, [conversationFind.open, focusConversationFindInput, snapshot.thread.id])
+  }, [conversationFind.open, focusConversationFindInput, snapshot.thread.id, anchorNavigation.navigation])
 
   const closeConversationFind = useCallback((restore = true): void => {
     conversationFindRequestGeneration.current += 1
@@ -3026,23 +3033,25 @@ export function ThreadWorkspace({
   const navigateUserAnchor = useCallback((messageId: string): void => {
     const threadId = snapshot.thread.id
     if (conversationFind.open) closeConversationFind(false)
-    // Closing Find changes the reading inset; locate after its layout has committed.
-    window.requestAnimationFrame(() => {
-      const viewport = timelineScrollRef.current
-      if (!viewport || viewport.hidden || mountedThreadId.current !== threadId) return
-      const target = viewport.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(messageId)}"]`)
-      if (!target) return
-      timelineReadingPosition.current = {
-        threadId, position: { scrollTop: viewport.scrollTop, followingLatest: false }
-      }
-      target.focus({ preventScroll: true })
-      viewport.scrollTo({
-        top: Math.max(0, viewport.scrollTop + target.getBoundingClientRect().top
-          - viewport.getBoundingClientRect().top - 18),
-        behavior: prefersReducedMotion() ? 'instant' : 'smooth'
-      })
-    })
-  }, [snapshot.thread.id, conversationFind.open, closeConversationFind])
+    // Stop following before a window mounts; otherwise layout restoration can scroll it away.
+    const viewport = timelineScrollRef.current
+    if (viewport) timelineReadingPosition.current = { threadId,
+      position: { scrollTop: viewport.scrollTop, followingLatest: false } }
+    void anchorNavigation.navigation.locate(messageId, visibleMessageById).then(ticket => {
+      if (ticket === null) return
+      window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+        const viewport = timelineScrollRef.current
+        if (!viewport || viewport.hidden || mountedThreadId.current !== threadId
+          || !anchorNavigation.navigation.currentNavigation(ticket)) return
+        const target = viewport.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(messageId)}"]`)
+        if (!target) return
+        target.focus({ preventScroll: true })
+        viewport.scrollTo({ top: Math.max(0, viewport.scrollTop + target.getBoundingClientRect().top
+          - viewport.getBoundingClientRect().top - 18), behavior: prefersReducedMotion() ? 'instant' : 'smooth' })
+      }))
+    }).catch(error => (onNotifyError ?? onNotify)(readErrorMessage(error)))
+  }, [snapshot.thread.id, conversationFind.open, closeConversationFind, anchorNavigation.navigation,
+    visibleMessageById, onNotifyError, onNotify])
 
   const navigateConversationFind = (direction: 1 | -1): void => {
     const snapshotResult = conversationFind.snapshot
@@ -3298,6 +3307,7 @@ export function ThreadWorkspace({
     const sourceMessageId = continuationIntent?.sourceThreadMessageId ?? null
     if (
       !sourceMessageId
+      || snapshot.thread.activationState === 'pending'
       || continuationRecipientAvailable
       || composerDraft?.replyIntent
       || hasExplicitRecipient
@@ -3313,6 +3323,7 @@ export function ThreadWorkspace({
     autoSuppressedContinuationSourceRef.current = sourceMessageId
     void dismissContinuation(false)
   }, [
+    snapshot.thread.activationState,
     composerDraft?.replyIntent,
     continuationIntent?.sourceThreadMessageId,
     continuationRecipientAvailable,
@@ -3322,6 +3333,7 @@ export function ThreadWorkspace({
   ])
 
   const revealQuote = async (quote: MessageQuoteSnapshot): Promise<void> => {
+    anchorNavigation.navigation.cancelNavigation()
     const threadId = snapshot.thread.id
     if (quote.source.scope !== 'camp' || quote.source.campId !== threadId) throw new Error('quote.owner_mismatch')
     const messageId = quote.source.messageId
@@ -3343,6 +3355,7 @@ export function ThreadWorkspace({
   }
 
   const revealReplyParent = async (messageId: string): Promise<void> => {
+    anchorNavigation.navigation.cancelNavigation()
     setConversationView('conversation')
     const existing = timelineScrollRef.current?.querySelector<HTMLElement>(
       `[data-message-id="${CSS.escape(messageId)}"]`
@@ -4022,12 +4035,13 @@ export function ThreadWorkspace({
         composerMemberMentionIds(routedDraft.content),
         currentSnapshot.members,
         agents,
-        currentSnapshot.thread.activationState === 'active' && Boolean(onAddMembers)
+        currentSnapshot.thread.activationState === 'pending' || Boolean(onAddMembers)
       )
       if (inviteTargets.unavailableAgentIds.length > 0) {
         throw new Error(uiAttribute('提及的队员当前不可接收，请调整后重试。'))
       }
-      if (inviteTargets.inviteAgentIds.length > 0) {
+      // Pending invitations are committed atomically by the first-message command.
+      if (inviteTargets.inviteAgentIds.length > 0 && currentSnapshot.thread.activationState === 'active') {
         if (!onAddMembers) throw new Error(uiAttribute('当前无法邀请队员，请稍后重试。'))
         const outcome = await onAddMembers(inviteTargets.inviteAgentIds)
         addedAgentIds = outcome.addedAgentIds
@@ -4045,6 +4059,9 @@ export function ThreadWorkspace({
       const sendReceipt = await onSend(routedDraft)
       if (!sendReceipt) throw new Error(uiAttribute('消息未被当前 Thread 接受。'))
       sendAccepted = true
+      if (currentSnapshot.thread.activationState === 'pending' && sendReceipt.threadMessageId) {
+        pendingDraftPersistence.current!.acknowledgeActivation(threadId)
+      }
       if (mountedThreadId.current === threadId
         && (sendReceipt.deliveryIds.length || sendReceipt.agentRunIds.length)) {
         setSubmittedExecutionRequests((current) => [...current, {
@@ -4520,6 +4537,48 @@ export function ThreadWorkspace({
     }
   }
 
+  const historyLoader = !conversationFind.open && messageHistory?.hasEarlier && (
+                <div ref={historyLoaderRef} key="normal-history-loader"
+                  className={`camp-history-loader is-${earlierMessageStatus}`}
+                  role={earlierMessageStatus === 'error' ? 'alert' : 'status'}
+                  aria-live={earlierMessageStatus === 'error' ? 'assertive' : 'polite'}
+                  aria-atomic="true"
+                >
+                  {earlierMessageStatus === 'error' ? (
+                    <>
+                      <span className="camp-history-error-message"><UiText zh={"较早消息暂时没有加载"} /></span>
+                      <span className="camp-history-separator" aria-hidden="true">·</span>
+                      <button
+                        className="camp-history-text-button"
+                        type="button"
+                        onClick={() => void loadEarlierMessages()}
+                      ><UiText zh={"重试"} /></button>
+                    </>
+                  ) : (
+                    <button
+                      className="camp-history-text-button"
+                      type="button"
+                      disabled={earlierMessageStatus === 'loading'}
+                      onClick={() => void loadEarlierMessages()}
+                    >
+                      {earlierMessageStatus === 'loading' ? (
+                        <>
+                          <span className="camp-history-spinner" aria-hidden="true" />
+                          <span><UiText zh={"正在加载更早消息…"} /></span>
+                        </>
+                      ) : (
+                        <>
+                          <span aria-hidden="true">↑</span>
+                          <span><UiText zh={"加载更早消息"} /></span>
+                        </>
+                      )}
+                    </button>
+                  )}
+                  <span className="camp-history-separator" aria-hidden="true">·</span>
+                  <span className="camp-history-count"><UiText zh={"已显示 "} />{messageHistory.loadedCount} / {messageHistory.totalCount}<UiText zh={" 条"} /></span>
+                </div>
+              )
+
   const maybeLoadEarlierFromUserInput = (): void => {
     const timeline = timelineScrollRef.current
     if (
@@ -4528,7 +4587,9 @@ export function ThreadWorkspace({
       || conversationFindOpenRef.current
       || earlierMessageStatus !== 'idle'
       || !messageHistory?.hasEarlier
-      || timeline.scrollTop > CAMP_HISTORY_AUTOLOAD_THRESHOLD_PX
+      || !historyLoaderRef.current
+      || Math.abs(historyLoaderRef.current.getBoundingClientRect().bottom
+        - timeline.getBoundingClientRect().top) > CAMP_HISTORY_AUTOLOAD_THRESHOLD_PX
     ) return
 
     void loadEarlierMessages()
@@ -4893,53 +4954,18 @@ export function ThreadWorkspace({
             >
               <div className="timeline-track">
               {missionBoard}
-              {!conversationFind.open && messageHistory?.hasEarlier && (
-                <div
-                  className={`camp-history-loader is-${earlierMessageStatus}`}
-                  role={earlierMessageStatus === 'error' ? 'alert' : 'status'}
-                  aria-live={earlierMessageStatus === 'error' ? 'assertive' : 'polite'}
-                  aria-atomic="true"
-                >
-                  {earlierMessageStatus === 'error' ? (
-                    <>
-                      <span className="camp-history-error-message"><UiText zh={"较早消息暂时没有加载"} /></span>
-                      <span className="camp-history-separator" aria-hidden="true">·</span>
-                      <button
-                        className="camp-history-text-button"
-                        type="button"
-                        onClick={() => void loadEarlierMessages()}
-                      ><UiText zh={"重试"} /></button>
-                    </>
-                  ) : (
-                    <button
-                      className="camp-history-text-button"
-                      type="button"
-                      disabled={earlierMessageStatus === 'loading'}
-                      onClick={() => void loadEarlierMessages()}
-                    >
-                      {earlierMessageStatus === 'loading' ? (
-                        <>
-                          <span className="camp-history-spinner" aria-hidden="true" />
-                          <span><UiText zh={"正在加载更早消息…"} /></span>
-                        </>
-                      ) : (
-                        <>
-                          <span aria-hidden="true">↑</span>
-                          <span><UiText zh={"加载更早消息"} /></span>
-                        </>
-                      )}
-                    </button>
-                  )}
-                  <span className="camp-history-separator" aria-hidden="true">·</span>
-                  <span className="camp-history-count"><UiText zh={"已显示 "} />{messageHistory.loadedCount} / {messageHistory.totalCount}<UiText zh={" 条"} /></span>
-                </div>
-              )}
+              {!anchorWindowBeforeNormal && historyLoader}
               {(() => {
                 const items: JSX.Element[] = []
                 let lastDayKey = ''
                 let previousMessageAuthorKey: string | null = null
                 for (let timelineIndex = 0; timelineIndex < conversationTimeline.length; timelineIndex += 1) {
                   const timelineItem = conversationTimeline[timelineIndex]
+                  if (timelineItem.id === historyBoundaryId) {
+                    if (hasAnchorGap) items.push(<div className="camp-history-gap" role="status" key="anchor-history-gap">{uiAttribute('中间消息尚未加载')}</div>)
+                    if (historyLoader) items.push(historyLoader)
+                    previousMessageAuthorKey = null
+                  }
                   const dayKey = localDayKey(timelineItem.createdAt)
                   if (dayKey && dayKey !== lastDayKey) {
                     lastDayKey = dayKey
@@ -5473,6 +5499,10 @@ export function ThreadWorkspace({
                   items.push(messageElement)
                   previousMessageAuthorKey = messageAuthorKey
                 }
+                if (anchorWindowBeforeNormal && !historyBoundaryId) {
+                  if (hasAnchorGap) items.push(<div className="camp-history-gap" role="status" key="anchor-history-gap">{uiAttribute('中间消息尚未加载')}</div>)
+                  if (historyLoader) items.push(historyLoader)
+                }
                 return items
               })()}
               {!missionBoard && conversationTimeline.length === 0 && snapshot.agentRuns.length === 0 && (
@@ -5491,7 +5521,17 @@ export function ThreadWorkspace({
             </div>
             <UserMessageAnchors key={snapshot.thread.id} anchors={userAnchors}
               viewportRef={timelineScrollRef} enabled={conversationView === 'conversation'}
-              followingLatest={groupingFollowsLatest} onNavigate={navigateUserAnchor} />
+              followingLatest={groupingFollowsLatest} onNavigate={navigateUserAnchor}
+              contentRevision={visibleThreadMessages} previews={anchorNavigation.previews}
+              onPreview={anchorNavigation.navigation.preview}
+              onRetryPreview={id => void anchorNavigation.navigation.readPreview(id)} />
+            {conversationView === 'conversation' && anchorNavigation.status !== 'ready' && <div className="conversation-anchor-index-status" role="status">
+              {anchorNavigation.status === 'loading'
+                ? <span className="sr-only">{uiAttribute('正在加载消息目录…')}</span>
+                : <button className="camp-history-text-button" type="button" onClick={() => void anchorNavigation.navigation.refresh()}>
+                  {uiAttribute('消息目录暂不可用，重试')}
+                </button>}
+            </div>}
             <ReturnToLatest
               viewportRef={timelineScrollRef}
               ownerKey={snapshot.thread.id}
@@ -6212,6 +6252,19 @@ export function runPulseMemberNameLines(
 
 type RunPulseStateShape = ExecutionStatusShape
 
+function pendingRuntimeCleanupLabel(runs: readonly AgentRunView[]): string | null {
+  const pending = runs.find(run =>
+    ['succeeded', 'failed', 'cancelled'].includes(run.status)
+    && run.cancelRequestedAt !== null
+    && run.cancelAcknowledgedAt === null
+  )
+  if (!pending) return null
+  const age = Date.now() - Date.parse(pending.cancelRequestedAt!)
+  return age >= 5_000
+    ? uiAttribute('上次执行清理未确认，正在重试')
+    : uiAttribute('等待上次执行清理')
+}
+
 function runPulseStateShape(run: AgentRunView, stopping: boolean): RunPulseStateShape {
   if (stopping && NON_TERMINAL_RUNS.has(run.status)) return 'cancelling'
   if (run.status === 'running') return 'running'
@@ -6234,11 +6287,15 @@ function runPulseProcessState(
 } {
   const run = preferredAgentProcessRun(process.runs)
   if (run && NON_TERMINAL_RUNS.has(run.status)) {
+    if (run.status === 'queued') {
+      const cleanupLabel = pendingRuntimeCleanupLabel(process.runs)
+      if (cleanupLabel) return { run, label: cleanupLabel, tone: 'attention', shape: 'queued' }
+    }
     const presentation = localizedAgentRunPresentation(run, stopping && NON_TERMINAL_RUNS.has(run.status))
     return { run, label: presentation.label, tone: presentation.tone, shape: runPulseStateShape(run, stopping) }
   }
   if (process.waitingDeliveries.length > 0) {
-    return { run: null, label:uiAttribute("排队中"), tone: 'attention', shape: 'queued' }
+    return { run: null, label: pendingRuntimeCleanupLabel(process.runs) ?? uiAttribute("排队中"), tone: 'attention', shape: 'queued' }
   }
   if (run) {
     const presentation = localizedAgentRunPresentation(run)
@@ -6580,28 +6637,25 @@ export function executionQueueBatches(runs: readonly AgentRunView[]): ExecutionQ
 export function executionDeliveryQueueBatches(
   deliveries: readonly MessageDeliveryView[]
 ): ExecutionDeliveryQueueBatch[] {
-  const byAgent = new Map<string, MessageDeliveryView[]>()
-  for (const delivery of deliveries) {
-    if (!messageDeliveryWaitsInExecutionQueue(delivery)) continue
-    byAgent.set(delivery.recipientAgentId, [
-      ...(byAgent.get(delivery.recipientAgentId) ?? []),
-      delivery
-    ])
+  const byBatch = new Map<string, MessageDeliveryView[]>()
+  const ordinaryBatch = new Map<string, string>()
+  // The snapshot already resolves equal timestamps by the durable queue sequence.
+  const ordered = deliveries.filter(messageDeliveryWaitsInExecutionQueue).slice().sort((left, right) =>
+    left.createdAt.localeCompare(right.createdAt))
+  for (const delivery of ordered) {
+    const agent = delivery.recipientAgentId
+    if (delivery.continuationRequest) ordinaryBatch.delete(agent)
+    const key = delivery.continuationRequest ? delivery.id : ordinaryBatch.get(agent) ?? delivery.id
+    if (!delivery.continuationRequest) ordinaryBatch.set(agent, key)
+    byBatch.set(key, [...(byBatch.get(key) ?? []), delivery])
   }
-  return [...byAgent.entries()].map(([agentId, agentDeliveries]) => {
-    const ordered = agentDeliveries.slice().sort((left, right) =>
-      left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id)
-    )
-    const messageIds = [...new Set(ordered.map((delivery) => delivery.messageId))]
-    return {
-      agentId,
-      deliveries: ordered,
-      messageIds,
-      createdAt: ordered.at(-1)?.createdAt ?? ''
-    }
-  }).sort((left, right) =>
-    right.createdAt.localeCompare(left.createdAt) || left.agentId.localeCompare(right.agentId)
-  )
+  return [...byBatch.values()].map((batch) => ({
+    agentId: batch[0].recipientAgentId,
+    deliveries: batch,
+    messageIds: [...new Set(batch.map((delivery) => delivery.messageId))],
+    createdAt: batch.at(-1)?.createdAt ?? ''
+  })).sort((left, right) =>
+    right.createdAt.localeCompare(left.createdAt) || left.agentId.localeCompare(right.agentId))
 }
 
 function executionRunDurationLabel(run: AgentRunView, now: number): string {
@@ -6758,6 +6812,7 @@ function ExecutionInputList({
   memberById: Map<string, ThreadSnapshot['members'][number]>
   onRevealMessage(messageId: string): void
 }): JSX.Element {
+  const { profile: currentUserProfile } = useCurrentUserProfile()
   return <ol className="execution-input-list">
     {messageIds.map((messageId) => {
       const message = messageById.get(messageId)
@@ -6767,7 +6822,7 @@ function ExecutionInputList({
       const author = message
         ? message.authorType === 'agent'
           ? authorMember?.displayName ?? message.authorId
-          : uiAttribute('你')
+          : currentUserDisplayName(currentUserProfile)
         : uiAttribute('消息')
       const summary = message
         ? message.body || message.attachments.map((item) => item.displayName).join('、')
@@ -6777,7 +6832,7 @@ function ExecutionInputList({
           ? <MemberAvatar agentId={message.authorId} avatarRef={authorMember?.avatarRef ?? null}
               displayName={author} size="execution" decorative />
           : message
-            ? <span className="execution-input-user" aria-hidden="true"><UiText zh={"你"} /></span>
+            ? <CurrentUserAvatar profile={currentUserProfile} className="execution-input-user" />
             : <span className="execution-input-placeholder" aria-hidden="true"><ExecutionBatchIcon /></span>}
         <div>
           <div><strong>{author}</strong><button type="button" onClick={() => onRevealMessage(messageId)}>
@@ -7350,6 +7405,9 @@ function ExecutionDrawer({
                   aria-controls={contentId} onClick={() => toggleRun(run.id)}>
                   <ExecutionCardChevron expanded={expanded} />
                 </button>
+                {run.invocationKind === 'batch' && (run.status === 'failed' || run.status === 'cancelled') && inputMessageIds.length > 0 && (
+                  <ContinueAgentRunButton threadId={threadId} agentRunId={run.id} onError={onFileOpenError} />
+                )}
                 {(stopState === 'available' || stopState === 'stopping' || stopState === 'confirming') && (
                   <button className="is-danger" type="button" aria-label={uiAttribute("终止{0}的本次执行", String(runMemberName))}
                     title={uiAttribute("终止本次执行")} disabled={stopState !== 'available'} onClick={() => stopRun(run)}>
@@ -7401,6 +7459,8 @@ function ExecutionDrawer({
       batch.runs[0]
     )
     const stoppingBatch = batch.runs.some((run) => runStopState(run) !== 'available')
+    const queueLabel = pendingRuntimeCleanupLabel(process.runs)
+      ?? uiAttribute('排队中')
     const contentId = `execution-queue-content-${batch.agentId}`
     const toggle = (): void => setExpandedQueueAgents((current) => {
       const next = new Set(current)
@@ -7431,7 +7491,7 @@ function ExecutionDrawer({
               subject={uiAttribute("排队批次")}
             />
             <span className="execution-run-trailing">
-              <span className="execution-run-metric is-queued"><UiText zh={"排队中"} /></span>
+              <span className="execution-run-metric is-queued">{queueLabel}</span>
               <span className="execution-run-operations">
                 <button type="button" aria-label={expanded ? uiAttribute("收起排队批次") : uiAttribute("展开排队批次")}
                   aria-expanded={expanded} aria-controls={contentId} onClick={toggle}>
@@ -7458,17 +7518,19 @@ function ExecutionDrawer({
   }
 
   const renderDeliveryQueueBatch = (batch: ExecutionDeliveryQueueBatch): JSX.Element => {
-    const expansionKey = `delivery:${batch.agentId}`
+    const expansionKey = `delivery:${batch.deliveries[0].id}`
     const expanded = expandedQueueAgents.has(expansionKey)
     const runMember = memberById.get(batch.agentId)
     const runMemberName = runMember?.displayName ?? batch.agentId
+    const queueLabel = pendingRuntimeCleanupLabel(process.runs)
+      ?? uiAttribute('排队中')
     const sourceMessage = messageById.get(batch.messageIds[0]) ?? null
     const summary = sourceMessage
       ? sourceMessage.body.trim().replace(/\s+/gu, ' ')
         || sourceMessage.attachments.map((item) => item.displayName).join('、')
         || uiAttribute('排队消息')
       : uiAttribute('排队消息')
-    const contentId = `execution-delivery-queue-content-${batch.agentId}`
+    const contentId = `execution-delivery-queue-content-${batch.deliveries[0].id}`
     const toggle = (): void => setExpandedQueueAgents((current) => {
       const next = new Set(current)
       if (next.has(expansionKey)) next.delete(expansionKey)
@@ -7477,7 +7539,7 @@ function ExecutionDrawer({
     })
     return (
       <li className="execution-process-stage status-queued" data-delivery-queue-agent-id={batch.agentId}
-        key={`delivery-queue:${batch.agentId}`}>
+        key={`delivery-queue:${batch.deliveries[0].id}`}>
         <span className="execution-process-node tone-attention state-queued" aria-hidden="true">
           <ExecutionStatusGlyph status="queued" />
         </span>
@@ -7499,7 +7561,7 @@ function ExecutionDrawer({
               subject={uiAttribute("排队消息")}
             />
             <span className="execution-run-trailing">
-              <span className="execution-run-metric is-queued"><UiText zh={"排队中"} /></span>
+              <span className="execution-run-metric is-queued">{queueLabel}</span>
               <span className="execution-run-operations">
                 <button type="button" aria-label={expanded ? uiAttribute("收起排队消息") : uiAttribute("展开排队消息")}
                   aria-expanded={expanded} aria-controls={contentId} onClick={toggle}>
@@ -7523,7 +7585,7 @@ function ExecutionDrawer({
     ...deliveryQueueBatches.map((batch) => ({
       kind: 'delivery_queue' as const,
       createdAt: batch.createdAt,
-      id: batch.agentId,
+      id: batch.deliveries[0].id,
       batch
     }))
   ].sort((left, right) =>

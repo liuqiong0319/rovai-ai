@@ -2,18 +2,36 @@
 mod attachment_paths;
 #[path = "db_member_creation.rs"]
 mod member_creation;
+#[path = "db_message_mentions.rs"]
+mod message_mentions;
 #[path = "db_mission_context.rs"]
 mod mission_context;
+#[path = "db_mission_description.rs"]
+mod mission_description;
 #[path = "db_mission_details.rs"]
 mod mission_details;
 #[path = "db_notification_model.rs"]
 pub(crate) mod notification_model;
 #[path = "db_pending_draft.rs"]
 mod pending_draft;
+#[path = "db_run_continuation.rs"]
+mod run_continuation;
 #[path = "db_thread_names.rs"]
 mod thread_names;
+#[path = "db_user_anchors.rs"]
+mod user_anchors;
 #[path = "db_user_projection.rs"]
 mod user_projection;
+
+#[cfg(all(test, feature = "slow-tests"))]
+pub(crate) fn downgrade_message_mentions_fixture(database: &Database) {
+    message_mentions::downgrade_for_test(database.connection());
+}
+
+#[cfg(all(test, feature = "slow-tests"))]
+pub(crate) fn upgrade_message_mentions_fixture(database: &mut Database) {
+    message_mentions::migrate(database).unwrap();
+}
 
 // Exercise upgrade against the context owner's populated, isolated legacy fixture.
 #[cfg(all(test, feature = "slow-tests"))]
@@ -58,8 +76,8 @@ use crate::database_admission::{
     TicketValidationError,
 };
 use crate::execution_budget::{
-    CAMP_TURN_EXECUTION_BUDGET_SCHEMA_VERSION, PRODUCT_MAX_ACCEPTED_A2A,
-    PRODUCT_MAX_AGENT_RUN_RESPONSIBILITIES, PRODUCT_MAX_EXECUTION_ELAPSED_SECONDS,
+    CAMP_TURN_EXECUTION_BUDGET_SCHEMA_VERSION, LEGACY_EXECUTION_ELAPSED_SECONDS,
+    PRODUCT_MAX_ACCEPTED_A2A, PRODUCT_MAX_AGENT_RUN_RESPONSIBILITIES,
 };
 use crate::member_avatar::{
     BUILTIN_PROFILE_AVATARS, LUOKE_AVATAR_REF, MIANZHI_AVATAR_REF, MUWA_AVATAR_REF, QILU_AVATAR_REF,
@@ -154,6 +172,8 @@ pub struct V2RecoverySummary {
 }
 
 pub struct Database {
+    pub(crate) execution_wake: crate::execution_wake::ExecutionWake,
+    pub(crate) message_changes: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     pub(crate) execution_text: crate::execution_text::ExecutionTextBuffer,
     connection: Connection,
     path: PathBuf,
@@ -313,7 +333,7 @@ impl MainThreadMigrationSource {
 }
 
 pub(crate) const CURRENT_DATA_CONTRACT_VERSION: &str = "v1.72";
-pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 134;
+pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 138;
 const V147_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.54";
 const V147_MIGRATION_SOURCE_PROJECTION_SCHEMA_VERSION: i64 = 96;
 const V145_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.53";
@@ -772,6 +792,10 @@ struct CurrentMigrationState {
     v182: bool,
     v183: bool,
     v184: bool,
+    v185: bool,
+    v186: bool,
+    v187: bool,
+    v188: bool,
 }
 
 impl CurrentMigrationState {
@@ -793,11 +817,43 @@ impl CurrentMigrationState {
     }
 
     fn admits(&self, contract: &str, schema: i64, classifier: &str) -> bool {
+        if self.v188 {
+            let mut previous = *self;
+            previous.v188 = false;
+            return contract == CURRENT_DATA_CONTRACT_VERSION
+                && schema == CURRENT_PROJECTION_SCHEMA_VERSION
+                && self.v187
+                && previous.admits("v1.72", 137, classifier);
+        }
+        if self.v187 {
+            let mut previous = *self;
+            previous.v187 = false;
+            return contract == "v1.72"
+                && schema == 137
+                && self.v186
+                && previous.admits("v1.72", 136, classifier);
+        }
+        if self.v186 {
+            let mut previous = *self;
+            previous.v186 = false;
+            return contract == CURRENT_DATA_CONTRACT_VERSION
+                && schema == 136
+                && self.v185
+                && previous.admits("v1.72", 135, classifier);
+        }
+        if self.v185 {
+            let mut previous = *self;
+            previous.v185 = false;
+            return contract == "v1.72"
+                && schema == 135
+                && self.v184
+                && previous.admits("v1.72", 134, classifier);
+        }
         if self.v184 {
             let mut previous = *self;
             previous.v184 = false;
-            return contract == CURRENT_DATA_CONTRACT_VERSION
-                && schema == CURRENT_PROJECTION_SCHEMA_VERSION
+            return contract == "v1.72"
+                && schema == 134
                 && self.v183
                 && previous.admits("v1.72", 133, classifier);
         }
@@ -3318,6 +3374,10 @@ pub(crate) fn classify_database_contract(
         || (migrations.v181 && !user_projection::schema_matches(connection)?)
         || (migrations.v182 && !member_creation::schema_matches(connection)?)
         || (migrations.v183 && !pending_draft::schema_matches(connection)?)
+        || (migrations.v184 && !run_continuation::schema_matches(connection)?)
+        || (migrations.v185 && !mission_description::schema_matches(connection)?)
+        || (migrations.v186 && !user_anchors::schema_matches(connection)?)
+        || (migrations.v187 && !message_mentions::schema_matches(connection)?)
         || (migrations.v156
             && !migrations.v157
             && !attachment_paths::schema_matches(connection)?
@@ -3590,7 +3650,7 @@ fn camp_message_agent_run_v163_schema_matches(connection: &Connection) -> rusqli
             'context_manifest_v28_only_insert',
             'context_manifest_v29_only_insert',
             'context_manifest_v30_only_insert',
-            'context_manifest_v31_only_insert','context_manifest_v32_only_insert',
+            'context_manifest_v31_only_insert','context_manifest_v32_only_insert','context_manifest_v33_only_insert',
             'context_manifest_quote_profile_insert',
             'runtime_input_delivery_attachment_auth_insert'
         )
@@ -3615,7 +3675,7 @@ fn camp_message_agent_run_v163_schema_matches(connection: &Connection) -> rusqli
             || context_manifest_schema
                 .contains("formatter_version IN (20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30)")
             || (context_manifest_schema
-                .contains("formatter_version IN (20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31)") || context_manifest_schema.contains("formatter_version IN (20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32)")))
+                .contains("formatter_version IN (20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31)") || (context_manifest_schema.contains("formatter_version IN (20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32)") || context_manifest_schema.contains("formatter_version IN (20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33)"))))
         && (context_manifest_schema
             .contains("context_manifest_version IN (19, 20, 21, 22, 23, 24, 25, 26)")
             || context_manifest_schema
@@ -3630,7 +3690,7 @@ fn camp_message_agent_run_v163_schema_matches(connection: &Connection) -> rusqli
             )
             || (context_manifest_schema.contains(
                 "context_manifest_version IN (19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31)",
-            ) || context_manifest_schema.contains("context_manifest_version IN (19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32)")))
+            ) || (context_manifest_schema.contains("context_manifest_version IN (19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32)") || context_manifest_schema.contains("context_manifest_version IN (19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33)"))))
         && (context_manifest_schema.contains("run_facts_schema_version IN (1, 2, 3, 4, 5)")
             || context_manifest_schema.contains("run_facts_schema_version IN (1, 2, 3, 4, 5, 6)")
             || context_manifest_schema
@@ -3667,7 +3727,7 @@ fn default_recipient_mention_v166_schema_matches(
             'agent_run_input_v28_only_insert',
             'agent_run_input_v29_only_insert',
             'agent_run_input_v30_only_insert',
-            'agent_run_input_v31_only_insert','agent_run_input_v32_only_insert',
+            'agent_run_input_v31_only_insert','agent_run_input_v32_only_insert','agent_run_input_v33_only_insert',
             'agent_run_input_context_projection_immutable'
         )
         "#,
@@ -3687,7 +3747,7 @@ fn default_recipient_mention_v166_schema_matches(
             'context_manifest_v28_only_insert',
             'context_manifest_v29_only_insert',
             'context_manifest_v30_only_insert',
-            'context_manifest_v31_only_insert','context_manifest_v32_only_insert',
+            'context_manifest_v31_only_insert','context_manifest_v32_only_insert','context_manifest_v33_only_insert',
             'context_manifest_quote_profile_insert',
             'runtime_input_delivery_attachment_auth_insert'
         )
@@ -3697,7 +3757,7 @@ fn default_recipient_mention_v166_schema_matches(
     )?;
     let new_write_trigger: String = connection
         .query_row(
-            "SELECT COALESCE(sql, '') FROM sqlite_master WHERE type = 'trigger' AND name IN ('context_manifest_v27_only_insert', 'context_manifest_v28_only_insert', 'context_manifest_v29_only_insert', 'context_manifest_v30_only_insert', 'context_manifest_v31_only_insert','context_manifest_v32_only_insert')",
+            "SELECT COALESCE(sql, '') FROM sqlite_master WHERE type = 'trigger' AND name IN ('context_manifest_v27_only_insert', 'context_manifest_v28_only_insert', 'context_manifest_v29_only_insert', 'context_manifest_v30_only_insert', 'context_manifest_v31_only_insert','context_manifest_v32_only_insert','context_manifest_v33_only_insert')",
             [],
             |row| row.get(0),
         )
@@ -3713,6 +3773,27 @@ fn default_recipient_mention_v166_schema_matches(
         [],
         |row| row.get(0),
     )?;
+    if manifest_schema.contains(
+        "context_manifest_version IN (19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33)",
+    ) {
+        return Ok(input_columns == 2
+            && input_guards == 2
+            && triggers == 3
+            && manifest_schema.contains(
+                "formatter_version IN (20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33)",
+            )
+            && manifest_schema
+                .contains("context_delivery_profile_version IN (4, 5, 6, 7, 8, 9, 10)")
+            && new_write_trigger.contains("NEW.context_manifest_version = 33")
+            && new_write_trigger.contains("NEW.context_manifest_version = 28")
+            && new_write_trigger.contains("NEW.context_manifest_version = 30")
+            && new_write_trigger.contains("NEW.context_manifest_version = 27")
+            && new_write_trigger.contains("invocation_kind = 'batch'")
+            && profile_trigger.contains("NEW.context_manifest_version = 31")
+            && profile_trigger.contains("NEW.context_delivery_profile_version = 10")
+            && attachment_trigger
+                .contains("context_manifest_version IN (26, 27, 28, 29, 30, 31, 32, 33)"));
+    }
     if manifest_schema.contains(
         "context_manifest_version IN (19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32)",
     ) {
@@ -4094,6 +4175,9 @@ fn legacy_main_context_source(
         || migrations.v181
         || migrations.v182
         || migrations.v183
+        || migrations.v184
+        || migrations.v185
+        || migrations.v186
         || !migrations.admits(
             "v1.72",
             marker.projection_schema_version,
@@ -4199,9 +4283,12 @@ fn public_history_claim_v174_schema_matches(connection: &Connection) -> rusqlite
         [],
         |row| row.get(0),
     )?;
+    let mentions = message_mentions::schema_matches(connection)?;
     let manifest_guard = schema(
         "trigger",
-        if thread_names {
+        if mentions {
+            "context_manifest_v33_only_insert"
+        } else if thread_names {
             "context_manifest_v32_only_insert"
         } else {
             "context_manifest_v31_only_insert"
@@ -4209,7 +4296,9 @@ fn public_history_claim_v174_schema_matches(connection: &Connection) -> rusqlite
     )?;
     let input_guard = schema(
         "trigger",
-        if thread_names {
+        if mentions {
+            "agent_run_input_v33_only_insert"
+        } else if thread_names {
             "agent_run_input_v32_only_insert"
         } else {
             "agent_run_input_v31_only_insert"
@@ -4242,12 +4331,12 @@ fn public_history_claim_v174_schema_matches(connection: &Connection) -> rusqlite
         && run.contains(
             "claim_has_additional_public_messages INTEGER CHECK(claim_has_additional_public_messages IN (0, 1))",
         )
-        && manifest.contains(if thread_names { "formatter_version IN (20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32)" } else { "formatter_version IN (20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31)" })
-        && manifest.contains(if thread_names { "context_manifest_version IN (19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32)" } else { "context_manifest_version IN (19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31)" })
+        && manifest.contains(if mentions { "formatter_version IN (20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33)" } else if thread_names { "formatter_version IN (20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32)" } else { "formatter_version IN (20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31)" })
+        && manifest.contains(if mentions { "context_manifest_version IN (19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33)" } else if thread_names { "context_manifest_version IN (19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32)" } else { "context_manifest_version IN (19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31)" })
         && manifest.contains(if thread_names { "run_facts_schema_version IN (1, 2, 3, 4, 5, 6, 7, 8, 9)" } else { "run_facts_schema_version IN (1, 2, 3, 4, 5, 6, 7, 8)" })
         && manifest.contains("context_manifest_version = 31 AND formatter_version = 31 AND run_facts_schema_version = 8")
         && manifest.contains("context_manifest_version = 30 AND formatter_version = 30 AND run_facts_schema_version = 7")
-        && input.contains(if thread_names { "context_manifest_version IN (26, 27, 28, 29, 30, 31, 32)" } else { "context_manifest_version IN (26, 27, 28, 29, 30, 31)" })
+        && input.contains(if mentions { "context_manifest_version IN (26, 27, 28, 29, 30, 31, 32, 33)" } else if thread_names { "context_manifest_version IN (26, 27, 28, 29, 30, 31, 32)" } else { "context_manifest_version IN (26, 27, 28, 29, 30, 31)" })
         && manifest_guard.contains("NEW.context_manifest_version = 31 AND NEW.formatter_version = 31")
         && manifest_guard.contains("NEW.run_facts_schema_version = 8 AND NEW.context_delivery_profile_version = 10")
         && manifest_guard.contains("run.claim_previous_public_boundary_sequence IS NOT NULL")
@@ -4257,10 +4346,10 @@ fn public_history_claim_v174_schema_matches(connection: &Connection) -> rusqlite
         && manifest_guard.contains("NEW.context_manifest_version = 29")
         && manifest_guard.contains("NEW.context_manifest_version = 27")
         && manifest_guard.contains("NEW.context_manifest_version = 26")
-        && input_guard.contains(if thread_names { "NEW.context_manifest_version IS NOT 32" } else { "NEW.context_manifest_version IS NOT 31" })
+        && input_guard.contains(if mentions { "NEW.context_manifest_version IS NOT 33" } else if thread_names { "NEW.context_manifest_version IS NOT 32" } else { "NEW.context_manifest_version IS NOT 31" })
         && profile_guard.contains("NEW.context_manifest_version = 31 AND NEW.context_delivery_profile_version = 10")
         && profile_guard.contains("NEW.context_manifest_version = 30 AND NEW.context_delivery_profile_version = 10")
-        && attachment_guard.contains(if thread_names { "context_manifest_version IN (26, 27, 28, 29, 30, 31, 32)" } else { "context_manifest_version IN (26, 27, 29, 30, 31)" }))
+        && attachment_guard.contains(if mentions { "context_manifest_version IN (26, 27, 28, 29, 30, 31, 32, 33)" } else if thread_names { "context_manifest_version IN (26, 27, 28, 29, 30, 31, 32)" } else { "context_manifest_version IN (26, 27, 29, 30, 31)" }))
 }
 
 fn skills_rebuild_v173_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
@@ -4682,7 +4771,7 @@ fn message_quote_v148_schema_matches(connection: &Connection) -> rusqlite::Resul
             return Ok(false);
         }
     }
-    let guards: i64 = connection.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name IN ('context_manifest_v23_only_insert','context_manifest_v24_only_insert','context_manifest_v25_only_insert','context_manifest_v26_only_insert','context_manifest_v27_only_insert','context_manifest_v28_only_insert','context_manifest_v29_only_insert','context_manifest_v30_only_insert','context_manifest_v31_only_insert','context_manifest_v32_only_insert','context_manifest_quote_profile_insert')", [], |row| row.get(0))?;
+    let guards: i64 = connection.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name IN ('context_manifest_v23_only_insert','context_manifest_v24_only_insert','context_manifest_v25_only_insert','context_manifest_v26_only_insert','context_manifest_v27_only_insert','context_manifest_v28_only_insert','context_manifest_v29_only_insert','context_manifest_v30_only_insert','context_manifest_v31_only_insert','context_manifest_v32_only_insert','context_manifest_v33_only_insert','context_manifest_quote_profile_insert')", [], |row| row.get(0))?;
     Ok(guards == 2)
 }
 
@@ -5198,7 +5287,11 @@ fn load_current_migration_state(
                EXISTS(SELECT 1 FROM schema_migration WHERE version = 181),
                EXISTS(SELECT 1 FROM schema_migration WHERE version = 182),
                EXISTS(SELECT 1 FROM schema_migration WHERE version = 183),
-               EXISTS(SELECT 1 FROM schema_migration WHERE version = 184)
+               EXISTS(SELECT 1 FROM schema_migration WHERE version = 184),
+               EXISTS(SELECT 1 FROM schema_migration WHERE version = 185),
+               EXISTS(SELECT 1 FROM schema_migration WHERE version = 186),
+               EXISTS(SELECT 1 FROM schema_migration WHERE version = 187),
+               EXISTS(SELECT 1 FROM schema_migration WHERE version = 188)
         "#,
         [],
         |row| {
@@ -5318,6 +5411,10 @@ fn load_current_migration_state(
                 v182: row.get(112)?,
                 v183: row.get(113)?,
                 v184: row.get(114)?,
+                v185: row.get(115)?,
+                v186: row.get(116)?,
+                v187: row.get(117)?,
+                v188: row.get(118)?,
             })
         },
     )
@@ -6544,6 +6641,8 @@ impl Database {
         connection.execute_batch("PRAGMA query_only = ON")?;
         Ok(Self {
             execution_text: Default::default(),
+            execution_wake: Default::default(),
+            message_changes: None,
             connection,
             path: path.into(),
             runtime_camp_files_root,
@@ -6635,6 +6734,8 @@ impl Database {
         configure_runtime_connection(&connection, &path)?;
         let mut database = Self {
             execution_text: Default::default(),
+            execution_wake: Default::default(),
+            message_changes: None,
             connection,
             path,
             runtime_camp_files_root: runtime_camp_files_root.to_path_buf(),
@@ -6759,6 +6860,8 @@ impl Database {
             })?;
             let mut staged = Self {
                 execution_text: Default::default(),
+                execution_wake: Default::default(),
+                message_changes: None,
                 connection,
                 path: temporary.clone(),
                 runtime_camp_files_root: runtime_camp_files_root.to_path_buf(),
@@ -6832,6 +6935,8 @@ impl Database {
         })?;
         Ok(Self {
             execution_text: Default::default(),
+            execution_wake: Default::default(),
+            message_changes: None,
             connection,
             path: target,
             runtime_camp_files_root: runtime_camp_files_root.to_path_buf(),
@@ -6902,6 +7007,8 @@ impl Database {
         progress("authority_open", started.elapsed());
         let mut database = Self {
             execution_text: Default::default(),
+            execution_wake: Default::default(),
+            message_changes: None,
             connection: connection?,
             path: path.clone(),
             runtime_camp_files_root: runtime_camp_files_root.to_path_buf(),
@@ -6967,6 +7074,8 @@ impl Database {
             })?;
         let mut staged = Self {
             execution_text: Default::default(),
+            execution_wake: Default::default(),
+            message_changes: None,
             connection,
             path: path.to_path_buf(),
             runtime_camp_files_root: runtime_camp_files_root.to_path_buf(),
@@ -7107,6 +7216,8 @@ impl Database {
         )?;
         let mut database = Self {
             execution_text: Default::default(),
+            execution_wake: Default::default(),
+            message_changes: None,
             connection,
             path,
             runtime_camp_files_root: runtime_camp_files_root.to_path_buf(),
@@ -7181,6 +7292,8 @@ impl Database {
         }
         Ok(Self {
             execution_text: Default::default(),
+            execution_wake: Default::default(),
+            message_changes: None,
             connection,
             path,
             runtime_camp_files_root,
@@ -8428,10 +8541,19 @@ impl Database {
                 migration_step!("migration_183", pending_draft::migrate(self));
             }
             if !self.schema_migration_applied(184)? {
-                migration_step!(
-                    "migration_184",
-                    self.migrate_member_confirmation_v184()
-                );
+                migration_step!("migration_184", run_continuation::migrate(self));
+            }
+            if !self.schema_migration_applied(185)? {
+                migration_step!("migration_185", mission_description::migrate(self));
+            }
+            if !self.schema_migration_applied(186)? {
+                migration_step!("migration_186", user_anchors::migrate(self));
+            }
+            if !self.schema_migration_applied(187)? {
+                migration_step!("migration_187", message_mentions::migrate(self));
+            }
+            if !self.schema_migration_applied(188)? {
+                migration_step!("migration_188", self.migrate_member_confirmation_v188());
             }
             if let Err(error) =
                 crate::notification::maintain_notification_episode_retention(self.connection())
@@ -9202,7 +9324,19 @@ impl Database {
             migration_step!("migration_183", pending_draft::migrate(self));
         }
         if !self.schema_migration_applied(184)? {
-            migration_step!("migration_184", self.migrate_member_confirmation_v184());
+            migration_step!("migration_184", run_continuation::migrate(self));
+        }
+        if !self.schema_migration_applied(185)? {
+            migration_step!("migration_185", mission_description::migrate(self));
+        }
+        if !self.schema_migration_applied(186)? {
+            migration_step!("migration_186", user_anchors::migrate(self));
+        }
+        if !self.schema_migration_applied(187)? {
+            migration_step!("migration_187", message_mentions::migrate(self));
+        }
+        if !self.schema_migration_applied(188)? {
+            migration_step!("migration_188", self.migrate_member_confirmation_v188());
         }
         if let Err(error) =
             crate::notification::maintain_notification_episode_retention(self.connection())
@@ -11867,9 +12001,7 @@ impl Database {
     fn migrate_camp_turn_execution_budget_v47(&mut self) -> Result<()> {
         let accepted_at = chrono::Utc::now();
         let deadline_at = accepted_at
-            .checked_add_signed(chrono::Duration::seconds(
-                PRODUCT_MAX_EXECUTION_ELAPSED_SECONDS,
-            ))
+            .checked_add_signed(chrono::Duration::seconds(LEGACY_EXECUTION_ELAPSED_SECONDS))
             .context("failed to derive the v47 legacy CampTurn deadline")?;
         let transaction = self
             .connection
@@ -11907,7 +12039,7 @@ impl Database {
                 CAMP_TURN_EXECUTION_BUDGET_SCHEMA_VERSION,
                 accepted_at.to_rfc3339(),
                 deadline_at.to_rfc3339(),
-                PRODUCT_MAX_EXECUTION_ELAPSED_SECONDS,
+                LEGACY_EXECUTION_ELAPSED_SECONDS,
                 PRODUCT_MAX_AGENT_RUN_RESPONSIBILITIES,
                 PRODUCT_MAX_ACCEPTED_A2A,
             ],
@@ -28713,11 +28845,11 @@ impl Database {
         Ok(())
     }
 
-    /// migration 184: member.create confirmation state machine (preview/event/
+    /// migration 188: member.create confirmation state machine (preview/event/
     /// capability/publish-intent tables) + reversible archived presence status.
-    /// Source v1.72/133; post state v1.72/134 == Current. SQL validated end-to-end against
+    /// Source v1.72/137; post state v1.72/138 == Current. SQL validated end-to-end against
     /// SQLite 3.43.2 (see p0-v24-sql-harness.py in the plan notes).
-    fn migrate_member_confirmation_v184(&mut self) -> Result<()> {
+    fn migrate_member_confirmation_v188(&mut self) -> Result<()> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -28726,9 +28858,9 @@ impl Database {
                 classify_database_contract(&tx)?,
                 DatabaseContractClassification::SupportedMigrationSource(ref marker)
                     if marker.contract_version == "v1.72"
-                        && marker.projection_schema_version == 133
+                        && marker.projection_schema_version == 137
             ),
-            "member confirmation migration requires the v1.72/schema 133 source"
+            "member confirmation migration requires the v1.72/schema 137 source"
         );
         tx.execute_batch(
             r#"
@@ -28840,8 +28972,8 @@ impl Database {
                 resolved_at TEXT
             );
 
-            INSERT INTO schema_migration VALUES (184, datetime('now'));
-            UPDATE rovai_data_contract SET projection_schema_version=134, updated_at=datetime('now') WHERE singleton=1;
+            INSERT INTO schema_migration VALUES (188, datetime('now'));
+            UPDATE rovai_data_contract SET projection_schema_version=138, updated_at=datetime('now') WHERE singleton=1;
             "#,
         )?;
         anyhow::ensure!(
@@ -38963,6 +39095,8 @@ mod tests {
             before,
             "navigation must add no persistent table"
         );
+        // Current read models require the later additive tables as well.
+        database.migrate(false).unwrap();
         assert_eq!(
             serde_json::to_value(
                 crate::read_model::ReadModelService
@@ -39315,7 +39449,7 @@ mod tests {
         assert!(
             old_insert
                 .to_string()
-                .contains("must use ContextManifest v32")
+                .contains("must use ContextManifest v33")
         );
         for (column, invalid) in [
             ("claim_previous_public_boundary_sequence", -1),
@@ -40285,6 +40419,11 @@ mod tests {
         thread_names::migrate(&mut database).unwrap();
         user_projection::migrate(&mut database).unwrap();
         member_creation::migrate(&mut database).unwrap();
+        pending_draft::migrate(&mut database).unwrap();
+        run_continuation::migrate(&mut database).unwrap();
+        mission_description::migrate(&mut database).unwrap();
+        user_anchors::migrate(&mut database).unwrap();
+        message_mentions::migrate(&mut database).unwrap();
         let successor_run_id = claim_waiting_delivery_batches(&mut database, 1)
             .unwrap()
             .pop()
@@ -40367,6 +40506,8 @@ mod tests {
             connection.execute_batch(&format!("CREATE TRIGGER reject_receipt BEFORE INSERT ON schema_migration WHEN NEW.version = {version} BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END;")).unwrap();
             let mut database = Database {
                 execution_text: Default::default(),
+                execution_wake: Default::default(),
+                message_changes: None,
                 connection,
                 path: PathBuf::from("unused-memory-fixture"),
                 runtime_camp_files_root: PathBuf::new(),
@@ -40646,6 +40787,10 @@ mod tests {
             v182: version >= 182,
             v183: version >= 183,
             v184: version >= 184,
+            v185: version >= 185,
+            v186: version >= 186,
+            v187: version >= 187,
+            v188: version >= 188,
         }
     }
 
@@ -40840,6 +40985,30 @@ mod tests {
                 "current",
                 CURRENT_DATA_CONTRACT_VERSION,
                 CURRENT_PROJECTION_SCHEMA_VERSION,
+                188,
+            ),
+            (
+                "v1.72/schema 137 before member confirmation security",
+                "v1.72",
+                137,
+                187,
+            ),
+            (
+                "v1.72/schema 136 before Message Mentions",
+                "v1.72",
+                136,
+                186,
+            ),
+            (
+                "v1.72/schema 135 before direct reply index",
+                "v1.72",
+                135,
+                185,
+            ),
+            (
+                "v1.72/schema 134 before mission member references",
+                "v1.72",
+                134,
                 184,
             ),
             (
@@ -41349,7 +41518,7 @@ mod tests {
         }
 
         assert!(migration_state_through(141).admits("v1.52", 92, V142_CLASSIFIER_VERSION));
-        let current = migration_state_through(184);
+        let current = migration_state_through(188);
         let v092_source = migration_state_through(91);
         let mut missing_intermediate = current;
         missing_intermediate.v84 = false;
@@ -41406,7 +41575,7 @@ mod tests {
         let mut missing_pending_draft = current;
         missing_pending_draft.v183 = false;
         let mut missing_member_confirmation = current;
-        missing_member_confirmation.v184 = false;
+        missing_member_confirmation.v188 = false;
         let rejected = [
             (
                 "current marker without member confirmation security",
@@ -41706,6 +41875,8 @@ mod tests {
             }
             let mut database = Database {
                 execution_text: Default::default(),
+                execution_wake: Default::default(),
+                message_changes: None,
                 connection,
                 path: PathBuf::new(),
                 runtime_camp_files_root: PathBuf::new(),
@@ -41893,7 +42064,7 @@ mod tests {
             )
             .expect("current contract marker should load");
 
-        assert_eq!(state, migration_state_through(182));
+        assert_eq!(state, migration_state_through(187));
         assert!(state.admits(&contract, schema, &classifier));
         assert!(has_admissible_data_contract(
             &directory.join("rovai.sqlite")
@@ -42266,6 +42437,48 @@ mod tests {
         std::fs::remove_dir_all(directory).expect("temporary database should be removable");
     }
 
+    // Historical sources have no mission_description table. Seed their literal
+    // description directly rather than running the current Mission writer on
+    // a schema that has not yet been admitted for current application use.
+    fn seed_legacy_mission(
+        database: &mut Database,
+        title: &str,
+        description: &str,
+        project: String,
+        tags: &[&str],
+    ) -> (String, String) {
+        let created = crate::collaboration::CollaborationService::default()
+            .create_camp(
+                database,
+                &crate::command::CommandEnvelope {
+                    command_id: Uuid::new_v4().to_string(),
+                    actor: crate::command::ActorRef::User {
+                        user_id: "local_user".into(),
+                    },
+                    camp_id: None,
+                    expected_versions: vec![],
+                    execution_epoch: None,
+                    payload: crate::collaboration::CreateThreadCommand::for_test(project),
+                },
+            )
+            .unwrap();
+        let camp = created.result.payload["threadId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mission = format!("rvm_{}", Uuid::now_v7().simple());
+        let connection = database.connection();
+        connection
+            .execute("INSERT INTO mission_number_sequence DEFAULT VALUES", [])
+            .unwrap();
+        let number = connection.last_insert_rowid();
+        connection.execute(
+            "INSERT INTO mission(id,number,camp_id,title,description,status,tags_json,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,'not_started',?6,'created','updated')",
+            rusqlite::params![mission, number, camp, title, description, serde_json::to_string(tags).unwrap()],
+        ).unwrap();
+        (mission, camp)
+    }
+
     // Migration 158 owns atomic schema/receipt admission; the current migration
     // chain must retain opted-out workspace records after Camp cascade. SQL state
     // and restart identity require this isolated DB owner.
@@ -42326,34 +42539,9 @@ mod tests {
             )
             .unwrap();
         let project = database.directory().to_string_lossy().to_string();
-        let result = crate::mission::MissionService::default()
-            .create(
-                &mut database,
-                &crate::command::CommandEnvelope {
-                    command_id: Uuid::new_v4().to_string(),
-                    actor: crate::command::ActorRef::User {
-                        user_id: "local_user".into(),
-                    },
-                    camp_id: None,
-                    expected_versions: vec![],
-                    execution_epoch: None,
-                    payload: crate::mission::CreateMissionCommand {
-                        title: "cleanup".into(),
-                        description: String::new(),
-                        project_path: project,
-                        project_binding_kind: crate::collaboration::ProjectBindingKind::Directory,
-                        member_agent_ids: vec!["agent_1".into()],
-                        default_lead_agent_id: "agent_1".into(),
-                        tags: vec![],
-                        source_attachments: vec![],
-                    },
-                },
-            )
-            .unwrap();
-        let camp = result.result.payload["threadId"].as_str().unwrap();
-        let mission = result.result.payload["missionId"].as_str().unwrap();
+        let (mission, camp) = seed_legacy_mission(&mut database, "cleanup", "", project, &[]);
         database.connection().execute("INSERT INTO mission_workspace(id,mission_id,camp_id,execution_host_id,source_directory,repository_root,git_common_dir,worktree_path,working_directory,base_branch,branch,base_sha,preparation_token,state,diagnostic,created_at,updated_at) VALUES('cleanup',?1,?2,?3,'/fixture/repo','/fixture/repo','/fixture/repo/.git','/fixture/worktree','/fixture/worktree','main','rovai/mission/fixture','base','ownership','ready',NULL,'created','updated')",rusqlite::params![mission,camp,host]).unwrap();
-        crate::collaboration::delete_camp_aggregate(database.connection(), camp).unwrap();
+        crate::collaboration::delete_camp_aggregate(database.connection(), &camp).unwrap();
         assert_eq!(
             database
                 .connection()
@@ -42415,34 +42603,13 @@ mod tests {
         downgrade_current_schema_to_v155_source_for_test(preview.connection());
         preview.migrate_missions_v156().unwrap();
         let preview_project = preview.directory().to_string_lossy().to_string();
-        let created = crate::mission::MissionService::default()
-            .create(
-                &mut preview,
-                &crate::command::CommandEnvelope {
-                    command_id: Uuid::new_v4().to_string(),
-                    actor: crate::command::ActorRef::User {
-                        user_id: "local_user".into(),
-                    },
-                    camp_id: None,
-                    expected_versions: vec![],
-                    execution_epoch: None,
-                    payload: crate::mission::CreateMissionCommand {
-                        title: "preview upgrade".into(),
-                        description: "retain me".into(),
-                        project_path: preview_project,
-                        project_binding_kind: crate::collaboration::ProjectBindingKind::Directory,
-                        member_agent_ids: vec!["agent_1".into()],
-                        default_lead_agent_id: "agent_1".into(),
-                        tags: vec!["compatibility".into()],
-                        source_attachments: vec![],
-                    },
-                },
-            )
-            .unwrap();
-        let preview_mission = created.result.payload["missionId"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let (preview_mission, _) = seed_legacy_mission(
+            &mut preview,
+            "preview upgrade",
+            "retain me",
+            preview_project,
+            &["compatibility"],
+        );
         preview.migrate_dsh_runtime_v157().unwrap();
         preview.migrate_mission_context_v158().unwrap();
         assert!(connection_has_v166_data_contract(preview.connection()).unwrap());
@@ -42466,34 +42633,13 @@ mod tests {
         let mut database = fresh_schema_database_v170_at(&directory);
         let project = directory.join("project");
         std::fs::create_dir_all(&project).unwrap();
-        let created = crate::mission::MissionService::default()
-            .create(
-                &mut database,
-                &crate::command::CommandEnvelope {
-                    command_id: Uuid::new_v4().to_string(),
-                    actor: crate::command::ActorRef::User {
-                        user_id: "local_user".into(),
-                    },
-                    camp_id: None,
-                    expected_versions: vec![],
-                    execution_epoch: None,
-                    payload: crate::mission::CreateMissionCommand {
-                        title: "migration survivor".into(),
-                        description: "retain through schema 162".into(),
-                        project_path: project.to_string_lossy().into_owned(),
-                        project_binding_kind: crate::collaboration::ProjectBindingKind::Directory,
-                        member_agent_ids: vec!["agent_1".into()],
-                        default_lead_agent_id: "agent_1".into(),
-                        tags: vec![],
-                        source_attachments: vec![],
-                    },
-                },
-            )
-            .unwrap();
-        let mission_id = created.result.payload["missionId"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let (mission_id, _) = seed_legacy_mission(
+            &mut database,
+            "migration survivor",
+            "retain through schema 162",
+            project.to_string_lossy().into_owned(),
+            &[],
+        );
         downgrade_current_schema_to_v162_source_for_test(database.connection());
         database
             .connection()
@@ -42631,6 +42777,9 @@ mod tests {
         assert!(database.schema_migration_applied(169).unwrap());
         database.migrate_tool_output_v170().unwrap();
         assert!(connection_has_v170_or_current_data_contract(database.connection()).unwrap());
+        // The current reader is used only after the remaining upgrade chain.
+        drop(database);
+        let database = Database::open(&directory).unwrap();
         let migrated = crate::mission::MissionService::default()
             .get(&database, &mission_id)
             .unwrap()
@@ -43522,7 +43671,7 @@ mod tests {
             )
             .unwrap();
         assert!(manifest_schema.contains(
-            "CHECK(formatter_version IN (20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32))"
+            "CHECK(formatter_version IN (20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33))"
         ));
         let conversation: (Option<String>, Option<String>, i64, i64) = reopened
             .connection()
@@ -43856,7 +44005,7 @@ mod tests {
             )
             .unwrap();
         assert!(manifest_schema.contains(
-            "CHECK(formatter_version IN (20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32))"
+            "CHECK(formatter_version IN (20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33))"
         ));
         assert!(
             manifest_schema
@@ -53818,7 +53967,7 @@ mod tests {
         assert_eq!(budget.0, CAMP_TURN_EXECUTION_BUDGET_SCHEMA_VERSION);
         assert!(chrono::DateTime::parse_from_rfc3339(&budget.1).is_ok());
         assert!(chrono::DateTime::parse_from_rfc3339(&budget.2).is_ok());
-        assert_eq!(budget.3, PRODUCT_MAX_EXECUTION_ELAPSED_SECONDS);
+        assert_eq!(budget.3, LEGACY_EXECUTION_ELAPSED_SECONDS);
         assert_eq!(budget.4, PRODUCT_MAX_AGENT_RUN_RESPONSIBILITIES);
         assert_eq!(budget.5, PRODUCT_MAX_ACCEPTED_A2A);
         assert_eq!(budget.6, 0);
@@ -54193,6 +54342,8 @@ mod tests {
             .unwrap();
         let mut database = Database {
             execution_text: Default::default(),
+            execution_wake: Default::default(),
+            message_changes: None,
             connection,
             path,
             runtime_camp_files_root,
@@ -54530,9 +54681,9 @@ mod tests {
             connection,
             "trigger",
             &[
-                "context_manifest_v32_only_insert",
+                "context_manifest_v33_only_insert",
                 "context_manifest_version_immutable",
-                "agent_run_input_v32_only_insert",
+                "agent_run_input_v33_only_insert",
                 "agent_run_input_context_projection_immutable",
                 "runtime_input_delivery_attachment_auth_insert",
                 "camp_attachment_view_camp_insert",
@@ -54554,6 +54705,8 @@ mod tests {
                 "context_manifest_v21_only_insert",
                 "context_manifest_v29_only_insert",
                 "agent_run_input_v29_only_insert",
+                "context_manifest_v32_only_insert",
+                "agent_run_input_v32_only_insert",
             ],
             false,
         );

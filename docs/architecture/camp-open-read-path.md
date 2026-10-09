@@ -3,12 +3,12 @@ document_type: architecture
 architecture: camp-open-read-path
 authority: desktop-camp-enter-and-progressive-read-boundaries
 status: accepted
-last_updated: 2026-10-02
+last_updated: 2026-10-08
 ---
 
 # Camp Open Read Path 架构
 
-字段与窗口见 [Camp Open Projection v25](../contracts/camp-open-projection-v25.md)与
+字段与窗口见 [Camp Open Projection v26](../contracts/camp-open-projection-v26.md)与
 [Camp Conversation Find v1](../contracts/camp-conversation-find-v1.md)。本架构把“进入会话”、
 “继续阅读”、“查找完整当前会话”和“检查运行详情”分成用途明确的接口，同时保持 SQLite Read Side
 为唯一权威。
@@ -70,8 +70,8 @@ Lead。明确依赖某次写入的读取仍在该写入回执后发起。当前�
 
 取消、成功与失败的普通终态继续由 Domain Command Gateway 在业务事务提交后收尾文本；受控关闭和
 planned-shutdown 的直提交流程在自己的提交后调用同一入口，不在 Adapter 回调重复实现。若业务与回执已提交、
-文本定稿失败，原 block 保留单调到期时间，由既有 `process_agent_run_maintenance` tick 到期尝试一次；无失败或
-尚未到期时只读内存，不扫描 Run/Camp。成功复用 block event 更新执行台，失败有界退避；重试绝不重放业务。
+文本定稿失败，原 block 保留单调到期时间，Core 按最早 `retry_not_before` 安排一次性重试；无失败时不设
+重试 timer，尚未到期不扫描 Run/Camp。成功复用 block event 更新执行台，失败有界退避；重试绝不重放业务。
 该进程内状态不承诺跨重启恢复尚未持久化的正文。
 
 ```text
@@ -131,6 +131,20 @@ Navigation 从 camp 的活动/完成摘要读取，正常刷新不再聚合历�
 当前 Snapshot 清空，也不提前切换 route。普通请求在 400 ms 内不呈现 loading，超过预算只在目标导航行
 显示非阻塞进度。schema mismatch、Core restart、Camp mismatch 或 sequence regression 使缓存失效。
 Renderer 不通过 event replay 补齐权威对象。
+
+## 用户消息目录与定位窗口
+
+进入 Thread 时先取得并展示正文首屏，再由页面独立读取完整用户目录；同一有效目录请求合并，不在激活／恢复时预取。
+Core 仅选择直接 reply 到目标用户消息的首条有效队员回复，悬浮／聚焦后才读取一个摘要，不使用 Run／Turn 推断。详见 [全会话导航合同](../contracts/camp-open-projection-v26.md)。
+正文保持原有连续分页。Renderer 的锚点局部模块持有目录、访问过的预览与单个可替换定位窗口；不把 around 消息
+回填到正常正文 coverage。只在展示层按 ID/版本合并；读取窗口与真实 next-row 边界证明缺口，分页入口和自动加载
+均留在正常连续区间之前。已有通知、引用、查找读取不扩展成统一窗口框架。
+
+目录材料和水位在同一读事务取得，释放共享 Database 锁后再格式化；直接回复通过 reply 等值前缀组合索引定位。
+旧目录可继续显示，resync／相关失效立即撤销缓存定位可信度，最新有效目录才恢复；缓存点击不主动清除承载目标的窗口。
+
+实际消息写入在同步事务作用域收集最小变化提示，提交成功后沿既有 Host output / Web SSE 发送；无关命令不反查事件范围。
+标题目录只响应用户可导航状态与名称变化，Agent 回复使已访问预览失效。提交后提示和读取水位仅负责新旧响应隔离，不把全局执行事件当作目录版本。
 
 ## Execution window flow
 
@@ -193,7 +207,7 @@ Memory 仍分别拥有读取与错误状态，但冷启动可见反馈共用不�
 
 - [Core 受管内容不变量](foundational-invariants.md#core-managed-content)
 - [协作与执行准入不变量](foundational-invariants.md#collaboration-admission)
-- [Camp Open Projection v25](../contracts/camp-open-projection-v25.md)
+- [Camp Open Projection v26](../contracts/camp-open-projection-v26.md)
 - [Camp Conversation Find v1](../contracts/camp-conversation-find-v1.md)
 - [Desktop Navigation Refresh](desktop-navigation-refresh.md)
 
