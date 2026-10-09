@@ -12,13 +12,16 @@ import {
   CLICK_COMMAND,
   COMMAND_PRIORITY_HIGH,
   CUT_COMMAND,
+  CUT_TAG,
+  COPY_COMMAND,
   FORMAT_TEXT_COMMAND,
+  KEY_ARROW_LEFT_COMMAND,
+  KEY_ARROW_RIGHT_COMMAND,
   KEY_BACKSPACE_COMMAND,
+  KEY_DELETE_COMMAND,
   KEY_ENTER_COMMAND,
   PASTE_COMMAND,
   PASTE_TAG,
-  CUT_TAG,
-  COPY_COMMAND,
   ParagraphNode,
   SET_TEXT_FORMAT_COMMAND,
   configExtension,
@@ -67,6 +70,37 @@ export function getComposerExtensionRuntime(
   return runtimes.get(editor) ?? null
 }
 
+/**
+ * A caret that steps onto a keyboard-selectable DecoratorNode collapses into a
+ * NodeSelection, which has no visible text caret. The plain-text base extension
+ * ignores arrow keys for NodeSelection, so a mention atom would trap the cursor
+ * ("光标消失无法操作"). Mirror the rich-text escape: step the caret off the
+ * selected atom to a visible adjacent text position.
+ */
+export function $moveComposerAtomSelection(direction: 'previous' | 'next'): boolean {
+  const selection = $getSelection()
+  if (!$isNodeSelection(selection)) return false
+  const firstAtom = selection.getNodes().find((node) => $isComposerAtomNode(node))
+  if (!firstAtom) return false
+  if (direction === 'previous') firstAtom.selectPrevious()
+  else firstAtom.selectNext(0, 0)
+  return true
+}
+
+/**
+ * Backspace/Delete on a keyboard-selected mention atom must remove it and leave
+ * a visible RangeSelection. The plain-text base extension only handles
+ * RangeSelection, so without this the browser default would desynchronize the
+ * node tree from the DOM.
+ */
+export function $deleteComposerAtomSelection(): boolean {
+  const selection = $getSelection()
+  if (!$isNodeSelection(selection)) return false
+  if (!selection.getNodes().some((node) => $isComposerAtomNode(node))) return false
+  selection.deleteNodes()
+  return true
+}
+
 export const ComposerAtomExtension = defineExtension({
   name: 'rovai:composer-atom',
   nodes: [ComposerAtomNode],
@@ -103,9 +137,31 @@ export const ComposerCommandExtension = defineExtension({
         runtime.submit()
         return true
       }, COMMAND_PRIORITY_HIGH),
+      editor.registerCommand(KEY_ARROW_LEFT_COMMAND, (event) => {
+        const runtime = runtimes.get(editor)
+        if (!runtime || editor.isComposing()) return false
+        if ($moveComposerAtomSelection('previous')) {
+          event?.preventDefault()
+          return true
+        }
+        return false
+      }, COMMAND_PRIORITY_HIGH),
+      editor.registerCommand(KEY_ARROW_RIGHT_COMMAND, (event) => {
+        const runtime = runtimes.get(editor)
+        if (!runtime || editor.isComposing()) return false
+        if ($moveComposerAtomSelection('next')) {
+          event?.preventDefault()
+          return true
+        }
+        return false
+      }, COMMAND_PRIORITY_HIGH),
       editor.registerCommand(KEY_BACKSPACE_COMMAND, (event) => {
         const runtime = runtimes.get(editor)
         if (!runtime || editor.isComposing()) return false
+        if ($deleteComposerAtomSelection()) {
+          event?.preventDefault()
+          return true
+        }
         const selection = $getSelection()
         if (!$isRangeSelection(selection) || !selection.isCollapsed()) return false
         const anchor = selection.anchor
@@ -118,6 +174,15 @@ export const ComposerCommandExtension = defineExtension({
         event.preventDefault()
         runtime.backspaceAtStart()
         return true
+      }, COMMAND_PRIORITY_HIGH),
+      editor.registerCommand(KEY_DELETE_COMMAND, (event) => {
+        const runtime = runtimes.get(editor)
+        if (!runtime || editor.isComposing()) return false
+        if ($deleteComposerAtomSelection()) {
+          event?.preventDefault()
+          return true
+        }
+        return false
       }, COMMAND_PRIORITY_HIGH),
       editor.registerCommand(CLICK_COMMAND, (event) => {
         const runtime = runtimes.get(editor)

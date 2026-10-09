@@ -5,10 +5,14 @@ import {
   $createNodeSelection,
   $createTextNode,
   $getRoot,
+  $getSelection,
   $isDecoratorNode,
   $isElementNode,
   $isLineBreakNode,
+  $isNodeSelection,
   $isParagraphNode,
+  $isRangeSelection,
+  $isTextNode,
   $setSelection,
   createEditor,
   type LexicalEditor
@@ -21,6 +25,10 @@ import {
   composerDocumentToEditorState,
   editorStateToComposerDocument
 } from './composer-editor-state'
+import {
+  $deleteComposerAtomSelection,
+  $moveComposerAtomSelection
+} from './RovaiComposerExtension'
 
 function createComposerEditor(): LexicalEditor {
   return createEditor({
@@ -184,5 +192,91 @@ describe('Composer Lexical state boundary', () => {
         atom: { type: 'skill', skillId: 'skill-review', nameAtSend: 'review-pr' }
       }]
     })
+  })
+
+  it('moves a caret off a keyboard-selected Atom so the cursor stays visible', () => {
+    const editor = createComposerEditor()
+    editor.update(() => {
+      $replaceEditorWithComposerDocument({
+        version: 2,
+        segments: [
+          { kind: 'atom', atom: { type: 'member', agentId: 'agent-a', labelFallback: '甲' } },
+          { kind: 'text', text: ' ' },
+          { kind: 'atom', atom: { type: 'member', agentId: 'agent-b', labelFallback: '乙' } },
+          { kind: 'text', text: ' ' }
+        ]
+      })
+      const paragraph = $getRoot().getFirstChildOrThrow()
+      if (!$isElementNode(paragraph)) throw new Error('expected paragraph')
+      const secondAtom = paragraph.getChildren()[2]
+      if (!$isComposerAtomNode(secondAtom)) throw new Error('expected second atom')
+      const selection = $createNodeSelection()
+      selection.add(secondAtom.getKey())
+      $setSelection(selection)
+
+      // The arrow escape mirrors the caret step that produced this NodeSelection.
+      expect($moveComposerAtomSelection('previous')).toBe(true)
+      const after = $getSelection()
+      expect($isRangeSelection(after)).toBe(true)
+      if (!$isRangeSelection(after)) return
+      expect(after.isCollapsed()).toBe(true)
+      const node = after.anchor.getNode()
+      expect(node.getType()).toBe('text')
+      expect(node.getTextContent()).toBe(' ')
+      expect(after.anchor.offset).toBe(1)
+    }, { discrete: true })
+  })
+
+  it('deletes a keyboard-selected Atom on Backspace and restores a visible caret', () => {
+    const editor = createComposerEditor()
+    let afterDocument: ComposerDocument = { version: 2, segments: [] }
+    editor.update(() => {
+      $replaceEditorWithComposerDocument({
+        version: 2,
+        segments: [
+          { kind: 'atom', atom: { type: 'member', agentId: 'agent-a', labelFallback: '甲' } },
+          { kind: 'text', text: ' ' },
+          { kind: 'atom', atom: { type: 'member', agentId: 'agent-b', labelFallback: '乙' } },
+          { kind: 'text', text: ' ' }
+        ]
+      })
+      const paragraph = $getRoot().getFirstChildOrThrow()
+      if (!$isElementNode(paragraph)) throw new Error('expected paragraph')
+      const secondAtom = paragraph.getChildren()[2]
+      if (!$isComposerAtomNode(secondAtom)) throw new Error('expected second atom')
+      const selection = $createNodeSelection()
+      selection.add(secondAtom.getKey())
+      $setSelection(selection)
+
+      expect($deleteComposerAtomSelection()).toBe(true)
+      const after = $getSelection()
+      expect($isRangeSelection(after)).toBe(true)
+      if (!$isRangeSelection(after)) return
+      expect(after.isCollapsed()).toBe(true)
+    }, { discrete: true })
+
+    afterDocument = editorStateToComposerDocument(editor.getEditorState())
+    expect(afterDocument.segments.map((segment) => segment.kind)).toEqual(['atom', 'text'])
+    expect(afterDocument.segments[0]).toEqual({
+      kind: 'atom',
+      atom: { type: 'member', agentId: 'agent-a', labelFallback: '甲' }
+    })
+  })
+
+  it('leaves non-atom selections untouched by the atom selection helpers', () => {
+    const editor = createComposerEditor()
+    editor.update(() => {
+      $replaceEditorWithComposerDocument({
+        version: 2,
+        segments: [{ kind: 'text', text: 'hello' }]
+      })
+      const paragraph = $getRoot().getFirstChildOrThrow()
+      if (!$isElementNode(paragraph)) throw new Error('expected paragraph')
+      const text = paragraph.getFirstChild()
+      if (!$isTextNode(text)) throw new Error('expected text')
+      text.select(1, 3)
+      expect($moveComposerAtomSelection('previous')).toBe(false)
+      expect($deleteComposerAtomSelection()).toBe(false)
+    }, { discrete: true })
   })
 })

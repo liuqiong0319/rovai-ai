@@ -10,6 +10,71 @@ import type {
 } from '@contracts'
 
 export const CURRENT_PROJECT_STORAGE_KEY = 'rovai.current-project.v1'
+export const KNOWN_PROJECTS_STORAGE_KEY = 'rovai.known-projects.v1'
+
+export interface KnownProject {
+  projectPath: string
+  name: string
+  openedAt: string
+}
+
+export function parseKnownProjects(value: string | null): KnownProject[] {
+  if (!value) return []
+  try {
+    const parsed = JSON.parse(value) as unknown
+    if (!Array.isArray(parsed)) return []
+    const projects: KnownProject[] = []
+    for (const candidate of parsed) {
+      if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) continue
+      const record = candidate as Record<string, unknown>
+      if (typeof record.projectPath !== 'string' || record.projectPath.length === 0) continue
+      if (typeof record.name !== 'string') continue
+      const openedAt = typeof record.openedAt === 'string' ? record.openedAt : ''
+      if (projects.some((entry) => entry.projectPath === record.projectPath)) continue
+      projects.push({ projectPath: record.projectPath, name: record.name, openedAt })
+    }
+    return projects
+  } catch {
+    return []
+  }
+}
+
+export function readKnownProjects(): KnownProject[] {
+  try {
+    return parseKnownProjects(window.localStorage.getItem(KNOWN_PROJECTS_STORAGE_KEY))
+  } catch {
+    return []
+  }
+}
+
+export function persistKnownProjects(projects: KnownProject[]): void {
+  try {
+    window.localStorage.setItem(KNOWN_PROJECTS_STORAGE_KEY, JSON.stringify(projects))
+  } catch {
+    // The current window still keeps its in-memory list when storage is blocked.
+  }
+}
+
+// Every directory the user opens as a project stays in the project list even
+// before it has any conversation/draft content. Bug reports: an empty project
+// vanished from the list when the user navigated away, and opening a second
+// empty project replaced the first (the Core snapshot only knows projects with
+// visible Camps). Remembering opened projects durably is the display-layer fix.
+export function rememberOpenedProject(workspace: { name: string; projectPath: string }): void {
+  const existing = readKnownProjects().filter(
+    (entry) => entry.projectPath !== workspace.projectPath
+  )
+  persistKnownProjects([{
+    projectPath: workspace.projectPath,
+    name: workspace.name,
+    openedAt: new Date().toISOString()
+  }, ...existing])
+}
+
+export function forgetOpenedProject(projectPath: string): void {
+  const remaining = readKnownProjects().filter((entry) => entry.projectPath !== projectPath)
+  persistKnownProjects(remaining)
+}
 
 export type CurrentProject =
   | { kind: 'quick_chat' }
@@ -217,6 +282,36 @@ export function navigationIncludingCurrentWorkspace(
   return {
     ...navigation,
     projects: [...navigation.projects, emptyProject]
+  }
+}
+
+// Empty (conversation-less) projects the user opened are promoted into the
+// project list so they neither vanish on navigation (Bug1) nor get replaced by
+// a newer open (Bug2). Projects already present in the snapshot (any Camp has
+// made them navigable) and removed projects are left untouched.
+export function navigationWithOpenedProjects(
+  navigation: NavigationSnapshot | null,
+  openedProjects: readonly KnownProject[],
+  removedProjectKeys: ReadonlySet<string>
+): NavigationSnapshot | null {
+  if (!navigation || openedProjects.length === 0) return navigation
+  const existingPaths = new Set(navigation.projects.map((project) => project.projectPath))
+  const missing = openedProjects.filter((entry) =>
+    !existingPaths.has(entry.projectPath)
+    && !removedProjectKeys.has(projectTargetKey(entry.projectPath)))
+  if (missing.length === 0) return navigation
+  const emptyProjects: ProjectNavigationGroup[] = missing.map((entry) => ({
+    projectKey: projectTargetKey(entry.projectPath),
+    name: entry.name,
+    projectPath: entry.projectPath,
+    lastActivityAt: entry.openedAt,
+    lastActivityGlobalSequence: 0,
+    totalCount: 0,
+    recentThreads: []
+  }))
+  return {
+    ...navigation,
+    projects: [...navigation.projects, ...emptyProjects]
   }
 }
 
