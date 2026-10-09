@@ -11,10 +11,12 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { randomUUID } from 'node:crypto'
 import { afterEach, describe, expect, it } from 'vitest'
+import { MEMBER_AVATAR_LIMITS } from '@contracts'
 import {
   inspectImage,
   inspectJpeg,
   inspectMemberAvatarSourceFile,
+  inspectMemberAvatarUploadPng,
   inspectPng,
   MemberAvatarAssetService
 } from './member-avatar-assets'
@@ -64,6 +66,43 @@ describe('member avatar image inspection', () => {
     await expect(inspectMemberAvatarSourceFile(oversizedPixels)).rejects.toThrow(
       'resource limit'
     )
+  })
+
+  it('accepts vendor metadata after IEND only at the upload boundary', async () => {
+    const png = makePng(582, 584)
+    const tail = new Uint8Array(281).fill(0x41)
+    tail.set(new TextEncoder().encode(JSON.stringify({ vendor: 'vivo', meta: 'screenshot' })))
+    const withTail = concat([png, tail])
+
+    // ① Tolerant entry: same PNG passes and reports the exact canonical boundary.
+    const upload = inspectMemberAvatarUploadPng(withTail)
+    expect(upload.iendOffset).toBe(png.byteLength)
+    expect([upload.width, upload.height]).toEqual([582, 584])
+
+    // ② The shared strict parser is unchanged and rejects the same bytes.
+    expect(() => inspectPng(withTail)).toThrow('Invalid PNG member avatar ending')
+    expect(() => inspectImage(withTail)).toThrow('Invalid PNG member avatar ending')
+
+    // ① The upload boundary returns the canonical PNG cropped before it
+    // crosses into the renderer/native decoder.
+    const directory = await temporaryDirectory()
+    const path = join(directory, 'vivo-screenshot.png')
+    await writeFile(path, withTail)
+    const selected = await inspectMemberAvatarSourceFile(path)
+    expect(selected.mediaType).toBe('image/png')
+    expect([selected.inspectedWidth, selected.inspectedHeight]).toEqual([582, 584])
+    expect(selected.byteLength).toBe(png.byteLength)
+    expect(selected.bytes.byteLength).toBe(png.byteLength)
+    expect(Array.from(selected.bytes)).toEqual(Array.from(png))
+  })
+
+  it('keeps the byte cap on the original input including the tail', async () => {
+    const directory = await temporaryDirectory()
+    const path = join(directory, 'oversized-tail.png')
+    const padded = new Uint8Array(MEMBER_AVATAR_LIMITS.selectedFileBytes + 1024)
+    padded.set(makePng(512, 512), 0)
+    await writeFile(path, padded)
+    await expect(inspectMemberAvatarSourceFile(path)).rejects.toThrow('byte limit')
   })
 })
 

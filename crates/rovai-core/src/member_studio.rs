@@ -12,7 +12,9 @@ use crate::{
         AgentProfileService, CreateAgentProfileCommand, MemberCapabilityClaim,
         validate_member_identity_input,
     },
-    command::{ActorRef, CommandEnvelope, CommandExecution, CommandGatewayError, CommandResultStatus},
+    command::{
+        ActorRef, CommandEnvelope, CommandExecution, CommandGatewayError, CommandResultStatus,
+    },
     current_user::CURRENT_USER_ID,
     db::Database,
     member_avatar::{
@@ -373,8 +375,15 @@ pub fn confirm_member_create(
             },
         )
         .optional()?;
-    let Some((owner, scope_kind, scope_id, card_digest, source_run_id, creation_key, preview_expires)) =
-        preview
+    let Some((
+        owner,
+        scope_kind,
+        scope_id,
+        card_digest,
+        source_run_id,
+        creation_key,
+        preview_expires,
+    )) = preview
     else {
         return Err(MemberOperationError {
             code: "member.confirmation_invalid",

@@ -1177,6 +1177,12 @@ impl AgentProfileService {
             .transpose()
     }
 
+    /// Reports whether a member with this display name already exists.
+    pub fn display_name_exists(&self, database: &mut Database, display_name: &str) -> Result<bool> {
+        let transaction = database.connection_mut().transaction()?;
+        profile_display_name_exists(&transaction, display_name, None)
+    }
+
     pub fn reorder_profiles(
         &self,
         database: &mut Database,

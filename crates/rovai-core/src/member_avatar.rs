@@ -293,6 +293,54 @@ fn normalize_selected_avatar(
     Ok(normalized)
 }
 
+/// Validates a run-readable PNG or JPEG avatar file without publishing any
+/// asset. Mirrors the import-time checks so a preview can confirm the file
+/// before any member creation is attempted; nothing is written to the managed
+/// asset store.
+pub fn validate_avatar_file(path: &Path) -> std::result::Result<(), MemberAvatarImportError> {
+    let bytes = read_selected_avatar(path)?;
+    let format = image::guess_format(&bytes)
+        .map_err(|_| MemberAvatarImportError::invalid("Avatar must be a PNG or JPEG image"))?;
+    if !matches!(format, ImageFormat::Png | ImageFormat::Jpeg) {
+        return Err(MemberAvatarImportError::invalid(
+            "Avatar must be a PNG or JPEG image",
+        ));
+    }
+    if format == ImageFormat::Png {
+        reject_animated_png(&bytes)?;
+    }
+    let mut reader = ImageReader::with_format(Cursor::new(&bytes), format);
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAXIMUM_DECODED_EDGE);
+    limits.max_image_height = Some(MAXIMUM_DECODED_EDGE);
+    limits.max_alloc = Some(MAXIMUM_DECODE_ALLOCATION);
+    reader.limits(limits);
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|_| MemberAvatarImportError::invalid("Avatar image could not be decoded"))?;
+    let (decoded_width, decoded_height) = decoder.dimensions();
+    validate_decoded_dimensions(decoded_width, decoded_height)?;
+    if decoder.total_bytes() > MAXIMUM_DECODE_ALLOCATION {
+        return Err(MemberAvatarImportError::invalid(
+            "Avatar image exceeds the decoded resource limit",
+        ));
+    }
+    let orientation = decoder
+        .orientation()
+        .map_err(|_| MemberAvatarImportError::invalid("Avatar orientation is invalid"))?;
+    let mut decoded = DynamicImage::from_decoder(decoder)
+        .map_err(|_| MemberAvatarImportError::invalid("Avatar image could not be decoded"))?;
+    decoded.apply_orientation(orientation);
+    validate_decoded_dimensions(decoded.width(), decoded.height())?;
+    Ok(())
+}
+
+/// Returns the SHA-256 of a selected avatar file without importing any asset.
+pub fn hash_selected_avatar(path: &Path) -> std::result::Result<String, MemberAvatarImportError> {
+    let bytes = read_selected_avatar(path)?;
+    Ok(sha256(&bytes))
+}
+
 /// Reuses creation's decoder and normalization, with an optional explicit crop.
 pub fn prepare_member_avatar(
     data_dir: &Path,
@@ -715,6 +763,22 @@ fn publish_managed_member_avatar(
     })
 }
 
+/// Removes a published managed avatar asset. Used to compensate a member
+/// creation that imported the avatar but failed before the profile was written,
+/// so no orphan asset is left behind.
+pub fn remove_managed_member_avatar(data_dir: &Path, avatar_ref: &str) -> Result<()> {
+    let MemberAvatarReference::Managed(asset_id) = parse_member_avatar_ref(avatar_ref)? else {
+        return Ok(());
+    };
+    let directory = data_dir
+        .join("member-avatars")
+        .join(asset_id.hyphenated().to_string());
+    if !path_exists(&directory)? {
+        return Ok(());
+    }
+    Ok(remove_scoped_temporary_path(&directory)?)
+}
+
 fn validate_decoded_dimensions(
     width: u32,
     height: u32,
@@ -772,12 +836,17 @@ fn reject_animated_png(bytes: &[u8]) -> std::result::Result<(), MemberAvatarImpo
                 "Animated PNG avatars are not supported",
             ));
         }
-        offset = chunk_end;
         if chunk_type == b"IEND" {
-            return (offset == bytes.len()).then_some(()).ok_or_else(|| {
-                MemberAvatarImportError::invalid("Avatar PNG structure is invalid")
-            });
+            // IEND must be empty. Bytes after it are vendor metadata that
+            // real-world decoders ignore and that the re-encode drops on disk.
+            if length != 0 {
+                return Err(MemberAvatarImportError::invalid(
+                    "Avatar PNG structure is invalid",
+                ));
+            }
+            return Ok(());
         }
+        offset = chunk_end;
     }
     Err(MemberAvatarImportError::invalid(
         "Avatar PNG structure is invalid",
@@ -1039,6 +1108,42 @@ mod tests {
         fs::write(path, encode_png(&image).unwrap()).unwrap();
     }
 
+    fn iend_chunk_end(bytes: &[u8]) -> Option<usize> {
+        const PNG_SIGNATURE_BYTES: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+        if !bytes.starts_with(PNG_SIGNATURE_BYTES) {
+            return None;
+        }
+        let mut offset = PNG_SIGNATURE_BYTES.len();
+        while offset < bytes.len() {
+            if offset + 8 > bytes.len() {
+                return None;
+            }
+            let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().ok()?) as usize;
+            let chunk_end = offset.checked_add(8)?.checked_add(length)?.checked_add(4)?;
+            if chunk_end > bytes.len() {
+                return None;
+            }
+            if &bytes[offset + 4..offset + 8] == b"IEND" {
+                return Some(chunk_end);
+            }
+            offset = chunk_end;
+        }
+        None
+    }
+
+    fn iend_chunk_offset(bytes: &[u8]) -> usize {
+        const PNG_SIGNATURE_BYTES: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+        let mut offset = PNG_SIGNATURE_BYTES.len();
+        loop {
+            let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+            let chunk_end = offset + 8 + length + 4;
+            if &bytes[offset + 4..offset + 8] == b"IEND" {
+                return offset;
+            }
+            offset = chunk_end;
+        }
+    }
+
     #[test]
     fn parses_builtin_and_managed_references() {
         assert_eq!(
@@ -1266,6 +1371,73 @@ mod tests {
 
         assert_eq!(error.kind, MemberAvatarImportErrorKind::Invalid);
         assert!(error.to_string().contains("Animated PNG"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reject_animated_png_ignores_trailing_bytes_after_iend() {
+        let mut bytes = encode_png(&DynamicImage::new_rgba8(300, 300)).unwrap();
+        let iend_end = iend_chunk_end(&bytes).unwrap();
+        assert_eq!(iend_end, bytes.len());
+        // Vendor metadata appended after IEND (vivo screenshot case).
+        for index in 0..281 {
+            bytes.push(((index * 37) % 251) as u8);
+        }
+        assert!(reject_animated_png(&bytes).is_ok());
+    }
+
+    #[test]
+    fn malformed_iend_and_truncated_chunks_are_still_rejected() {
+        // IEND with a non-zero length must still be rejected.
+        let mut inflated = encode_png(&DynamicImage::new_rgba8(300, 300)).unwrap();
+        let iend = iend_chunk_offset(&inflated);
+        inflated[iend..iend + 4].copy_from_slice(&4_u32.to_be_bytes());
+        inflated.extend_from_slice(b"DATA");
+        inflated.extend_from_slice(&0_u32.to_be_bytes());
+        assert!(reject_animated_png(&inflated).is_err());
+
+        // A chunk cut short by the file end must still be rejected.
+        let mut truncated = encode_png(&DynamicImage::new_rgba8(300, 300)).unwrap();
+        truncated.truncate(truncated.len() - 4);
+        assert!(reject_animated_png(&truncated).is_err());
+    }
+
+    #[test]
+    fn trailing_metadata_is_imported_and_reencoded_without_residue() {
+        let directory = temporary_directory();
+        let input = directory.join("vivo-trailing.png");
+        let mut bytes = encode_png(&DynamicImage::new_rgba8(582, 584)).unwrap();
+        bytes.extend_from_slice(br#"{"vendor":"vivo","meta":"screenshot"}"#);
+        bytes.extend_from_slice(&[0u8; 281 - 35]);
+        fs::write(&input, bytes.clone()).unwrap();
+
+        // End-to-end import must succeed and re-encode so no tail reaches disk.
+        let asset_id = Uuid::new_v4();
+        let summary = import_managed_member_avatar(&directory, asset_id, &input).unwrap();
+        let asset = directory.join("member-avatars").join(asset_id.to_string());
+        let source = fs::read(asset.join("source.png")).unwrap();
+        let icon = fs::read(asset.join("icon-192.png")).unwrap();
+        assert_eq!(iend_chunk_end(&source), Some(source.len()));
+        assert_eq!(iend_chunk_end(&icon), Some(icon.len()));
+        assert!(reject_animated_png(&source).is_ok());
+        let portrait = read_managed_member_avatar(&directory, &summary.avatar_ref, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!((portrait.width, portrait.height), (582, 584));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn trailing_bytes_cannot_bypass_the_selected_file_byte_cap() {
+        let directory = temporary_directory();
+        let input = directory.join("oversized-tail.png");
+        let mut bytes = encode_png(&DynamicImage::new_rgba8(512, 512)).unwrap();
+        bytes.resize(SELECTED_FILE_BYTES as usize + 1024, 0u8);
+        fs::write(&input, bytes).unwrap();
+
+        let error = import_managed_member_avatar(&directory, Uuid::new_v4(), &input).unwrap_err();
+        assert_eq!(error.kind, MemberAvatarImportErrorKind::Invalid);
+        assert!(error.to_string().contains("no larger than 10 MiB"));
         fs::remove_dir_all(directory).unwrap();
     }
 }

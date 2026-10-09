@@ -29,6 +29,11 @@ type PngInspection = {
   height: number
 }
 
+type MemberAvatarUploadPngInspection = PngInspection & {
+  /** Byte offset just past the final IEND chunk — the canonical PNG boundary. */
+  iendOffset: number
+}
+
 type JpegInspection = {
   mediaType: 'image/jpeg'
   width: number
@@ -245,15 +250,25 @@ export async function inspectMemberAvatarSourceFile(
     filePath,
     MEMBER_AVATAR_LIMITS.selectedFileBytes
   )
-  const inspection = inspectImage(bytes)
+  let inspection: ImageInspection
+  let canonicalBytes = bytes
+  if (hasPrefix(bytes, PNG_SIGNATURE)) {
+    const png = inspectMemberAvatarUploadPng(bytes)
+    inspection = png
+    if (png.iendOffset !== bytes.byteLength) {
+      canonicalBytes = bytes.subarray(0, png.iendOffset)
+    }
+  } else {
+    inspection = inspectJpeg(bytes)
+  }
   validateMemberAvatarDimensions(inspection.width, inspection.height)
   return {
     displayName: basename(filePath),
     mediaType: inspection.mediaType,
-    bytes,
+    bytes: canonicalBytes,
     inspectedWidth: inspection.width,
     inspectedHeight: inspection.height,
-    byteLength: bytes.byteLength
+    byteLength: canonicalBytes.byteLength
   }
 }
 
@@ -263,10 +278,28 @@ export function inspectImage(bytes: Uint8Array): ImageInspection {
 }
 
 export function inspectPng(bytes: Uint8Array): PngInspection {
+  const { iendOffset: _iendOffset, ...inspection } = inspectPngCore(bytes, false)
+  return inspection
+}
+
+/** Member-avatar upload boundary parser. Real-world devices (e.g. vivo phone
+ * screenshots) append vendor metadata after IEND; crop to `iendOffset` before
+ * the bytes cross into a native decoder. The shared `inspectPng` stays strict. */
+export function inspectMemberAvatarUploadPng(
+  bytes: Uint8Array
+): MemberAvatarUploadPngInspection {
+  return inspectPngCore(bytes, true)
+}
+
+function inspectPngCore(
+  bytes: Uint8Array,
+  tolerateTrailingBytes: boolean
+): MemberAvatarUploadPngInspection {
   if (!hasPrefix(bytes, PNG_SIGNATURE)) throw new Error('Unsupported member avatar image type')
   let offset: number = PNG_SIGNATURE.length
   let width = 0
   let height = 0
+  let iendOffset = 0
   let sawHeader = false
   let sawEnd = false
   while (offset < bytes.byteLength) {
@@ -303,16 +336,18 @@ export function inspectPng(bytes: Uint8Array): PngInspection {
     } else if (type === 'acTL') {
       throw new Error('Animated PNG member avatars are not supported')
     } else if (type === 'IEND') {
-      if (length !== 0 || endOffset !== bytes.byteLength) {
+      if (length !== 0) throw new Error('Invalid PNG member avatar ending')
+      if (!tolerateTrailingBytes && endOffset !== bytes.byteLength) {
         throw new Error('Invalid PNG member avatar ending')
       }
+      iendOffset = endOffset
       sawEnd = true
       break
     }
     offset = endOffset
   }
   if (!sawHeader || !sawEnd) throw new Error('Incomplete PNG member avatar')
-  return { mediaType: 'image/png', width, height }
+  return { mediaType: 'image/png', width, height, iendOffset }
 }
 
 export function inspectJpeg(bytes: Uint8Array): JpegInspection {
