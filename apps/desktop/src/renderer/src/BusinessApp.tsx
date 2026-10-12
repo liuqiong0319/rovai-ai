@@ -155,16 +155,21 @@ import {
   currentProjectForThread,
   currentProjectGroup,
   currentProjectWorkspace,
+  forgetOpenedProject,
   navigationIncludingCurrentWorkspace,
+  navigationWithOpenedProjects,
   navigationWithProjectAuthority,
   navigationWithProjectNames,
   navigationWithProjectOrder,
   persistCurrentProject,
   projectTargetKey,
   readCurrentProject,
+  readKnownProjects,
+  rememberOpenedProject,
   resolveAvailableNewConversationDefaults,
   shouldInvalidateNewConversationDefaults,
-  type CurrentProject
+  type CurrentProject,
+  type KnownProject
 } from './new-conversation-preferences'
 import { type NavigationRefreshTrigger } from './navigation-refresh-coordinator'
 import { createNavigationWindowReader, type NavigationGroupLimits } from './navigation-window-reader'
@@ -1135,6 +1140,7 @@ export function BusinessApp({
   }, [])
   const [currentProject, setCurrentProject] = useState<CurrentProject>(() => readCurrentProject())
   const [currentWorkspaceHint, setCurrentWorkspaceHint] = useState<WorkspaceSelection | null>(null)
+  const [knownProjects, setKnownProjects] = useState<KnownProject[]>(() => readKnownProjects())
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null)
   const campInspectorVisible = activeThreadId !== null && campInspectorThreadId === activeThreadId
   const singleChatVisible = activeThreadId !== null && singleChatThreadId === activeThreadId
@@ -2662,10 +2668,14 @@ export function BusinessApp({
     setConfirmingRunIds((current) => reconcileRunCancellationIds(current, campSnapshot))
   }, [campSnapshot])
 
-  const displayNavigation = navigationWithProjectNames(navigationIncludingCurrentWorkspace(
-    navigationWithMemberCreationDrafts(visibleNavigation, memberCreationDrafts),
-    currentProject,
-    currentWorkspaceHint
+  const displayNavigation = navigationWithProjectNames(navigationWithOpenedProjects(
+    navigationIncludingCurrentWorkspace(
+      navigationWithMemberCreationDrafts(visibleNavigation, memberCreationDrafts),
+      currentProject,
+      currentWorkspaceHint
+    ),
+    removedProjectAuthorityReady ? knownProjects : [],
+    removedProjectKeys
   ), projectNames)
   const activeThread = navigation
     ? allNavigationThreads(navigation).find((thread) => thread.id === activeThreadId) ?? null
@@ -2810,6 +2820,10 @@ export function BusinessApp({
     setCurrentProject(nextProject)
     setCurrentWorkspaceHint(nextProject.kind === 'directory' ? workspaceHint : null)
     persistCurrentProject(nextProject)
+    if (nextProject.kind === 'directory' && workspaceHint) {
+      rememberOpenedProject(workspaceHint)
+      setKnownProjects(readKnownProjects())
+    }
   }
 
   const openNewConversation = (
@@ -3356,6 +3370,8 @@ export function BusinessApp({
           relatedPinnedThreadIds
         )
         applyNavigationPreferences(snapshot)
+        forgetOpenedProject(project.projectPath)
+        setKnownProjects(readKnownProjects())
         setPinnedThreadItems((current) => current.filter((thread) => !(
           thread.projectBindingKind === 'directory'
           && thread.projectPath === project.projectPath

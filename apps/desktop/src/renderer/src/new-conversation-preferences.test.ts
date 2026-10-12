@@ -10,12 +10,18 @@ import {
   currentProjectForThread,
   currentProjectWorkspace,
   defaultsNeedInvalidation,
+  forgetOpenedProject,
   navigationIncludingCurrentWorkspace,
+  navigationWithOpenedProjects,
   navigationWithProjectAuthority,
   navigationWithProjectOrder,
   navigationWithoutRemovedProjects,
   parseCurrentProject,
+  parseKnownProjects,
+  persistKnownProjects,
   projectTargetKey,
+  readKnownProjects,
+  rememberOpenedProject,
   resolveNewConversationDefaults,
   resolveAvailableNewConversationDefaults,
   shouldInvalidateNewConversationDefaults
@@ -227,6 +233,76 @@ describe('new conversation preferences', () => {
     const preferences = configuredPreferences()
     expect(shouldInvalidateNewConversationDefaults(preferences, [], false)).toBe(false)
     expect(shouldInvalidateNewConversationDefaults(preferences, [], true)).toBe(true)
+  })
+
+  it('parses the persisted opened-project list leniently and de-duplicates', () => {
+    expect(parseKnownProjects(null)).toEqual([])
+    expect(parseKnownProjects('{broken')).toEqual([])
+    expect(parseKnownProjects(JSON.stringify([
+      { projectPath: '/repo/a', name: 'A', openedAt: '2026-01-01' },
+      { projectPath: '/repo/a', name: 'A-dup', openedAt: '2026-01-02' },
+      { projectPath: '', name: 'x', openedAt: '' },
+      { name: 'missing-path' }
+    ]))).toEqual([
+      { projectPath: '/repo/a', name: 'A', openedAt: '2026-01-01' }
+    ])
+  })
+
+  it('promotes every remembered empty Project, not just the current one', () => {
+    const navigation: NavigationSnapshot = {
+      schemaVersion: 3,
+      throughGlobalSequence: 7,
+      quickChat: { totalCount: 0, recentThreads: [] },
+      projects: [project('/repo/existing')]
+    }
+    const displayed = navigationWithOpenedProjects(navigation, [
+      { projectPath: '/repo/a', name: 'a', openedAt: '2026-01-01T00:00:00.000Z' },
+      { projectPath: '/repo/b', name: 'b', openedAt: '2026-01-02T00:00:00.000Z' }
+    ], new Set())
+
+    expect(displayed?.projects.map((candidate) => candidate.projectPath))
+      .toEqual(['/repo/existing', '/repo/a', '/repo/b'])
+    expect(displayed?.projects[1]).toMatchObject({
+      projectKey: 'directory:/repo/a',
+      name: 'a',
+      projectPath: '/repo/a',
+      totalCount: 0,
+      recentThreads: []
+    })
+  })
+
+  it('does not resurrect removed or already-listed empty Projects', () => {
+    const navigation: NavigationSnapshot = {
+      schemaVersion: 3,
+      throughGlobalSequence: 7,
+      quickChat: { totalCount: 0, recentThreads: [] },
+      projects: [project('/repo/a')]
+    }
+    expect(navigationWithOpenedProjects(navigation, [
+      { projectPath: '/repo/a', name: 'a', openedAt: 'x' },
+      { projectPath: '/repo/removed', name: 'removed', openedAt: 'x' }
+    ], new Set([projectTargetKey('/repo/removed')]))).toBe(navigation)
+  })
+
+  it('remembers opened projects durably and forgets them on removal', () => {
+    const values = new Map<string, string>()
+    globalThis.window = {
+      localStorage: {
+        getItem: (key: string) => values.get(key) ?? null,
+        setItem: (key: string, value: string) => { values.set(key, value) }
+      }
+    } as unknown as Window & typeof globalThis
+
+    rememberOpenedProject({ name: 'a', projectPath: '/repo/a' })
+    rememberOpenedProject({ name: 'b', projectPath: '/repo/b' })
+    rememberOpenedProject({ name: 'a', projectPath: '/repo/a' })
+    expect(readKnownProjects().map((entry) => entry.projectPath)).toEqual(['/repo/a', '/repo/b'])
+
+    forgetOpenedProject('/repo/a')
+    expect(readKnownProjects().map((entry) => entry.projectPath)).toEqual(['/repo/b'])
+
+    persistKnownProjects([])
+    delete (globalThis as { window?: unknown }).window
   })
 })
 
