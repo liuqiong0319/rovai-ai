@@ -2670,7 +2670,7 @@ export function BusinessApp({
       currentProject,
       currentWorkspaceHint
     ),
-    knownProjects,
+    removedProjectAuthorityReady ? knownProjects : [],
     removedProjectKeys
   ), projectNames)
   const activeThread = navigation

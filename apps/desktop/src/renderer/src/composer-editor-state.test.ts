@@ -227,6 +227,36 @@ describe('Composer Lexical state boundary', () => {
     }, { discrete: true })
   })
 
+  it('moves a caret past the last keyboard-selected Atom on ArrowRight', () => {
+    const editor = createComposerEditor()
+    editor.update(() => {
+      $replaceEditorWithComposerDocument({
+        version: 2,
+        segments: [
+          { kind: 'atom', atom: { type: 'member', agentId: 'agent-a', labelFallback: '甲' } },
+          { kind: 'text', text: ' ' },
+          { kind: 'atom', atom: { type: 'member', agentId: 'agent-b', labelFallback: '乙' } },
+          { kind: 'text', text: '尾' }
+        ]
+      })
+      const paragraph = $getRoot().getFirstChildOrThrow()
+      if (!$isElementNode(paragraph)) throw new Error('expected paragraph')
+      const [firstAtom, , secondAtom] = paragraph.getChildren()
+      const selection = $createNodeSelection()
+      selection.add(firstAtom.getKey())
+      selection.add(secondAtom.getKey())
+      $setSelection(selection)
+
+      expect($moveComposerAtomSelection('next')).toBe(true)
+      const after = $getSelection()
+      expect($isRangeSelection(after)).toBe(true)
+      if (!$isRangeSelection(after)) return
+      expect(after.isCollapsed()).toBe(true)
+      expect(after.anchor.getNode().getTextContent()).toBe('尾')
+      expect(after.anchor.offset).toBe(0)
+    }, { discrete: true })
+  })
+
   it('deletes a keyboard-selected Atom on Backspace and restores a visible caret', () => {
     const editor = createComposerEditor()
     let afterDocument: ComposerDocument = { version: 2, segments: [] }

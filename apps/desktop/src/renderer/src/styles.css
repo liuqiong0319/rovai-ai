@@ -4584,7 +4584,8 @@ details summary { min-height: 28px; padding: 5px 0; color: var(--muted); font-si
   transition: color 110ms ease, background-color 110ms ease, box-shadow 110ms ease;
 }
 .structured-mention-token.is-interactive:hover,
-.structured-mention-token.is-interactive[data-mention-open="true"] {
+.structured-mention-token.is-interactive[data-mention-open="true"],
+.structured-mention-token[data-selected="true"] {
   color: var(--mention-ink-hover);
   background: var(--mention-feedback);
   box-shadow: 0 0 0 1px var(--mention-feedback);

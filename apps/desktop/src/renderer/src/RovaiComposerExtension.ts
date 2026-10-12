@@ -80,10 +80,10 @@ export function getComposerExtensionRuntime(
 export function $moveComposerAtomSelection(direction: 'previous' | 'next'): boolean {
   const selection = $getSelection()
   if (!$isNodeSelection(selection)) return false
-  const firstAtom = selection.getNodes().find((node) => $isComposerAtomNode(node))
-  if (!firstAtom) return false
-  if (direction === 'previous') firstAtom.selectPrevious()
-  else firstAtom.selectNext(0, 0)
+  const atoms = selection.getNodes().filter((node) => $isComposerAtomNode(node))
+  if (atoms.length === 0) return false
+  if (direction === 'previous') atoms[0].selectPrevious()
+  else atoms[atoms.length - 1].selectNext(0, 0)
   return true
 }
 
@@ -105,7 +105,27 @@ export const ComposerAtomExtension = defineExtension({
   name: 'rovai:composer-atom',
   nodes: [ComposerAtomNode],
   register(editor) {
-    return editor.registerNodeTransform(ParagraphNode, normalizeParagraphBoundary)
+    // A keyboard NodeSelection has no native caret; mark the selected atom so
+    // it shows the mention feedback instead of the caret "disappearing".
+    let selectedKeys = new Set<string>()
+    const cleanups = [
+      editor.registerNodeTransform(ParagraphNode, normalizeParagraphBoundary),
+      editor.registerUpdateListener(({ editorState }) => {
+        const nextKeys = editorState.read(() => {
+          const selection = $getSelection()
+          if (!$isNodeSelection(selection)) return new Set<string>()
+          return new Set(selection.getNodes()
+            .filter((node) => $isComposerAtomNode(node))
+            .map((node) => node.getKey()))
+        })
+        for (const key of selectedKeys) {
+          if (!nextKeys.has(key)) editor.getElementByKey(key)?.removeAttribute('data-selected')
+        }
+        for (const key of nextKeys) editor.getElementByKey(key)?.setAttribute('data-selected', 'true')
+        selectedKeys = nextKeys
+      })
+    ]
+    return () => cleanups.forEach((cleanup) => cleanup())
   }
 })
 
