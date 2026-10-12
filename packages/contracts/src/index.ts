@@ -42,6 +42,8 @@ export type AdapterKind =
   | 'grok-build'
   | 'zcode-app'
   | 'deepseek-harness'
+  | 'cline-cli'
+  | 'command-code-cli'
   | 'antigravity-app'
 
 export type RuntimeOptionScope = 'run' | 'session' | 'host'
@@ -126,12 +128,20 @@ export interface RuntimeModelCatalogCache {
   expiresAt: string | null
 }
 
+export interface RuntimeModelCatalogTarget {
+  modelId: string
+  dshSource?: 'native' | 'web'
+  /** Validate cached DSH capability context without starting a Runtime. */
+  cacheOnly?: boolean
+}
+
 export interface RuntimeModelCatalogView {
   runtimeKind: AdapterKind
   cache: RuntimeModelCatalogCache
   models: ModelDescriptor[]
   refreshStatus: 'not_required' | 'scheduled' | 'joined' | 'completed' | 'failed' | 'deferred'
   diagnosticCode: string | null
+  selectedModelId?: string
 }
 
 export type RuntimeProbeFailureClass =
@@ -213,7 +223,7 @@ export interface MemberThreadMembership {
 
 export type ModelSelection =
   | { mode: 'runtime_default' }
-  | { mode: 'explicit'; modelId: string; options: Record<string, unknown> }
+  | { mode: 'explicit'; modelId: string; options: Record<string, unknown>; dshSource?: 'native' | 'web' }
 
 export interface AdapterPermissionConfig {
   adapterKind: AdapterKind
@@ -1380,7 +1390,7 @@ export interface MessageQuoteSnapshot {
   capturedAt: string
   sourceContentDigest: string
   /** Internal, immutable selection anchor. Never projected into model input. */
-  locator?: { projectionVersion: 1; startScalar: number; endScalar: number; projectionDigest: string }
+  locator?: { projectionVersion: 1 | 2; startScalar: number; endScalar: number; projectionDigest: string }
   snapshotDigest: string
 }
 
@@ -1854,6 +1864,8 @@ export interface AgentRunView {
   anchorMessageId?: string | null
   /** Core-rendered title source, independent of the loaded conversation page. */
   inputSummary?: string | null
+  /** At least one continuation Delivery was accepted for this Run; not an execution-eligibility lock. */
+  hasAcceptedContinuation?: boolean
   conversationId: string
   agentId: string
   taskId: string | null
@@ -1992,7 +2004,7 @@ export interface CanonicalRuntimeDiffProjectionView {
   revision: number
   sourceEvidenceIds: string[]
   status: 'available' | 'unavailable' | 'conflict'
-  semanticKind?: 'unified_diff_snapshot' | 'complete_patch_snapshot' | 'exact_mutation' | 'complete_before_after'
+  semanticKind?: 'unified_diff_snapshot' | 'complete_patch_snapshot' | 'exact_mutation' | 'reported_mutation' | 'complete_before_after'
   entries?: CanonicalRuntimeDiffEntryView[]
   safeReasonCode?: string
 }
@@ -2360,6 +2372,7 @@ export interface DomainEventView {
 export type AgentRunFileChangePresentationKind =
   | 'full_net_diff'
   | 'exact_mutations'
+  | 'reported_mutations'
   | 'operation_only'
   | 'operation_history'
 
@@ -2390,7 +2403,7 @@ export interface AgentRunFileChangesView {
 
 export interface AgentRunFileChangeBlockView {
   sequence: number
-  semantics: 'full_net_diff' | 'full_before_after' | 'unified_diff_snapshot' | 'exact_mutation' | 'operation_only'
+  semantics: 'full_net_diff' | 'full_before_after' | 'unified_diff_snapshot' | 'exact_mutation' | 'reported_mutation' | 'operation_only'
   changeKind: string
   additions?: number
   deletions?: number
@@ -2594,6 +2607,7 @@ export interface ThreadMessageFindParams {
 
 interface MessageDeliveryBaseView {
   continuationRequest?: boolean
+  inputMessageIds?: string[]
   id: string
   messageId: string
   threadTurnId: string | null
@@ -4039,6 +4053,10 @@ export type CoreMethod =
   | 'runtime.product.ensure'
   | 'runtime.product.check'
   | 'runtime.startup.get'
+  | 'member.runtimeEnvironment.get'
+  | 'runtime.environmentLegacy.list'
+  | 'runtime.environmentLegacy.get'
+  | 'runtime.environmentLegacy.acknowledge'
   | 'runtime.startup.inspect'
   | 'runtime.startup.check'
   | 'runtime.startup.save'
@@ -4133,6 +4151,7 @@ export type CoreMethod =
   | 'mcp.servers.delete'
   | 'mcp.import.scan'
   | 'mcp.import.commit'
+  | 'conversations.memberSession.get'
   | 'conversations.restartNativeSession'
   | 'channels.credentials.get'
   | 'channels.credentials.listPublished'

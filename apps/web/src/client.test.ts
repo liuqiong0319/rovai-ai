@@ -515,19 +515,31 @@ describe('renewable browser authentication', () => {
     const expiry = now + 30 * day
     let finish: ((value: Response) => void) | undefined
     let offline = true
+    let storageFailure = true
+    const storageMessage = '无法保存登录状态：操作系统拒绝写入或替换凭据文件。原登录凭据未被修改。'
     const fetcher = vi.fn<typeof fetch>(async url => {
-      if (String(url).endsWith('/login')) return Response.json({ ...identity, serverTime: now, expiresAt: expiry, renewalWindowSeconds: 604800 })
+      if (String(url).endsWith('/login')) return storageFailure
+        ? Response.json({ error: { code: 'session_storage_unavailable', message: storageMessage } }, { status: 503 })
+        : Response.json({ ...identity, serverTime: now, expiresAt: expiry, renewalWindowSeconds: 604800 })
       if (String(url).endsWith('/session/renew')) return new Promise(resolve => { finish = resolve })
       if (offline) throw new TypeError('offline')
+      if (storageFailure) return Response.json({ error: { code: 'session_storage_unavailable', message: storageMessage } }, { status: 503 })
       return new Response(null, { status: 204 })
     })
     const auth = durable(), client = new ConsoleClient(origin, fetcher, memory(), auth, () => now)
+    await expect(client.login('d'.repeat(64))).rejects.toThrow(storageMessage)
+    expect(client.authenticated).toBe(false)
+    storageFailure = false
     await client.login('d'.repeat(64)); now = expiry - 7 * day
     await expect(client.logout()).rejects.toThrow('退出未完成')
     expect(client.authenticated).toBe(true)
     const renewing = client.renewIfNeeded()
     await vi.waitFor(() => expect(finish).toBeTypeOf('function'))
-    offline = false; await client.logout()
+    offline = false; storageFailure = true
+    await expect(client.logout()).rejects.toThrow(storageMessage)
+    expect(client.authenticated).toBe(true)
+    expect((await auth.read())?.token).toBe(identity.token)
+    storageFailure = false; await client.logout()
     finish!(Response.json({ serverTime: now, expiresAt: now + 30 * day, renewalWindowSeconds: 604800 }))
     await renewing
     expect(client.authenticated).toBe(false); expect(await auth.read()).toBeNull()

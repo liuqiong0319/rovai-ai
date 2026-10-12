@@ -559,7 +559,7 @@ Desktop 与宽屏 Web 的展开正文首尾、主要过程项间距及相邻 Run
 滚动容器为键盘焦点留出标题安全区，不改变跟随最新、折叠、输入清单或 exact Run 停止语义。
 总览中的队员头像固定为 20×20px，不随 flex 收缩拉伸。左侧状态节点与卡头首行垂直居中并跟随本卡标题，
 展开与停止操作距卡片右边保留 9px。字段与验收边界见
-[Run Process Detail Surface v46](../../contracts/run-process-detail-surface-v46.md)。
+[Run Process Detail Surface v47](../../contracts/run-process-detail-surface-v47.md)。
 
 执行浮层入口、右侧标签、消息区“处理中”回执和底部标题共用同一 24×24 心跳路径与 1.65 描边；
 queued 回执的时钟及各执行状态图形不变。
@@ -601,7 +601,7 @@ Renderer 以公开消息和 Delivery ID 跟踪刚提交输入；Scheduler claim 
 不创建 pending-input 占位，也不夺走 Composer 焦点。
 删除待发送消息、无执行发布或离开 Camp 会消费或丢弃意图；其他窗口的发送和后台新 Run 不触发该行为。
 
-单聊与执行台的发送确认前和排队显示“连接中”；开始处理但尚未输出时，未收到明确 phase 显示“执行中”，收到 `thinking` phase 显示“思考中”。正文、计划、工具或 final 到达即移除初始等待提示。执行台与单聊在最新阅读窗口再次收到根 `thinking` phase 时，若 Run 仍运行、没有活动压缩或 final，在正文、计划或 Tool 后均显示一条瞬时思考提示。活动 Tool 保留真实运行状态，可与根思考并列；已结算尾组收口。Codex/Copilot 的已准入原生短标题直接替换“思考中”，缺失或无效时回退；新正文、计划、根 Tool、等待／停止或 Run 终态到来时撤下，不留下历史思考条目。折叠与 Mobile 使用相同标题规则，详见 [Run Process Detail Surface v46](../../contracts/run-process-detail-surface-v46.md)。
+单聊与执行台的发送确认前和排队显示“连接中”；开始处理但尚未输出时，未收到明确 phase 显示“执行中”，收到 `thinking` phase 显示“思考中”。正文、计划、工具或 final 到达即移除初始等待提示。执行台与单聊在最新阅读窗口再次收到根 `thinking` phase 时，若 Run 仍运行、没有活动压缩或 final，在正文、计划或 Tool 后均显示一条瞬时思考提示。活动 Tool 保留真实运行状态，可与根思考并列；已结算尾组收口。Codex/Copilot 的已准入原生短标题直接替换“思考中”，缺失或无效时回退；新正文、计划、根 Tool、等待／停止或 Run 终态到来时撤下，不留下历史思考条目。折叠与 Mobile 使用相同标题规则，详见 [Run Process Detail Surface v47](../../contracts/run-process-detail-surface-v47.md)。
 Runtime 的 private thought/reasoning 文本不进入 Renderer state、搜索、缓存或 disclosure；仅消费不含思考正文的
 `thinking | executing` phase 与独立准入的短标题来切换上述反馈，并把 phase edge 作为匿名公开正文的分段边界。
 Camp 执行卡片的普通等待提示与正文共用字号、行高和文字起点，加载图标放在提示文字后；底部、桌面浮层和手机端切入首行正文时不改变卡片位置或单行高度。
@@ -632,7 +632,7 @@ Shell 载体时，标题使用完整命令的单行预览，展开显示 `$ comm
 纯 CLI Shell 的完整成功返回值与其生命周期内唯一 Core 调用精确匹配时，折叠到 Built-in 行；单记录生命周期
 改用同 Run、同 epoch、紧邻序号和精确结果 digest 证明关联。混合命令、帮助、
 提前失败或不确定关联保留。底层 Evidence 和 Canonical 身份不变。完整规则见
-[Run Process Detail Surface v46](../../contracts/run-process-detail-surface-v46.md)。
+[Run Process Detail Surface v47](../../contracts/run-process-detail-surface-v47.md)。
 
 新 operation 的 started/progress/terminal 按稳定 Evidence ID 合并为一行；Renderer 只接受更高
 `revision/changeSequence`，不以记录数量或固定展示 `sequence` 判断内容是否变化。终态后的输入补齐、结果更新和
@@ -646,7 +646,7 @@ Shell 载体时，标题使用完整命令的单行预览，展开显示 `$ comm
 “<最近一条指令>”。真正收口后只显示 `已完成 x 个步骤`；`x` 统计成功、失败、停止、跳过和结果未知在内的
 全部已结算逻辑操作，各终态不再追加独立数量，具体结果由展开后的 Tool 行表达。分页读取沿用相同的执行结果摘要，不改成“已载入 x 项执行记录”；组摘要统计该组完整的可见逻辑操作，不表示整轮总量；未展开的子项不读取。主线和组内分别维护已载入范围。
 `x` 按去重后的可见逻辑操作计数；同一 Built-in 与已关联 Shell 载体计一步，started/result/delta 和一个 Activity 的多文件行不重复计数。
-精确计数语义见 [Run Process Detail Surface v46](../../contracts/run-process-detail-surface-v46.md)。
+精确计数语义见 [Run Process Detail Surface v47](../../contracts/run-process-detail-surface-v47.md)。
 
 Runtime Compaction 作为根级、非 Tool process item 同样截断前后 Tool 分组，但不进入“已完成 x 个步骤”。
 它复用普通 command 的桌面 28px 行、最右侧状态 icon、文字后展开提示与结果文本框，并保留独立压缩 SVG；同一
@@ -739,9 +739,9 @@ standalone raw Evidence、Envelope JSON 或独立
 
 ### Runtime 终态文件变更与 AgentRun 文件变化
 
-只有 [Runtime File Change Observation v6](../../contracts/runtime-file-change-observation-v6.md)准入的可靠
+只有 [Runtime File Change Observation v7](../../contracts/runtime-file-change-observation-v7.md)准入的可靠
 Evidence 才进入文件操作呈现。成功 read 的可靠单路径显示为不可展开的 `阅读 <basename>`；成功 write 的可靠
-单路径显示 `编辑 <basename>`。有完整 before/after、unified snapshot 或 exact mutation 时，每个文件作为同一
+单路径显示 `编辑 <basename>`。有完整 before/after、unified snapshot、exact mutation 或已准入 reported mutation 时，每个文件作为同一
 Canonical Activity 的 presentation row，明确 add 显示“新增”，其他显示“编辑”；没有可靠内容时不显示
 `+A −D` 或空 disclosure。read 只属于过程事实，永不进入 AgentRun `Files Changed`。
 
@@ -765,6 +765,10 @@ Canonical Activity 计算。每行复用既有 File Tool 图标，顶格占满�
 Claude Code `Edit` 的 exact mutation 展开只显示 `− oldText / + newText` 片段，不显示 `@@`、旧/新文件行号或
 推测上下文。同一文件连续 Edit 在 Command View 中仍按各 Tool 时序分别显示；Write、NotebookEdit、ApplyPatch、
 失败/缺失 result 与 `replace_all=true` 保持普通 Tool Activity。
+
+Cline 已确认成功的 Update 补丁或 editor 替换用 `reported_mutation` 展示“补丁片段”，复用无行号片段布局。
+提示说明原生匹配可能调整文本、统计来自补丁；Command 和 Review 都保留该来源区别，不合成为完整文件净差异。
+失败、未知语法、创建/移动/删除等未准入内容保持原有文件行回退。
 
 每个 terminal `agentRunId + executionEpoch` 可以在对应 Run 的会话位置追加一张独立卡片，标题固定为
 `Files Changed`。卡片位于来源 Run 最后一条公开消息后的结果区域；同 Run 有入队卡片时，顺序固定为
@@ -964,17 +968,37 @@ Reason 仅在空白归一化后与动作摘要完全相同或自身为空时隐�
 超出时提供“展开全文 / 收起全文”，状态按审批 ID 隔离。容器宽度变化（含详情/文件区显隐与调整）时重新
 计算溢出，不重置该审批的展开状态；完整说明始终可读，不因压缩而永久丢失。
 
-public Composer 不提供 CampTurn 或整轮停止。共享 ExecutionDrawer 顶栏在“收起”旁提供唯一 AgentRun Stop，
+public Composer 不提供 CampTurn 或整轮停止。执行台保留既有 AgentRun Stop，
 只停止当前聚焦 Run；底部和 Inspector 复用同一个直接停止入口与状态。
 停止等待只覆盖 IPC 提交阶段，文案为“正在提交停止请求…”；Applied 后立即显示 Core 返回的实际终态并刷新。
 既有 cancel_requested_at 或 Runtime 清理未完成不产生停止 spinner；取消 Run 显示已取消并清除旧外部效果提示，
 底层发送与 Action 证据不因此删除。
 Run 卡片与步骤组均以权威终态优先：即使取消标记尚存，终态也不得被“正在停止 · 等待执行结束”覆盖；
 已完成步骤保持完成，取消 Run 中未结束的工具按既有终态投影显示已停止。
-Header、Task 卡、时间线和 Composer 不增加 Run-local 入口。accepted/unknown 只显示普通红色失败，
+消息区占位按下节提供确认停止，Header、Task 卡和 Composer 不增加 Run-local 入口。accepted/unknown 只显示普通红色失败，
 不与普通 Stop 同时出现。Run-local 请求不创建 Camp 时间线消息；新 public Camp 不再生成 Turn-level 停止消息，
 历史停止占位只按已有记录只读展示。精确资格、required/optional 后果与不确定态见
 [Run Process Detail Surface v34](../../contracts/run-process-detail-surface-v34.md)。
+
+## 会话中的队员占位
+
+公开会话沿用 User 确认的 v10「停止区分隔」及 v8 停止按钮默认色：运行中的队员在最新公开消息之后显示头像、姓名和单行执行内容。
+同一 Run 紧接自己的消息时省去重复身份；被其他消息隔开后重新显示，即使另一条消息来自同一队员也按 Run 区分。
+紧邻的同 Run 产物沿用身份，其他 Run 产物或 Task 作为新的分界。
+并行中，与末条消息连续的 Run 排在首位，其余稳定排列；排队、未开始的等待和私有单聊不占位。
+
+正文与命令复用执行台投影，正文从开头流出，满一行后省略，不前后滚动。命令使用既有工具图标；
+内容点击打开该 Run 详情。行内不显示耗时，以短竖线分隔右侧停止区，整行保持透明、无外框。
+停止图标与执行台共用，默认中性色、透明背景，悬浮才变红，点击后确认；取消／Esc 不提交，
+确认只停止对应 Run。自然结束后占位移除，不增加执行完成行。
+
+中断时保留简短原因和“重试”。提交期间显示“正在提交…”并禁用；受理后收起中断占位，等待不占位。
+收起依据 Core 的 `hasAcceptedContinuation`，切群／刷新也能恢复；切群缓存预览阶段不展示中断行，等待最新投影后判断。
+网络回执丢失时保留普通重试入口，内部复用同一请求，
+不增加“结果未知”交互。新 Run 开始再展示，再失败时重试新 Run；执行台历史记录仍可主动多次继续执行。
+新 Run 不改变原消息与草稿。仅每位队员最新且尚未受理续做的公开 batch 失败可留在末尾，避免历史失败堆积。
+已发消息的复制／回复按钮、分组、文件与图片不变；桌面静止时仍只有最新一条队员消息的复制／回复常驻。
+桌面行高 36px，停止目标 26px，粗指针扩展为 44px 目标；精确边界见 [Run Process Detail Surface v49](../../contracts/run-process-detail-surface-v49.md)。
 
 ## 会话 Pane 紧凑布局
 
@@ -1083,6 +1107,12 @@ Message Mention 通知导航必须以 `campId + sourceMessageId` 加载和定位
 独立格式标签，不显示大小；图片是 48×48px 圆角缩略块，不显示文件名。两者共处一条不换行的附件带，删除
 按钮固定在每项右上角。超宽时隐藏视觉滚动条，保留触控板水平滚动；普通鼠标的主滚轮在附件带仍有可滚空间
 时转为横向浏览。附件带本身可聚焦，并以 Left/Right 分段浏览、Home/End 到首尾，不抢占移除按钮的键盘入口。
+
+输入框图片的缩略图和预览共用消息图片的菜单组件，固定只有“复制图片”“保存图片…”两项，顺序、图标、
+中英文文案和主题样式一致；不提供路径、系统打开、所在位置、刷新或查看大图菜单项。点击缩略图仍打开预览，
+右上角仍可移除附件。复制写入完整尺寸的 PNG 像素，保存保留已加载文件的原始字节与格式；两项操作都不改动
+草稿或重新读取源路径。进行中防重复执行，成功与失败提示沿用消息图片。未加载或解码失败时两项禁用，缩略图
+仍可聚焦并打开菜单，不回退到文件打开；Escape 回到触发菜单的缩略图或预览图片。普通文件菜单保持原有操作。
 
 Renderer 对新 source refs、Managed v2 和 legacy 附件只消费同一个无路径 View，不显示或分支判断底层
 storage model。历史加载时 `availability = unknown`，不得为了填充附件卡而批量 `stat`、启动 watcher 或
@@ -1230,6 +1260,11 @@ Pending 行只展示正文，不展示附件或附件数量；纯附件摘要留
 
 ## 多段消息选文引用
 
+Agent Markdown 的中文标点与相邻中文使用 CJK 兼容强调解析；代码和转义标记保持字面值。
+选文引用按当前可见正文捕获，Core 与 Renderer 共用投影对照用例；整条消息复制继续保留原始 Markdown。
+已有引用始终展示和发送捕获时的纯文本，投影升级不改写原文或旧快照。旧定位摘要不匹配时仍回到来源消息，
+只放弃精确高亮并反馈原因，不阻止引用内容展示与使用；定位规则见引用合同。
+
 引用仅针对同一条用户/队员消息正文，一次可跨段落、列表和代码，分次操作追加多段。跨消息、正文外、附件/文件/历史引用/过程卡片均不显示入口；复制和右键菜单关闭残留浮层，正常复制不受影响。
 
 引用元数据放在现有 composer-box 内：回复摘要 → 引用标签 → 问题 → 工具栏。常驻约 36px 单行，只显示一个 28px 无描边圆角标签，使用中性底色、无分隔线；标签显示引用图标、段数和去重作者名称，不预览选文。
@@ -1245,14 +1280,13 @@ Pending 行只展示正文，不展示附件或附件数量；纯附件摘要留
 ## 用户主动继续执行
 
 公开 batch Run 的失败／停止卡片沿用现有布局，在折叠操作旁提供 24×24 的纯图标按钮。
-title 和 aria-label 为“继续执行”，键盘可达；提交中禁用。系统操作记录、waiting 请求和新 Run 使用
+title 和 aria-label 为“继续执行”，键盘可达；提交中禁用。续做新请求不产生公屏系统消息，也不进入消息历史、搜索与定位；已生成的记录保留原样。waiting 请求和新 Run 使用
 现有时间线／执行区；原卡片终态与输出不变，受理后仍可再次点击，各次 Run 不显示关联状态。
-已知必须更换会话时一次确认“原会话无法恢复，将使用新会话继续。当前工作区会保留。”
-实际恢复失败后当前 Run 明确失败，再由用户选择新会话；无恢复向导。合同见
-[Run Process Detail Surface v46](../../contracts/run-process-detail-surface-v46.md)。
+会话自动选择遵循下节规则；无恢复向导。合同见
+[Run Process Detail Surface v47](../../contracts/run-process-detail-surface-v47.md)。
 
 ### 继续执行的会话选择
 
 失败／停止卡片的 24×24 继续图标直接提交，Core 自动复用或选择新会话，不显示会话确认弹窗。
 提交中保持原尺寸并禁用；受理后恢复可点，原 Run 状态和工作区保留。响应未知时沿用同一 commandId 核对。
-恢复失败的投递前降级由 [AgentRun Continuation v2](../../contracts/agent-run-continuation-v2.md) 拥有。
+恢复失败的投递前降级由 [AgentRun Continuation v3](../../contracts/agent-run-continuation-v3.md) 拥有。

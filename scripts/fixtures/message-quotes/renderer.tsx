@@ -7,7 +7,7 @@ import { SafeMarkdown } from '../../../apps/desktop/src/renderer/src/SafeMarkdow
 import { projectQuoteBody, quoteDomOffset, readMessageQuoteSelection } from '../../../apps/desktop/src/renderer/src/message-quote-selection'
 import { AgentMessageMarkdownBody, StructuredMessageBody, TruncatedStructuredMessageBody } from '../../../apps/desktop/src/renderer/src/ThreadWorkspace'
 import { CurrentUserProfileContext } from '../../../apps/desktop/src/renderer/src/CurrentUserProfile'
-import cases from '../../../packages/contracts/fixtures/message-quote-projection-v1.json'
+import cases from '../../../packages/contracts/fixtures/message-quote-projection-v2.json'
 import '../../../apps/desktop/src/renderer/src/styles.css'
 
 const lineSourceIndex = cases.length
@@ -38,8 +38,14 @@ window.addEventListener('unhandledrejection', event => errors.push(String(event.
 let fail = false
 let failRemoval = false
 let latest: MessageQuoteSnapshot[] = []
+let setFixtureQuotes: (quotes: MessageQuoteSnapshot[]) => void
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 const frames = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+async function waitFor(condition: () => boolean, reason: string) {
+  const deadline = performance.now() + 2000
+  while (!condition() && performance.now() < deadline) await frames()
+  check(condition(), reason)
+}
 // macOS may give another integration window OS focus. Keep DOM focus semantics deterministic.
 const focus = (element: HTMLElement) => {
   element.focus()
@@ -82,11 +88,12 @@ function messageBody(index: number): ReactNode {
 }
 function Fixture() {
   const [quotes, setQuotes] = useState<MessageQuoteSnapshot[]>([])
+  setFixtureQuotes = setQuotes
   const composer = useRef<HTMLTextAreaElement>(null)
   latest = quotes
   const add = async (selection: MessageQuoteSelection) => {
     if (fail) throw { kind: 'infrastructure_failure', code: 'CORE_REQUEST_FAILED', message: 'quote.limit_exceeded', retryable: false, generation: 1, details: {} }
-    const locator = { projectionVersion: 1 as const, startScalar: selection.startScalar, endScalar: selection.endScalar, projectionDigest: await quoteProjectionDigest(projectQuoteBody(root(Number(selection.messageId.split('-')[1]))).text) }
+    const locator = { projectionVersion: 2 as const, startScalar: selection.startScalar, endScalar: selection.endScalar, projectionDigest: await quoteProjectionDigest(projectQuoteBody(root(Number(selection.messageId.split('-')[1]))).text) }
     setQuotes(current => [...current, { locator, version: 1, quoteId: crypto.randomUUID(),
       source: { scope: 'camp', threadId: 'fixture', messageId: selection.messageId }, authorAtCapture: { type: 'agent', agentId: 'agent_1', displayName: '叮叮' },
       text: selection.text, format: 'plain_text', capturedAt: '2026-09-09T00:00:00Z', sourceContentDigest: 'fixture', snapshotDigest: 'fixture' }])
@@ -148,6 +155,8 @@ Object.assign(window, { quoteTest: {
     }
     for (const [index, entry] of cases.entries()) {
       check(projectQuoteBody(root(index)).text === entry.text, `projection: ${entry.name}: ${JSON.stringify(projectQuoteBody(root(index)).text)}`)
+      if (entry.strong) check(JSON.stringify([...root(index).querySelectorAll('strong')].map(node => node.textContent)) === JSON.stringify(entry.strong),
+        `strong markup: ${entry.name}`)
       select(index)
       const candidate = readMessageQuoteSelection(window.getSelection(), 'thread:fixture', id => messages.find(message => message.id === id))
       check(candidate?.selection.text === entry.text, `selection: ${entry.name}`)
@@ -161,6 +170,39 @@ Object.assign(window, { quoteTest: {
     const excluded = document.getElementById('excluded-test')!
     range.selectNodeContents(excluded)
     check(!readMessageQuoteSelection(window.getSelection(), 'thread:fixture', id => messages.find(message => message.id === id)), 'card between endpoints')
+    // CJK capture, serialized reuse, and old immutable snapshots share the same
+    // production selection/reveal surfaces as ordinary messages.
+    const cjkIndex = cases.findIndex(entry => entry.name === 'CJK original conflict reply')
+    root(cjkIndex).scrollIntoView(); select(cjkIndex, 0, 5); await frames()
+    check(window.getSelection()!.toString() === '有冲突。我', 'native CJK selection copies visible text without markers')
+    click('.message-quote-selection-toolbar button', 'capture CJK excerpt'); await pause(30); await frames()
+    const cjkSaved: MessageQuoteSnapshot = JSON.parse(JSON.stringify(latest[0]))
+    check(cjkSaved.text === '有冲突。我' && cjkSaved.locator?.projectionVersion === 2, 'CJK snapshot uses the current projection')
+    await revealMessageQuote(cjkSaved, root(cjkIndex)); await frames()
+    check(root(cjkIndex).dataset.quoteLocated === 'true', 'CJK persisted quote returns to its exact source')
+    const oldCjk: MessageQuoteSnapshot = {
+      ...cjkSaved,
+      text: cases[cjkIndex].source,
+      locator: { projectionVersion: 1, startScalar: 0, endScalar: Array.from(cases[cjkIndex].source).length,
+        projectionDigest: await quoteProjectionDigest(cases[cjkIndex].source) }
+    }
+    const frozenOldCjk = JSON.stringify(oldCjk)
+    await revealMessageQuote(oldCjk, root(cjkIndex)).then(
+      () => { throw new Error('old changed CJK projection must not highlight') },
+      error => check(String(error).includes('selection_unavailable'), 'old projection loses only its highlight'))
+    check(!document.querySelector('.message-quote-line-band') && JSON.stringify(oldCjk) === frozenOldCjk,
+      'failed old CJK location preserves the frozen quote')
+    // Exercise the actual history/draft UI failure path, retaining display and use.
+    setFixtureQuotes([oldCjk]); await frames()
+    root(0).scrollIntoView()
+    const cjkTrigger = document.querySelector<HTMLButtonElement>('.message-quotes:not(.is-history) .message-quotes-trigger')!
+    cjkTrigger.click(); await frames()
+    click('.message-quote-jump', 'unavailable old CJK highlight'); await pause(30); await frames()
+    check(document.querySelector('.message-quote-full-text')?.textContent === oldCjk.text
+      && document.querySelector('[role="alert"]')?.textContent?.includes('引用文字仍保留'),
+      'old CJK quote remains fully visible after highlight failure')
+    check(latest[0].text === oldCjk.text && latest[0].format === 'plain_text', 'old CJK quote remains available to send')
+    click('.message-quote-remove', 'finish CJK fixture'); await pause(30); await frames()
     for (let index = 0; index < 3; index++) {
       root(0).scrollIntoView(); select(0, index, 14 + index); await frames()
       const button = document.querySelector<HTMLButtonElement>('.message-quote-selection-toolbar button')
@@ -214,6 +256,8 @@ Object.assign(window, { quoteTest: {
     root(lineSourceIndex).scrollIntoView(); select(lineSourceIndex, start, end); await frames()
     click('.message-quote-selection-toolbar button', 'capture code-line excerpt'); await pause(30); await frames()
     const saved: MessageQuoteSnapshot = JSON.parse(JSON.stringify(latest.at(-1)))
+    await revealMessageQuote({ ...saved, locator: { ...saved.locator!, projectionVersion: 1 } }, root(lineSourceIndex))
+    check(root(lineSourceIndex).dataset.quoteLocated === 'true', 'unchanged v1 projection still locates exactly')
     await revealMessageQuote(saved, root(lineSourceIndex)); await frames()
     const band = root(lineSourceIndex).querySelector<HTMLElement>('.message-quote-line-band')!
     const code = root(lineSourceIndex).querySelector('pre')!
@@ -244,11 +288,18 @@ Object.assign(window, { quoteTest: {
     // Single Chat has a scrolling viewport outside its non-scrolling transcript.
     const viewport = document.querySelector<HTMLElement>('.conversation-timeline')!
     viewport.className = 'single-chat-viewport'
+    viewport.scrollIntoView({ block: 'start', behavior: 'instant' }); await frames()
     viewport.scrollTop = 0
-    await revealMessageQuote(saved, root(lineSourceIndex)); await pause(400); await frames()
-    const located = root(lineSourceIndex).querySelector('.message-quote-line-band')!.getBoundingClientRect()
+    await revealMessageQuote(saved, root(lineSourceIndex))
+    // The shared corpus can change scroll distance. Wait for the visible result,
+    // since smooth scrolling is not complete when revealMessageQuote resolves.
+    await waitFor(() => {
+      const located = root(lineSourceIndex).querySelector('.message-quote-line-band')!.getBoundingClientRect()
+      const visible = viewport.getBoundingClientRect()
+      return viewport.scrollTop > 0 && located.top >= Math.max(0, visible.top)
+        && located.bottom <= Math.min(window.innerHeight, visible.bottom)
+    }, 'private jump scrolls the actual viewport into view')
     const visible = viewport.getBoundingClientRect()
-    check(viewport.scrollTop > 0 && located.top >= visible.top && located.bottom <= visible.bottom, 'private jump scrolls the actual viewport into view')
     const clippedRange = select(lineSourceIndex, start + 1, end)
     viewport.scrollTop += clippedRange.getBoundingClientRect().top - (visible.bottom + 20)
     document.dispatchEvent(new Event('scroll')); await frames()
@@ -271,10 +322,15 @@ Object.assign(window, { quoteTest: {
     click('.message-quote-selection-toolbar button', 'add excerpt after clearing'); await pause(30); await frames()
     check(latest.length === 1 && !document.querySelector('.message-quotes-popover'), 'new selection after clearing starts with a collapsed label')
     check(!errors.length, errors.join('\n'))
-    return { ok: true, verified: ['long user collapsed and expanded selection', 'shared projection', 'Unicode and code', 'cross message and cards', 'multiple compact quotes', 'failure retention', 'stale copy selection', 'hover and keyboard disclosure', 'full row navigation and direct removal', 'last removal closes and returns focus', 'persisted code-line anchors', 'duplicate and stale source', 'reflow and multi-block highlights'] }
+    return { ok: true, projectionCases: cases.length, verified: ['long user collapsed and expanded selection', 'shared CJK projection and strong markup', 'CJK native selection and persisted v2 quote', 'immutable v1 quote display and reuse after highlight failure', 'unchanged v1 exact anchors', 'Unicode and code', 'cross message and cards', 'multiple compact quotes', 'failure retention', 'stale copy selection', 'hover and keyboard disclosure', 'full row navigation and direct removal', 'last removal closes and returns focus', 'persisted code-line anchors', 'duplicate and stale source', 'reflow and multi-block highlights'] }
   },
   async linePreview() {
     await revealMessageQuote(latest.at(-1)!, root(lineSourceIndex)); await frames()
+  },
+  async cjkPreview() {
+    window.getSelection()?.removeAllRanges()
+    root(cases.findIndex(entry => entry.name === 'CJK original conflict reply')).scrollIntoView({ block: 'start', behavior: 'instant' })
+    await frames()
   },
   hoverTarget() {
     ;(document.activeElement as HTMLElement)?.blur()

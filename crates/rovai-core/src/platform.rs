@@ -7,6 +7,8 @@ pub(crate) mod windows_file_tree;
 #[cfg(windows)]
 pub(crate) mod windows_security;
 
+#[cfg(windows)]
+pub use private_storage::{WebAuthPathError, atomic_write_web_auth_bytes, open_web_auth_read_file};
 pub use private_storage::{
     WindowsBootstrapLayout, WindowsDataRootLayout, atomic_write_private_bytes,
     open_private_read_file, prepare_private_directory, prepare_windows_bootstrap_root,

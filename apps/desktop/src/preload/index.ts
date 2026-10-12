@@ -53,15 +53,23 @@ ipcRenderer.on(APP_PREPARE_QUIT_CHANNEL, (event) => {
   })
 })
 
+async function invokeHostWeb<T>(operation: string, input?: unknown): Promise<T> {
+  const transport = await ipcRenderer.invoke('rovai:host-web', operation, input) as RovaiRequestTransport<T>
+  // Reuse the cloneable failure envelope: throwing in Main would prepend the
+  // Electron remote-method exception and discard the domain error fields.
+  if (transport.kind === 'failure') return Promise.reject(transport.failure)
+  return transport.value
+}
+
 const api: RovaiApi = {
   windowClose: createWindowCloseApi(ipcRenderer, process.platform),
   hostWeb: {
-    loginTicket: () => ipcRenderer.invoke('rovai:host-web', 'loginTicket'),
-    token: () => ipcRenderer.invoke('rovai:host-web', 'token'),
-    status: () => ipcRenderer.invoke('rovai:host-web', 'status'),
-    start: (input) => ipcRenderer.invoke('rovai:host-web', 'start', input),
-    stop: () => ipcRenderer.invoke('rovai:host-web', 'stop'),
-    rotate: () => ipcRenderer.invoke('rovai:host-web', 'rotate')
+    loginTicket: () => invokeHostWeb('loginTicket'),
+    token: () => invokeHostWeb('token'),
+    status: () => invokeHostWeb('status'),
+    start: (input) => invokeHostWeb('start', input),
+    stop: () => invokeHostWeb('stop'),
+    rotate: () => invokeHostWeb('rotate')
   },
   async request<T>(method: CoreMethod, params?: unknown): Promise<T> {
     const transport = await ipcRenderer.invoke(

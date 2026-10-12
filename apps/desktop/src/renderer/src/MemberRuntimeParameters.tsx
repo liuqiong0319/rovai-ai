@@ -11,6 +11,7 @@ import type {
   ModelSelection,
   PermissionOptionDescriptor,
   RuntimeModelCatalogCache,
+  RuntimeModelCatalogTarget,
   RuntimeModelCatalogView
 } from '@contracts'
 import { UiText, uiAttribute, useInterfaceLanguage } from './interface-language'
@@ -21,17 +22,18 @@ export type MemberRuntimeDraft = {
 }
 
 type RuntimeParameterProps = {
+  active?: boolean
   adapterKind: AdapterKind
   installation: AdapterInstallation
   permissionOptions: PermissionOptionDescriptor[]
   draft: MemberRuntimeDraft
   disabled: boolean
-  onOpenModelCatalog?: () => Promise<RuntimeModelCatalogView>
+  onOpenModelCatalog?: (target?: RuntimeModelCatalogTarget) => Promise<RuntimeModelCatalogView>
   onChange(draft: MemberRuntimeDraft): void
 }
 
 type ModelFieldsProps = RuntimeParameterProps & {
-  optionKey?: 'reasoning_effort' | 'effort'
+  optionKey?: 'reasoning_effort' | 'effort' | 'thinking_level'
   optionLabel?: string
 }
 
@@ -91,8 +93,7 @@ function cloneRuntimeDraft(draft: MemberRuntimeDraft): MemberRuntimeDraft {
     model: draft.model.mode === 'runtime_default'
       ? { mode: 'runtime_default' }
       : {
-          mode: 'explicit',
-          modelId: draft.model.modelId,
+          ...draft.model,
           options: { ...draft.model.options }
         },
     permissions: {
@@ -105,6 +106,7 @@ function cloneRuntimeDraft(draft: MemberRuntimeDraft): MemberRuntimeDraft {
 
 export function MemberRuntimeParameters({
   inline = false,
+  active = true,
   adapterKind,
   installation,
   draft,
@@ -113,11 +115,12 @@ export function MemberRuntimeParameters({
   onChange
 }: {
   inline?: boolean
+  active?: boolean
   adapterKind: AdapterKind
   installation: AdapterInstallation | null
   draft: MemberRuntimeDraft | null
   disabled: boolean
-  onOpenModelCatalog?: () => Promise<RuntimeModelCatalogView>
+  onOpenModelCatalog?: (target?: RuntimeModelCatalogTarget) => Promise<RuntimeModelCatalogView>
   onChange(draft: MemberRuntimeDraft): void
 }): React.JSX.Element {
   useInterfaceLanguage()
@@ -125,6 +128,7 @@ export function MemberRuntimeParameters({
   const permissionOptions = installation?.permissionOptions ?? installation?.snapshot?.permissionOptions ?? []
   const content = installation && draft
     ? runtimeParametersFor(adapterKind, {
+        active,
         adapterKind,
         installation,
         permissionOptions,
@@ -161,7 +165,7 @@ export function MemberModelParameters({
   installation: AdapterInstallation | null
   model: ModelSelection | null
   disabled: boolean
-  onOpenModelCatalog?: () => Promise<RuntimeModelCatalogView>
+  onOpenModelCatalog?: (target?: RuntimeModelCatalogTarget) => Promise<RuntimeModelCatalogView>
   onChange(model: ModelSelection): void
 }): React.JSX.Element {
   const permissionOptions = installation?.permissionOptions ?? installation?.snapshot?.permissionOptions ?? []
@@ -223,6 +227,16 @@ function runtimeParametersFor(
       return <GrokRuntimeParameters {...props} />
     case 'deepseek-harness':
       return <DeepseekHarnessRuntimeParameters {...props} />
+    case 'cline-cli':
+      return (
+        <div className="runtime-parameter-form">
+          {modelFieldsFor('cline-cli', props)}
+          <PermissionSelect {...props} fieldKey="mode" label={uiAttribute("执行模式")} />
+          <PermissionSwitch {...props} fieldKey="auto_approve" label={uiAttribute("自动通过权限请求")} enabledValue="true" disabledValue="false" />
+        </div>
+      )
+    case 'command-code-cli':
+      return <div className="runtime-parameter-form">{modelFieldsFor('command-code-cli', props)}<PermissionSelect {...props} fieldKey="permission_mode" label={uiAttribute("权限模式")} /></div>
     case 'zcode-app':
       return <div className="runtime-parameter-form">{modelFieldsFor('zcode-app', props)}<PermissionSelect {...props} fieldKey="permission_mode" label={uiAttribute("权限模式")} /></div>
     case 'antigravity-app':
@@ -395,6 +409,7 @@ function modelFieldsFor(
   props: RuntimeParameterProps
 ): React.JSX.Element {
   switch (adapterKind) {
+    case 'command-code-cli':
     case 'claude-code-cli':
       return <ModelFields {...props} optionKey="effort" optionLabel={uiAttribute("思考强度")} />
     case 'codex-cli':
@@ -405,19 +420,22 @@ function modelFieldsFor(
     case 'qwen-code':
     case 'deepseek-harness':
       return <ModelFields {...props} optionKey="reasoning_effort" optionLabel={uiAttribute("推理强度")} />
-    case 'kiro-cli':
     case 'pi':
+      return <ModelFields {...props} optionKey="thinking_level" optionLabel={uiAttribute('思考强度')} />
+    case 'kiro-cli':
     case 'trae-cn-cli':
     case 'cursor-agent':
     case 'kimi-code-cli':
     case 'grok-build':
     case 'zcode-app':
+    case 'cline-cli':
     case 'antigravity-app':
       return <ModelFields {...props} />
   }
 }
 
 function ModelFields({
+  active: pageActive = true,
   adapterKind,
   installation,
   draft,
@@ -437,12 +455,114 @@ function ModelFields({
   const selectedModel = explicit
     ? initialModels.find((model) => model.id === explicit.modelId) ?? null
     : null
+  const isDsh = adapterKind === 'deepseek-harness'
+  const isPi = adapterKind === 'pi'
+  const optionsKnown = isPi
+    ? selectedModel?.runtimeMetadata?.piThinkingSchemaVersion === 1
+      && selectedModel.runtimeMetadata.piThinkingState === 'known'
+    : !isDsh || dshModelOptionsResolved(selectedModel, explicit?.dshSource)
   const option = optionKey && selectedModel
     ? selectedModel.options.find((candidate) => candidate.key === optionKey) ?? null
     : null
+  const targetKey = dshOptionReadKey(identity, draft.model)
+  const [optionRead, setOptionRead] = useState<{ key: string; status: 'loading' | 'ready' | 'failed' } | null>(null)
+  const [optionLoadingKey, setOptionLoadingKey] = useState<string | null>(null)
+  const [optionRetry, setOptionRetry] = useState(0)
+  const pendingModelSwitch = useRef<{ key: string; model: string } | null>(null)
+  const latest = useRef({ draft, onChange, onOpenModelCatalog, selectedModel })
+  latest.current = { draft, onChange, onOpenModelCatalog, selectedModel }
+
+  const updateCatalog = (catalog: RuntimeModelCatalogView): void => {
+    // The model menu and selected-model options read can finish out of order.
+    // A late catalog snapshot must not erase newer reasoning capabilities.
+    setLive(current => current?.identity === identity
+      && !liveCatalogIsAtLeastAsRecent(catalog, current.catalog.cache)
+      ? current : { identity, catalog })
+  }
+
+  useEffect(() => {
+    // Saving freezes the submitted draft. A later capability result may update
+    // the menu, but must no longer clean up that now-saved selection.
+    if (disabled) pendingModelSwitch.current = null
+    if (!isDsh || draft.model.mode !== 'explicit' || disabled || !pageActive) return
+    let active = true
+    let loadingTimer: ReturnType<typeof setTimeout> | undefined
+    setOptionLoadingKey(null)
+    const target = { modelId: draft.model.modelId, dshSource: draft.model.dshSource }
+    const accept = (model: ModelDescriptor): void => {
+      if (!active) return
+      setOptionRead({ key: targetKey, status: 'ready' })
+      // Only a deliberate model change can discard incompatible draft options.
+      // Refreshing a saved selection never rewrites it.
+      if (pendingModelSwitch.current?.key === targetKey) {
+        const pending = pendingModelSwitch.current
+        pendingModelSwitch.current = null
+        const current = latest.current.draft
+        if (dshOptionReadKey(identity, current.model) !== targetKey
+          || JSON.stringify(current.model) !== pending.model) return
+        const next = explicitSelection(model, current.model, true)
+        if (JSON.stringify(next) !== JSON.stringify(current.model)) latest.current.onChange({ ...current, model: next })
+      }
+    }
+    setOptionRead({ key: targetKey, status: 'loading' })
+    const read = latest.current.onOpenModelCatalog
+    if (!read) {
+      setOptionRead({ key: targetKey, status: 'failed' })
+      return () => { active = false }
+    }
+    const publish = (catalog: RuntimeModelCatalogView): ModelDescriptor | null => {
+      if (catalog.runtimeKind !== 'deepseek-harness' || catalog.selectedModelId !== target.modelId) {
+        throw new Error('Model options identity changed')
+      }
+      const model = catalog.models.find((candidate) => candidate.id === target.modelId) ?? null
+      // A cache miss is not evidence that the native target is unavailable.
+      if (active && model) updateCatalog(catalog)
+      return model
+    }
+    // Every visit checks local configuration, even inside the freshness window.
+    // Core owns persisted per-model timestamps, merging and in-flight deduplication.
+    void read({ ...target, cacheOnly: true }).then(async (cached) => {
+      if (!active) return
+      const cachedModel = publish(cached)
+      if (cachedModel && cached.refreshStatus === 'not_required' && dshModelOptionsResolved(cachedModel, target.dshSource)) {
+        accept(cachedModel)
+        return
+      }
+      // Fast cache hits never flash a loading indicator; only the actual read can show one.
+      loadingTimer = setTimeout(() => { if (active) setOptionLoadingKey(targetKey) }, 240)
+      const catalog = await read(target)
+      if (!active) return
+      const model = publish(catalog)
+      if (!model || !['completed', 'not_required'].includes(catalog.refreshStatus)
+        || !dshModelOptionsResolved(model, target.dshSource)) throw new Error('Model options unavailable')
+      accept(model)
+    }).catch(() => {
+      if (active) setOptionRead({ key: targetKey, status: 'failed' })
+    }).finally(() => {
+      clearTimeout(loadingTimer)
+      if (active) setOptionLoadingKey(null)
+    })
+    return () => { active = false; clearTimeout(loadingTimer) }
+  }, [isDsh, targetKey, installation.modelCatalog.observedAt, optionRetry, disabled, pageActive])
+
+  useEffect(() => {
+    if (!isDsh || !explicit || !pageActive) return
+    const revisit = (): void => setOptionRetry(value => value + 1)
+    window.addEventListener('focus', revisit)
+    return () => window.removeEventListener('focus', revisit)
+  }, [isDsh, targetKey, pageActive])
+
+  const readStatus = optionRead?.key === targetKey ? optionRead.status : 'loading'
+  const changeModel = (next: MemberRuntimeDraft): void => {
+    if (isDsh && dshOptionReadKey(identity, next.model) !== targetKey) {
+      pendingModelSwitch.current = { key: dshOptionReadKey(identity, next.model), model: JSON.stringify(next.model) }
+    }
+    onChange(next)
+  }
 
   const setOption = (value: string): void => {
     if (!explicit || !optionKey) return
+    pendingModelSwitch.current = null
     const options = { ...explicit.options }
     if (value) options[optionKey] = value
     else delete options[optionKey]
@@ -458,6 +578,9 @@ function ModelFields({
   const optionInvalid = optionValue
     ? !option?.values.some((candidate) => candidate.value === optionValue)
     : false
+  const showOption = isPi
+    ? optionValue || (optionsKnown && option?.values.some(choice => choice.value !== 'off'))
+    : isDsh ? !optionsKnown || option || optionValue : option || optionValue
 
   return (
     <>
@@ -468,22 +591,33 @@ function ModelFields({
         draft={draft}
         disabled={disabled}
         onOpenModelCatalog={onOpenModelCatalog}
-        onChange={onChange}
-        onCatalogChange={(catalog) => setLive({ identity, catalog })}
+        onChange={changeModel}
+        onCatalogChange={updateCatalog}
       />
 
-      {explicit && optionKey && (option || optionValue) && (
+      {explicit && optionKey && showOption && (
         <RuntimeParameterSelect
           label={optionLabel ?? option?.label ?? optionKey}
           value={optionValue}
           disabled={disabled}
           onChange={setOption}
-          defaultChoice={{ value: '', label:uiAttribute("跟随模型默认值") }}
+          loadingLabel={isDsh && pageActive && !disabled && readStatus === 'loading' && optionLoadingKey === targetKey
+            ? uiAttribute('正在读取可选思考强度，当前选择仍可保存') : undefined}
+          defaultChoice={{ value: '', label: isPi ? uiAttribute('跟随 Pi 原生设置')
+            : isDsh ? uiAttribute('模型默认') : uiAttribute("跟随模型默认值") }}
           choices={[
-            ...(optionInvalid ? [{ value: optionValue, label: uiAttribute("当前目录未提供 · {0}", String(optionValue)), disabled: true }] : []),
-            ...(option?.values ?? [])
+            ...(optionInvalid ? [{ value: optionValue, label: optionsKnown
+              ? uiAttribute("当前目录未提供 · {0}", String(optionValue))
+              : uiAttribute('尚未核对 · {0}', optionValue), disabled: true }] : []),
+            ...(option?.values ?? []).map(choice => ({ ...choice, disabled: isDsh && !optionsKnown }))
           ]}
         />
+      )}
+      {isDsh && explicit && !disabled && readStatus === 'failed' && (
+        <div className="runtime-parameter-unavailable" role="status">
+          <UiText zh="暂时无法读取思考强度，已保留当前选择。" />
+          <button type="button" className="quiet-button" onClick={() => setOptionRetry((value) => value + 1)}><UiText zh="重试" /></button>
+        </div>
       )}
     </>
   )
@@ -502,7 +636,7 @@ function RuntimeModelPicker({
   installation: AdapterInstallation
   draft: MemberRuntimeDraft
   disabled: boolean
-  onOpenModelCatalog?: () => Promise<RuntimeModelCatalogView>
+  onOpenModelCatalog?: (target?: RuntimeModelCatalogTarget) => Promise<RuntimeModelCatalogView>
   onChange(draft: MemberRuntimeDraft): void
   onCatalogChange(catalog: RuntimeModelCatalogView): void
 }): React.JSX.Element {
@@ -574,7 +708,8 @@ function RuntimeModelPicker({
       return
     }
     const model = models.find((candidate) => candidate.id === value)
-    if (model) onChange({ ...draft, model: explicitSelection(model, draft.model, canFilterOptions) })
+    if (model) onChange({ ...draft, model: explicitSelection(model, draft.model,
+      canFilterOptions && adapterKind !== 'deepseek-harness' && adapterKind !== 'pi') })
   }
 
   const statusCopy = modelCatalogStatusCopy(cache, {
@@ -627,8 +762,14 @@ function modelCatalogIsServiceable(cache: RuntimeModelCatalogCache): boolean {
 }
 
 function catalogInstallationIdentity(installation: AdapterInstallation): string {
-  return [installation.id, installation.generation, installation.snapshot?.executableFingerprint,
+  const healthIdentity = [installation.id, installation.generation, installation.snapshot?.executableFingerprint,
     installation.snapshot?.staleAt].join(':')
+  if (installation.adapterKind !== 'pi') return healthIdentity
+  // Pi's catalog can be invalidated independently of the shared health fields.
+  // A prior local response must not outlive Core's new ownership projection.
+  const catalogIdentity = installation.snapshot?.models.find(model => model.id === 'pi://runtime-default')
+    ?.runtimeMetadata?.piCatalogIdentity
+  return JSON.stringify([healthIdentity, installation.modelCatalog.status === 'invalidated', catalogIdentity])
 }
 
 // Display policy only. Never use this to approve a new saved model selection.
@@ -636,7 +777,7 @@ export function displayableInstallationModels(installation: AdapterInstallation)
   const cache = installation.modelCatalog
   const snapshot = installation.snapshot
   const sameEnvironmentHistory = cache.status === 'expired'
-    && snapshot?.probeStatus === 'ready' && !snapshot.staleAt
+    && (installation.adapterKind === 'pi' || (snapshot?.probeStatus === 'ready' && !snapshot.staleAt))
   return modelCatalogIsServiceable(cache) || sameEnvironmentHistory
     ? selectableModels(snapshot?.models ?? []) : []
 }
@@ -668,6 +809,7 @@ export function modelCatalogCanValidateOptions(
 }
 
 function latestCatalogRefreshFailed(installation: AdapterInstallation, cache: RuntimeModelCatalogCache): boolean {
+  if (installation.adapterKind === 'pi') return false
   const attempt = installation.lastProbeAttempt
   if (attempt?.status !== 'failed') return false
   const observedAt = cache.observedAt
@@ -733,8 +875,21 @@ export function explicitSelection(
   return {
     mode: 'explicit',
     modelId: model.id,
-    options
+    options,
+    ...(model.runtimeMetadata?.dshSource === 'native' || model.runtimeMetadata?.dshSource === 'web'
+      ? { dshSource: model.runtimeMetadata.dshSource }
+      : {})
   }
+}
+
+function dshOptionReadKey(identity: string, model: ModelSelection): string {
+  return JSON.stringify([identity, model.mode === 'explicit' ? model.modelId : null,
+    model.mode === 'explicit' ? model.dshSource ?? 'native' : null])
+}
+
+export function dshModelOptionsResolved(model: ModelDescriptor | null, source?: 'native' | 'web'): boolean {
+  return model?.runtimeMetadata?.dshOptionsResolved === true
+    && model.runtimeMetadata.dshSource === (source ?? 'native')
 }
 
 function PermissionSelect({
@@ -785,17 +940,21 @@ function PermissionSwitch({
   disabled,
   onChange,
   fieldKey,
-  label
+  label,
+  enabledValue = 'on',
+  disabledValue = 'off'
 }: RuntimeParameterProps & {
   fieldKey: string
   label: string
+  enabledValue?: string
+  disabledValue?: string
 }): React.JSX.Element {
   const language = useInterfaceLanguage()
   const hintId = useId()
   const descriptor = permissionDescriptor(permissionOptions, fieldKey)
-  const checked = draft.permissions.values[fieldKey] === 'on'
-  const recommendEnabling = descriptor?.choices.some(choice => choice.value === 'on') === true
-    && installation.memberRuntimeDefaults?.permissions.values[fieldKey] === 'on'
+  const checked = draft.permissions.values[fieldKey] === enabledValue
+  const recommendEnabling = descriptor?.choices.some(choice => choice.value === enabledValue) === true
+    && installation.memberRuntimeDefaults?.permissions.values[fieldKey] === enabledValue
   return (
     <label className="field-label runtime-parameter-switch-field">
       <span className="permission-switch-label">{label}</span>
@@ -812,7 +971,7 @@ function PermissionSwitch({
           onChange={(event) => updatePermission(
             draft,
             fieldKey,
-            event.target.checked ? 'on' : 'off',
+            event.target.checked ? enabledValue : disabledValue,
             onChange
           )}
         />

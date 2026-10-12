@@ -3,7 +3,7 @@ document_type: architecture
 architecture: runtime-monitoring
 authority: runtime-usage-metering-and-read-boundaries
 status: accepted
-last_updated: 2026-10-04
+last_updated: 2026-10-05
 ---
 
 # Runtime Monitoring 架构
@@ -61,8 +61,9 @@ summary/hourly 只加已归一的 contribution；缺 Input/Output 的 contributi
 执行台根据新完整性字段决定是否能显示 Input＋Output，四项已观测值继续可读。
 
 指标层没有 CLI 版本白名单或私设最低版本。实际字段、来源身份和计量语义决定准入；产品本身的
-Runtime 最低版本和平台门槛保持。OpenCode prompt result 不能证明整轮范围，使用原生逐调用
-来源；ACP `usage_update.cost` 的 Session 累计不进入 Run summary。Codex 完整 buckets、
+Runtime 最低版本和平台门槛保持。OpenCode V1 使用原生逐调用来源；V2 prompt response 只拥有当前
+根会话本轮已报告用量，未覆盖原生子会话／委派，因此沿用部分统计，不能作为完整 Run 总量。
+ACP `usage_update.cost` 的 Session 累计不进入 Run summary。Codex 完整 buckets、
 模型／档位／生效时间仍决定静态价格投影，不以 CLI 版本代替字段完整性。
 
 周期 Flush 不发出立即 Snapshot 事件。普通事件受全局最短间隔约束；terminal 事件可在 Debounce 后立即
@@ -72,8 +73,10 @@ Runtime 最低版本和平台门槛保持。OpenCode prompt result 不能证明�
 
 ### 本地原生数值来源与 Context
 
-CodeBuddy、Kimi Code、Qoder 与 TRAE 使用当前 workspace／Session 下的 JSONL cursor；OpenCode
-使用只读 SQLite 中的根 Session assistant 元数据。版本仅记录实测，不决定 reader 是否运行。prompt 发送前建立历史 offset 与身份 baseline；之后
+CodeBuddy、Kimi Code、Qoder 与 TRAE 使用当前 workspace／Session 下的 JSONL cursor；OpenCode V1
+使用只读 SQLite 中的根 Session assistant 元数据，读取根与所选 Runtime 的有效环境一致。
+OpenCode V2 停用 V1 reader，使用本轮终态 usage，缺响应时保持缺失；不能从两个来源重复累计。
+代际选择数据语义，不形成补丁版本白名单。prompt 发送前建立历史 offset 与身份 baseline；之后
 最多每 4 秒在既有 Flush 锁内读取、buffer、落盘，terminal 强制 Flush 保持同一 Run cursor，增加 400ms
 尾读后才允许后继 prompt 建立 baseline。整个过程在 blocking pool 读取，不持有 Core Database Mutex
 等待原生磁盘。部分行等待完整换行；文件换代、缺口、超限停止采集且不重扫历史。
@@ -105,6 +108,22 @@ Kiro 从原生 metadata 接收比例，CodeBuddy 从最新根调用输入与同�
 DSH 私有 committed Usage 保留原生完整调用 total，校验后以 total 减 output 接通含缓存 Input；
 缓存桶缺失仍未知。ZCode 从已有终态 session/read 的原生 runtime.contextUsage 提取同 Session
 used/size，在 prompt 终态之前交给现有绑定栅栏；不增加轮询或传播完整 snapshot。
+
+Cline 官方 ACP 的数值补充来自只读 Plugin `afterModel`，按根调用、精确 Prompt lease、原生 Run 和
+单调序号归属。既有周期 Flush 读取有界私有文件，terminal 消费同一批记录并排除已采序号；
+无正文、原生历史扫描或第二个定时器。四个原生 token 桶按 `model_call / delta` 归一化，可选 reasoning
+不与 output 重复相加；最新调用的含缓存 input 独立产生 used-only Gauge，实际模型来自该调用。
+Host 同时将原生 `settings/models.json` 中显式的 `contextWindow` 冻结为仅含 Provider/模型/数值的私有目录，
+observer 以实际调用返回的 Provider 与模型 ID 精确匹配后补窗口；目录由现有 native configuration digest 栅栏，
+不猜别名、不使用压缩回退或最大可选窗口。窗口和 used 独立，缺字段仍未知；此只读路径不访问 Provider 网络。
+配置缺窗口时，可先独立核验 Provider 对精确模型的元数据，再由原生配置明确生效；不把手动同步说成自动发现。
+原生比例和费用缺失时保持未知。Cline 仍未取得 First-Class 资格。
+Command Code ACP 的 `usage_update.used/size` 作为 Session Gauge，`session/prompt` 结果的 `_meta.usage`
+四个字段作为当前 prompt 的 Delta，input 包含缓存，归一化时扣除 read/write 得到 uncached；同结果的 `usage` 是 Session 累计，禁止入账。原生累计 Session
+cost 缺少安全的跨 Run baseline，按现有 OpenCode 边界保持 Run 费用未知；没有 reasoning 字段时保持 NULL。
+旧 headless 数值帧只保留内部研究路径。真实字段与验收层级见
+[两条 Runtime 数值核验](../research/runtime-monitoring/command-cline-verification-2026-10-04.md)及
+[窗口补采复核](../research/runtime-monitoring/command-cline-context-window-2026-10-05.md)。
 
 ## Read path
 

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, ensure};
+#[cfg(any(not(windows), test))]
 use rovai_core::platform::{atomic_write_private_bytes, open_private_read_file};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -89,7 +90,106 @@ pub enum LoginFailure {
     Throttled,
     Unauthorized,
     Capacity,
-    Storage,
+    Storage(AuthStoreFailure),
+}
+
+/// Safe public diagnostics. Internal error chains and credential values never
+/// become a Desktop/HTTP error message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthStoreFailure {
+    ReadDenied,
+    Read,
+    SaveDenied,
+    Save,
+    Content,
+    Path,
+}
+impl AuthStoreFailure {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::ReadDenied | Self::Read => "HOST_WEB_AUTH_READ_FAILED",
+            Self::SaveDenied | Self::Save => "HOST_WEB_AUTH_SAVE_FAILED",
+            Self::Content => "HOST_WEB_AUTH_INVALID_CONTENT",
+            Self::Path => "HOST_WEB_AUTH_INVALID_PATH",
+        }
+    }
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::ReadDenied => "无法读取登录凭据：操作系统拒绝访问。原文件已保留。",
+            Self::Read => {
+                "无法读取登录凭据：文件读取失败，请检查文件是否被占用后重试。原文件已保留。"
+            }
+            Self::SaveDenied => {
+                "无法保存登录状态：操作系统拒绝写入或替换凭据文件。原登录凭据未被修改。"
+            }
+            Self::Save => {
+                "无法保存登录状态：写入或原子替换失败，请检查磁盘空间及文件占用后重试。原登录凭据未被修改。"
+            }
+            Self::Content => {
+                "登录凭据文件内容异常，无法使用。请恢复有效的凭据文件；原文件未被覆盖。"
+            }
+            Self::Path => {
+                "登录凭据文件路径或身份异常，无法使用。请检查数据目录中的文件路径；原文件已保留。"
+            }
+        }
+    }
+    fn io(error: &anyhow::Error, saving: bool) -> Self {
+        #[cfg(windows)]
+        if error.is::<rovai_core::platform::WebAuthPathError>() {
+            return Self::Path;
+        }
+        match error.downcast_ref::<std::io::Error>() {
+            Some(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                if saving {
+                    Self::SaveDenied
+                } else {
+                    Self::ReadDenied
+                }
+            }
+            Some(_) => {
+                if saving {
+                    Self::Save
+                } else {
+                    Self::Read
+                }
+            }
+            None => Self::Path,
+        }
+    }
+    pub(crate) fn saving(error: anyhow::Error) -> Self {
+        error.downcast_ref::<Self>().copied().unwrap_or(Self::Save)
+    }
+}
+impl std::fmt::Display for AuthStoreFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+impl std::error::Error for AuthStoreFailure {}
+
+fn open_store_file(path: &Path) -> Result<std::fs::File> {
+    #[cfg(windows)]
+    let opened =
+        rovai_core::platform::open_web_auth_read_file(path.parent().expect("store parent"));
+    #[cfg(not(windows))]
+    let opened = open_private_read_file(path);
+    opened.map_err(|error| {
+        let failure = AuthStoreFailure::io(&error, false);
+        error.context(failure)
+    })
+}
+fn write_store_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(windows)]
+    let written = rovai_core::platform::atomic_write_web_auth_bytes(
+        path.parent().expect("store parent"),
+        bytes,
+    );
+    #[cfg(not(windows))]
+    let written = atomic_write_private_bytes(path, bytes);
+    written.map_err(|error| {
+        let failure = AuthStoreFailure::io(&error, true);
+        error.context(failure)
+    })
 }
 
 fn wall_clock() -> u64 {
@@ -116,24 +216,29 @@ fn valid_token(token: &str) -> bool {
     token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 fn read_store(path: &Path) -> Result<Option<StoredAuth>> {
-    // symlink_metadata also detects a dangling symlink; private-file admission
-    // rejects links and unsafe ownership instead of treating them as a new store.
+    // symlink_metadata also detects a dangling symlink; file admission rejects
+    // links and non-regular objects instead of treating them as a new store.
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         result => {
-            result?;
+            let metadata = result.map_err(|error| {
+                let error = anyhow::Error::from(error);
+                let failure = AuthStoreFailure::io(&error, false);
+                error.context(failure)
+            })?;
+            ensure!(
+                metadata.is_file() && !metadata.file_type().is_symlink(),
+                AuthStoreFailure::Path
+            );
         }
     }
     let mut bytes = Vec::new();
-    open_private_read_file(path)?
+    open_store_file(path)?
         .take(65537)
-        .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() <= 65536,
-        "Web authentication store is too large"
-    );
-    let stored: StoredAuth = serde_json::from_slice(&bytes)
-        .context("Web authentication store is invalid; credentials were not reset")?;
+        .read_to_end(&mut bytes)
+        .context(AuthStoreFailure::Read)?;
+    ensure!(bytes.len() <= 65536, AuthStoreFailure::Content);
+    let stored: StoredAuth = serde_json::from_slice(&bytes).context(AuthStoreFailure::Content)?;
     ensure!(
         stored.version == 1
             && valid_token(&stored.administrator_token)
@@ -142,7 +247,7 @@ fn read_store(path: &Path) -> Result<Option<StoredAuth>> {
                 .sessions
                 .iter()
                 .all(|session| valid_token(&session.client_id) && session.expires_at > 0),
-        "Web authentication store is unsupported or invalid; credentials were not reset"
+        AuthStoreFailure::Content
     );
     let mut digests = std::collections::HashSet::new();
     let mut editors = std::collections::HashSet::new();
@@ -151,7 +256,7 @@ fn read_store(path: &Path) -> Result<Option<StoredAuth>> {
             .sessions
             .iter()
             .all(|session| digests.insert(session.digest) && editors.insert(&session.client_id)),
-        "Web authentication store contains duplicate identities"
+        AuthStoreFailure::Content
     );
     Ok(Some(stored))
 }
@@ -259,7 +364,10 @@ impl Sessions {
                 })
                 .collect(),
         };
-        atomic_write_private_bytes(path, &serde_json::to_vec(&stored)?)
+        write_store_file(
+            path,
+            &serde_json::to_vec(&stored).context(AuthStoreFailure::Save)?,
+        )
     }
     // Publish to disk before changing memory or notifying streams. Renewal and
     // revocation use this same mutex, so a late response cannot resurrect a grant.
@@ -410,7 +518,7 @@ impl Sessions {
         let session = Session::new(client_id, expiry, now);
         next.insert(digest(b"rovai-session-v1\0", &token), session.clone());
         self.replace(state, &state.administrator_plaintext.clone(), next)
-            .map_err(|_| LoginFailure::Storage)?;
+            .map_err(|error| LoginFailure::Storage(AuthStoreFailure::saving(error)))?;
         Ok((token, session))
     }
     fn live(&self, state: &SessionState, session: &Session) -> bool {
@@ -455,7 +563,7 @@ impl Sessions {
                 &state.sessions,
                 Some((session, expiry)),
             )
-            .map_err(|_| LoginFailure::Storage)?;
+            .map_err(|error| LoginFailure::Storage(AuthStoreFailure::saving(error)))?;
             session.expires_at.send_replace(expiry);
         }
         Ok(self.timing(session))
@@ -730,6 +838,29 @@ mod tests {
             Arc::new(move || now.load(Ordering::SeqCst))
         };
         let open = || Sessions::open_with_clock(&root, None, clock.clone()).unwrap();
+        #[cfg(windows)]
+        {
+            // A restored file inherits the admitted parent's permissions. It
+            // must be readable without rewriting credentials or repairing ACLs.
+            let path = root.join(STORE_FILE);
+            let bytes = serde_json::to_vec(&StoredAuth {
+                version: 1,
+                administrator_token: "a".repeat(64),
+                sessions: Vec::new(),
+            })
+            .unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(open_private_read_file(&path).is_err());
+            assert_eq!(
+                stored_administrator_token(&root).unwrap().unwrap(),
+                "a".repeat(64)
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert!(
+                open_private_read_file(&path).is_err(),
+                "read must leave the inherited ACL unchanged"
+            );
+        }
         let registry = open();
         let token = registry.administrator_token();
         let (bearer, session) = registry.login(&token).ok().unwrap();
@@ -786,7 +917,7 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         assert!(matches!(
             registry.renew(&restored),
-            Err(LoginFailure::Storage)
+            Err(LoginFailure::Storage(_))
         ));
         assert_eq!(restored.expiry(), expiry);
         assert!(registry.revoke(&restored).is_err());
@@ -794,7 +925,7 @@ mod tests {
         assert!(registry.rotate(&new_token().unwrap()).is_err());
         assert!(matches!(
             registry.issue(0, new_token().unwrap()),
-            Err(LoginFailure::Storage)
+            Err(LoginFailure::Storage(_))
         ));
         assert_eq!(registry.count(), MAX_SESSIONS);
         assert!(registry.authenticate(&candidate).is_some());
@@ -841,9 +972,27 @@ mod tests {
         assert!(registry.authenticate(&rotated).is_none());
         assert!(registry.authorize_login(&token).is_err());
         drop(registry);
-        atomic_write_private_bytes(&path, b"{broken").unwrap();
-        assert!(Sessions::open(&root, None).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), b"{broken");
+        for bytes in [
+            b"{broken".to_vec(),
+            vec![b' '; 65537],
+            serde_json::to_vec(&StoredAuth {
+                version: 2,
+                administrator_token: replacement.clone(),
+                sessions: Vec::new(),
+            })
+            .unwrap(),
+        ] {
+            // Match credential I/O policy when constructing invalid-content fixtures.
+            write_store_file(&path, &bytes).unwrap();
+            let error = Sessions::open(&root, None)
+                .err()
+                .expect("invalid content must fail");
+            assert_eq!(
+                error.downcast_ref::<AuthStoreFailure>(),
+                Some(&AuthStoreFailure::Content)
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -1147,6 +1147,10 @@ fn persist_usage_record(
             delta.any_observed().then(|| {
                 normalized.prompt_input_total_tokens.is_some()
                     && normalized.output_tokens.is_some()
+                    // This is a reliable root-prompt sum, but does not cover
+                    // native delegated Sessions. Reuse the existing partial
+                    // quality instead of advertising a complete Run total.
+                    && record.usage.dialect_id != "opencode-acp-root-prompt-usage-v2"
                     && existing.as_ref().is_none_or(|checkpoint| {
                         record.usage.counter_mode == RuntimeUsageCounterMode::Delta
                             || (checkpoint.baseline.prompt_input_total_tokens.is_some()
@@ -2037,6 +2041,10 @@ fn eligible_mask(runtime: AdapterKind, _runtime_version: Option<&str>) -> i64 {
         }
         AdapterKind::ZcodeApp => {
             ELIGIBLE_PROMPT_INPUT_TOTAL | ELIGIBLE_CACHE_READ | ELIGIBLE_OUTPUT
+        }
+        AdapterKind::ClineCli => full_tokens,
+        AdapterKind::CommandCodeCli => {
+            full_tokens & !(ELIGIBLE_REASONING_OUTPUT | ELIGIBLE_REQUEST_CACHE_HIT)
         }
         AdapterKind::DeepseekHarness => {
             ELIGIBLE_UNCACHED_INPUT
@@ -3107,7 +3115,7 @@ fn dsh_exact_prompt_total(usage: &Value, fields: &RuntimeUsageFields) -> Option<
 
 pub fn parse_acp_usage_message(
     adapter_kind: AdapterKind,
-    _runtime_version: Option<&str>,
+    runtime_version: Option<&str>,
     method: &str,
     params: &Value,
 ) -> Vec<ParsedRuntimeUsage> {
@@ -3221,6 +3229,16 @@ pub fn parse_acp_usage_message(
             context_model_id: None,
             occurred_at: None,
         }];
+    }
+    if adapter_kind == AdapterKind::ClineCli && method == "session/update" {
+        return params
+            .pointer("/update/_meta/clineObservations")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|record| record["sessionId"] == params["sessionId"])
+            .flat_map(crate::cline::parse_observations)
+            .collect();
     }
     if adapter_kind == AdapterKind::DeepseekHarness && method == "session/update" {
         let update = &params["update"];
@@ -3491,8 +3509,11 @@ pub fn parse_acp_usage_message(
             }
         }
 
-        let cost = if adapter_kind == AdapterKind::OpencodeCli {
-            // OpenCode reports totalSessionCost(messages) here, not the current
+        let cost = if matches!(
+            adapter_kind,
+            AdapterKind::OpencodeCli | AdapterKind::CommandCodeCli
+        ) {
+            // These adapters report total Session cost here, not the current
             // Turn/Run cost. A Run projection requires a Native Session-scoped
             // baseline, which the minimal Usage model intentionally does not own.
             None
@@ -3558,14 +3579,61 @@ pub fn parse_acp_usage_message(
     if method != "rovai/acp_prompt_completed" {
         return Vec::new();
     }
-    if adapter_kind == AdapterKind::OpencodeCli {
-        // This terminal shape can describe only the last assistant call.
-        // Per-call native metadata is the Run source; unavailable metadata
-        // stays unknown instead of presenting this tail as a complete Run.
+    if adapter_kind == AdapterKind::OpencodeCli
+        && crate::opencode_compat::Generation::from_version(runtime_version)
+            != Some(crate::opencode_compat::Generation::V2)
+    {
+        // V1's verified per-call database reader owns consumption. Unknown
+        // dialects cannot borrow V2's root-prompt aggregate semantics.
         return Vec::new();
     }
-    let usage = params.pointer("/result/usage").unwrap_or(&Value::Null);
+    if !crate::runtime::is_root_output(params) || !crate::runtime::is_root_output(&params["result"])
+    {
+        return Vec::new();
+    }
+    let usage = params
+        .pointer(if adapter_kind == AdapterKind::CommandCodeCli {
+            "/result/_meta/usage"
+        } else {
+            "/result/usage"
+        })
+        .unwrap_or(&Value::Null);
     let (dialect_id, input_semantics, fields) = match adapter_kind {
+        AdapterKind::OpencodeCli => {
+            // V2 separates reasoning from output and both cache buckets from
+            // input. totalTokens covers this root prompt, not delegated Sessions.
+            let reasoning = integer_at_any(usage, &["/thoughtTokens"]);
+            let output = integer_at_any(usage, &["/outputTokens"])
+                .and_then(|output| output.checked_add(reasoning.unwrap_or(0)));
+            let total_input = integer_at_any(usage, &["/totalTokens"])
+                .zip(output)
+                .and_then(|(total, output)| total.checked_sub(output))
+                .filter(|input| *input >= 0);
+            (
+                "opencode-acp-root-prompt-usage-v2",
+                RuntimeInputSemantics::CacheInclusiveTotal,
+                RuntimeUsageFields {
+                    input_tokens: total_input,
+                    uncached_input_tokens: integer_at_any(usage, &["/inputTokens"]),
+                    output_tokens: output,
+                    reasoning_output_tokens: reasoning,
+                    cache_read_input_tokens: integer_at_any(usage, &["/cachedReadTokens"]),
+                    cache_write_input_tokens: integer_at_any(usage, &["/cachedWriteTokens"]),
+                    ..Default::default()
+                },
+            )
+        }
+        AdapterKind::CommandCodeCli => (
+            "command-code-acp-prompt-usage-v1",
+            RuntimeInputSemantics::CacheInclusiveTotal,
+            RuntimeUsageFields {
+                input_tokens: integer_at_any(usage, &["/inputTokens"]),
+                output_tokens: integer_at_any(usage, &["/outputTokens"]),
+                cache_read_input_tokens: integer_at_any(usage, &["/cacheReadTokens"]),
+                cache_write_input_tokens: integer_at_any(usage, &["/cacheWriteTokens"]),
+                ..Default::default()
+            },
+        ),
         AdapterKind::CopilotCli => (
             "acp-copilot-usage-v2",
             RuntimeInputSemantics::CacheInclusiveTotal,
@@ -4959,6 +5027,60 @@ mod tests {
 
     #[test]
     fn runtime_parsers_emit_sparse_usage_without_antigravity_inference() {
+        let root_prompt = json!({"sessionId":"root", "promptId":"prompt-1", "result":{"usage":{
+            "inputTokens":100,"cachedReadTokens":40,"cachedWriteTokens":20,
+            "outputTokens":10,"thoughtTokens":5,"totalTokens":175}}});
+        for version in [None, Some("1.18.32"), Some("unknown")] {
+            assert!(
+                parse_acp_usage_message(
+                    AdapterKind::OpencodeCli,
+                    version,
+                    "rovai/acp_prompt_completed",
+                    &root_prompt
+                )
+                .is_empty()
+            );
+        }
+        let parsed = parse_acp_usage_message(
+            AdapterKind::OpencodeCli,
+            Some("opencode v2.0.26"),
+            "rovai/acp_prompt_completed",
+            &root_prompt,
+        );
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].scope, "turn");
+        assert_eq!(parsed[0].dialect_id, "opencode-acp-root-prompt-usage-v2");
+        let normalized = normalize_usage(&parsed[0]).unwrap();
+        assert_eq!(normalized.prompt_input_total_tokens, Some(160));
+        assert_eq!(normalized.uncached_input_tokens, Some(100));
+        assert_eq!(normalized.output_tokens, Some(15));
+        assert_eq!(normalized.reasoning_output_tokens, Some(5));
+        assert!(parsed[0].cost.is_none());
+        for missing in [json!({}), json!({"inputTokens":100,"outputTokens":10})] {
+            let mut sparse = root_prompt.clone();
+            sparse["result"]["usage"] = missing;
+            for usage in parse_acp_usage_message(
+                AdapterKind::OpencodeCli,
+                Some("2.99.0"),
+                "rovai/acp_prompt_completed",
+                &sparse,
+            ) {
+                assert_eq!(usage.fields.cache_read_input_tokens, None);
+                assert_eq!(usage.fields.reasoning_output_tokens, None);
+                assert_eq!(usage.fields.input_tokens, None);
+            }
+        }
+        let mut child = root_prompt;
+        child["_meta"] = json!({"opencode/child-session":{"sessionId":"child"}});
+        assert!(
+            parse_acp_usage_message(
+                AdapterKind::OpencodeCli,
+                Some("2.0.26"),
+                "rovai/acp_prompt_completed",
+                &child
+            )
+            .is_empty()
+        );
         let mut step = json!({"conversation_id":"native-session","step_index":5,"state":"DONE",
             "step_type":"agent_response","text_delta":"PRIVATE_AGY_CANARY","usage":{
                 "input_tokens":4211,"output_tokens":133,"thinking_tokens":13,"cache_read_tokens":12206,"total_tokens":4344}});
@@ -5465,6 +5587,84 @@ mod tests {
             );
             assert_eq!(normalized.output_tokens, usage["outputTokens"].as_i64());
         }
+        // Command Code result.usage is cumulative across the native Session;
+        // only _meta.usage is a current-prompt delta. Warm reuse must not
+        // double-charge previous turns or turn a context gauge into input.
+        let mut command = json!({"sessionId":"command-session","result":{
+            "usage":{"inputTokens":9000,"outputTokens":1000},
+            "_meta":{"usage":{"inputTokens":105,"outputTokens":7,"cacheReadTokens":80,"cacheWriteTokens":5}}}});
+        let parsed = parse_acp_usage_message(
+            AdapterKind::CommandCodeCli,
+            Some("1.74.1"),
+            "rovai/acp_prompt_completed",
+            &command,
+        );
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].counter_mode, RuntimeUsageCounterMode::Delta);
+        assert_eq!(
+            normalize_usage(&parsed[0])
+                .unwrap()
+                .prompt_input_total_tokens,
+            Some(105)
+        );
+        assert_eq!(parsed[0].fields.reasoning_output_tokens, None);
+        command["result"]["_meta"] = json!({});
+        assert!(
+            parse_acp_usage_message(
+                AdapterKind::CommandCodeCli,
+                None,
+                "rovai/acp_prompt_completed",
+                &command
+            )
+            .is_empty()
+        );
+        let command_context = parse_acp_usage_message(
+            AdapterKind::CommandCodeCli,
+            Some("1.74.1"),
+            "session/update",
+            &json!({"sessionId":"command-session","update":{"sessionUpdate":"usage_update","used":720,"size":1000000,"cost":{"amount":0.004,"currency":"USD"}}}),
+        );
+        assert_eq!(
+            command_context[0].counter_mode,
+            RuntimeUsageCounterMode::Gauge
+        );
+        assert_eq!(command_context[0].fields.context_size_tokens, Some(1000000));
+        assert_eq!(command_context[0].fields.input_tokens, None);
+        assert_eq!(
+            command_context.len(),
+            1,
+            "Session cumulative cost must not be charged to this Run"
+        );
+        assert!(command_context[0].cost.is_none());
+
+        let cline = parse_acp_usage_message(
+            AdapterKind::ClineCli,
+            Some("3.0.65"),
+            "session/update",
+            &json!({"sessionId":"cline-session","update":{"sessionUpdate":"usage_update","_meta":{"clineObservations":[
+                {"schemaVersion":1,"kind":"model_completed","sessionId":"other-session","runId":"wrong","messageId":"wrong","metrics":{"inputTokens":900}},
+                {"schemaVersion":1,"kind":"model_completed","sessionId":"cline-session","runId":"native-run","messageId":"model-message","metrics":{"inputTokens":110,"cacheReadTokens":100,"cacheWriteTokens":0,"outputTokens":7}}
+            ]}}}),
+        );
+        assert_eq!(cline.len(), 2);
+        assert_eq!(cline[0].identity_suffix, "native-run:model-message");
+        assert_eq!(cline[0].native_session_id.as_deref(), Some("cline-session"));
+        let cline_normalized = normalize_usage(&cline[0]).unwrap();
+        assert_eq!(cline_normalized.prompt_input_total_tokens, Some(110));
+        assert_eq!(cline_normalized.uncached_input_tokens, Some(10));
+        assert_eq!(cline_normalized.cache_read_tokens, Some(100));
+        assert_eq!(cline_normalized.output_tokens, Some(7));
+        assert!(cline[0].cost.is_none());
+        assert_eq!(cline[0].scope, "model_call");
+        assert_eq!(cline_normalized.cache_observable_request_count, Some(1));
+        assert_eq!(cline_normalized.cache_hit_request_count, Some(1));
+        assert_eq!(cline[1].counter_mode, RuntimeUsageCounterMode::Gauge);
+        assert_eq!(cline[1].fields.context_used_tokens, Some(110));
+        assert_eq!(cline[1].fields.context_size_tokens, None);
+        assert_eq!(
+            normalize_usage(&cline[1]).unwrap(),
+            UsageCounters::default()
+        );
 
         // ACP terminal Usage can be a single final call. It must never become
         // a complete Run merely because a version differs from the witness.

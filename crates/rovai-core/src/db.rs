@@ -2,6 +2,8 @@
 mod attachment_paths;
 #[path = "db_member_creation.rs"]
 mod member_creation;
+#[path = "db_member_environment.rs"]
+mod member_environment;
 #[path = "db_message_mentions.rs"]
 mod message_mentions;
 #[path = "db_mission_context.rs"]
@@ -28,9 +30,13 @@ pub(crate) fn downgrade_message_mentions_fixture(database: &Database) {
     message_mentions::downgrade_for_test(database.connection());
 }
 
+#[cfg(all(test, feature = "extended-tests"))]
+pub(crate) use run_continuation::assert_legacy_request_upgrade;
+
 #[cfg(all(test, feature = "slow-tests"))]
 pub(crate) fn upgrade_message_mentions_fixture(database: &mut Database) {
     message_mentions::migrate(database).unwrap();
+    run_continuation::migrate_requests(database).unwrap();
 }
 
 // Exercise upgrade against the context owner's populated, isolated legacy fixture.
@@ -333,7 +339,7 @@ impl MainThreadMigrationSource {
 }
 
 pub(crate) const CURRENT_DATA_CONTRACT_VERSION: &str = "v1.72";
-pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 138;
+pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 143;
 const V147_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.54";
 const V147_MIGRATION_SOURCE_PROJECTION_SCHEMA_VERSION: i64 = 96;
 const V145_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.53";
@@ -796,6 +802,11 @@ struct CurrentMigrationState {
     v186: bool,
     v187: bool,
     v188: bool,
+    v189: bool,
+    v190: bool,
+    v191: bool,
+    v192: bool,
+    v193: bool,
 }
 
 impl CurrentMigrationState {
@@ -817,18 +828,58 @@ impl CurrentMigrationState {
     }
 
     fn admits(&self, contract: &str, schema: i64, classifier: &str) -> bool {
+        if self.v193 {
+            let mut previous = *self;
+            previous.v193 = false;
+            return contract == CURRENT_DATA_CONTRACT_VERSION
+                && schema == CURRENT_PROJECTION_SCHEMA_VERSION
+                && self.v192
+                && previous.admits("v1.72", 142, classifier);
+        }
+        if self.v192 {
+            let mut previous = *self;
+            previous.v192 = false;
+            return contract == "v1.72"
+                && schema == 142
+                && self.v191
+                && previous.admits("v1.72", 141, classifier);
+        }
+        if self.v191 {
+            let mut previous = *self;
+            previous.v191 = false;
+            return contract == CURRENT_DATA_CONTRACT_VERSION
+                && schema == 141
+                && self.v190
+                && previous.admits("v1.72", 140, classifier);
+        }
+        if self.v190 {
+            let mut previous = *self;
+            previous.v190 = false;
+            return contract == CURRENT_DATA_CONTRACT_VERSION
+                && schema == 140
+                && self.v189
+                && previous.admits("v1.72", 139, classifier);
+        }
+        if self.v189 {
+            let mut previous = *self;
+            previous.v189 = false;
+            return contract == CURRENT_DATA_CONTRACT_VERSION
+                && schema == 139
+                && self.v188
+                && previous.admits("v1.72", 138, classifier);
+        }
         if self.v188 {
             let mut previous = *self;
             previous.v188 = false;
-            return contract == CURRENT_DATA_CONTRACT_VERSION
-                && schema == CURRENT_PROJECTION_SCHEMA_VERSION
+            return contract == "v1.72"
+                && schema == 138
                 && self.v187
                 && previous.admits("v1.72", 137, classifier);
         }
         if self.v187 {
             let mut previous = *self;
             previous.v187 = false;
-            return contract == "v1.72"
+            return contract == CURRENT_DATA_CONTRACT_VERSION
                 && schema == 137
                 && self.v186
                 && previous.admits("v1.72", 136, classifier);
@@ -836,7 +887,7 @@ impl CurrentMigrationState {
         if self.v186 {
             let mut previous = *self;
             previous.v186 = false;
-            return contract == CURRENT_DATA_CONTRACT_VERSION
+            return contract == "v1.72"
                 && schema == 136
                 && self.v185
                 && previous.admits("v1.72", 135, classifier);
@@ -3374,10 +3425,24 @@ pub(crate) fn classify_database_contract(
         || (migrations.v181 && !user_projection::schema_matches(connection)?)
         || (migrations.v182 && !member_creation::schema_matches(connection)?)
         || (migrations.v183 && !pending_draft::schema_matches(connection)?)
-        || (migrations.v184 && !run_continuation::schema_matches(connection)?)
-        || (migrations.v185 && !mission_description::schema_matches(connection)?)
-        || (migrations.v186 && !user_anchors::schema_matches(connection)?)
-        || (migrations.v187 && !message_mentions::schema_matches(connection)?)
+        || (migrations.v184 && !runtime_v184_source_schema_matches(connection, migrations.v185)?)
+        || (migrations.v186 && !run_continuation::schema_matches(connection)?)
+        || (migrations.v185 && !runtime_v185_source_schema_matches(connection, migrations.v186)?)
+        || (migrations.v187
+            && (!mission_description::schema_matches(connection)?
+                || !message_mentions::source_schema_matches(connection)?))
+        || (migrations.v189 && !message_mentions::schema_matches(connection)?)
+        || (migrations.v188
+            && (!user_anchors::schema_matches(connection)?
+                || !run_continuation::request_source_schema_matches(connection)?
+                || (!command_code_runtime_v185_schema_matches(connection)?
+                    && (!message_mentions::schema_matches(connection)?
+                        || !run_continuation::request_schema_matches(connection)?))))
+        || (migrations.v191 && !member_environment::schema_matches(connection)?)
+        || (migrations.v192 && !member_environment::session_schema_matches(connection)?)
+        || (migrations.v190
+            && (!run_continuation::request_schema_matches(connection)?
+                || !command_code_runtime_v185_schema_matches(connection)?))
         || (migrations.v156
             && !migrations.v157
             && !attachment_paths::schema_matches(connection)?
@@ -4660,6 +4725,179 @@ const DSH_RUNTIME_TABLES: [&str; 5] = [
 ];
 const DSH_SKILL_TABLES: [&str; 2] = ["skill_group_assignment", "skill_projection_observation"];
 
+fn runtime_v184_source_schema_matches(
+    connection: &Connection,
+    has_v185: bool,
+) -> rusqlite::Result<bool> {
+    let cline = cline_runtime_v184_schema_matches(connection)?;
+    if cline {
+        return Ok(has_v185 || !connection.table_exists(None, "camp_run_continuation")?);
+    }
+    if !run_continuation::schema_matches(connection)? {
+        return Ok(false);
+    }
+    // A main/134 source has no partial Preview catalog expansion.
+    for (tables, tokens) in [
+        (
+            &DSH_RUNTIME_TABLES[..],
+            ["'cline-cli'", "'command-code-cli'"],
+        ),
+        (&DSH_SKILL_TABLES[..], ["'cline'", "'command_code'"]),
+    ] {
+        for table in tables {
+            let sql: String = connection.query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |row| row.get(0),
+            )?;
+            if tokens.iter().any(|token| sql.contains(token)) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+// Receipt 185 was independently deployed for the Preview catalog and main's
+// structured Mission descriptions. Admit exact schemas, never the receipt alone.
+fn runtime_v185_source_schema_matches(
+    connection: &Connection,
+    has_v186: bool,
+) -> rusqlite::Result<bool> {
+    let descriptions = mission_description::schema_matches(connection)?;
+    if connection.table_exists(None, "mission_description")? && !descriptions {
+        return Ok(false);
+    }
+    if cline_runtime_v184_schema_matches(connection)? {
+        return command_code_runtime_v185_schema_matches(connection);
+    }
+    // Main's receipt 186 owns the exact direct-reply index instead of the
+    // Preview catalog convergence. This remains a source until migration 188.
+    Ok((!has_v186 || user_anchors::schema_matches(connection)?)
+        && descriptions
+        && runtime_v184_source_schema_matches(connection, true)?)
+}
+
+fn cline_runtime_v184_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
+    for (tables, token) in [
+        (&DSH_RUNTIME_TABLES[..], "'cline-cli'"),
+        (&DSH_SKILL_TABLES[..], "'cline'"),
+    ] {
+        for table in tables {
+            let sql: Option<String> = connection
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if sql.is_none_or(|sql| !sql.contains(token)) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn rewrite_cline_runtime_closed_sets(tx: &Transaction<'_>, reverse: bool) -> Result<()> {
+    // SQLite does not allow changing CHECK expressions in place. Preserve all
+    // existing trigger SQL while rebuilding the seven closed-set tables.
+    let triggers = {
+        let mut statement = tx.prepare(
+            "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND sql IS NOT NULL ORDER BY name",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (name, _) in &triggers {
+        tx.execute_batch(&format!("DROP TRIGGER \"{}\"", name.replace('"', "\"\"")))?;
+    }
+    for (tables, old, new) in [
+        (
+            &DSH_RUNTIME_TABLES[..],
+            "'deepseek-harness'",
+            "'deepseek-harness', 'cline-cli'",
+        ),
+        (&DSH_SKILL_TABLES[..], "'dsh'", "'dsh', 'cline'"),
+    ] {
+        for table in tables {
+            expand_closed_set(
+                tx,
+                table,
+                if reverse { new } else { old },
+                if reverse { old } else { new },
+            )?;
+        }
+    }
+    for (_, sql) in triggers {
+        tx.execute_batch(&sql)?;
+    }
+    Ok(())
+}
+
+fn command_code_runtime_v185_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
+    for (tables, token) in [
+        (&DSH_RUNTIME_TABLES[..], "'command-code-cli'"),
+        (&DSH_SKILL_TABLES[..], "'command_code'"),
+    ] {
+        for table in tables {
+            let sql: Option<String> = connection
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if sql.is_none_or(|sql| !sql.contains(token)) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn rewrite_command_code_runtime_closed_sets(tx: &Transaction<'_>, reverse: bool) -> Result<()> {
+    // SQLite does not allow changing CHECK expressions in place. Preserve all
+    // existing trigger SQL while rebuilding the seven closed-set tables.
+    let triggers = {
+        let mut statement = tx.prepare(
+            "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND sql IS NOT NULL ORDER BY name",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (name, _) in &triggers {
+        tx.execute_batch(&format!("DROP TRIGGER \"{}\"", name.replace('"', "\"\"")))?;
+    }
+    for (tables, old, new) in [
+        (
+            &DSH_RUNTIME_TABLES[..],
+            "'cline-cli'",
+            "'cline-cli', 'command-code-cli'",
+        ),
+        (&DSH_SKILL_TABLES[..], "'cline'", "'cline', 'command_code'"),
+    ] {
+        for table in tables {
+            expand_closed_set(
+                tx,
+                table,
+                if reverse { new } else { old },
+                if reverse { old } else { new },
+            )?;
+        }
+    }
+    for (_, sql) in triggers {
+        tx.execute_batch(&sql)?;
+    }
+    Ok(())
+}
+
 fn dsh_runtime_v157_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
     for (tables, token) in [
         (&DSH_RUNTIME_TABLES[..], "'deepseek-harness'"),
@@ -5291,7 +5529,12 @@ fn load_current_migration_state(
                EXISTS(SELECT 1 FROM schema_migration WHERE version = 185),
                EXISTS(SELECT 1 FROM schema_migration WHERE version = 186),
                EXISTS(SELECT 1 FROM schema_migration WHERE version = 187),
-               EXISTS(SELECT 1 FROM schema_migration WHERE version = 188)
+               EXISTS(SELECT 1 FROM schema_migration WHERE version = 188),
+               EXISTS(SELECT 1 FROM schema_migration WHERE version = 189),
+               EXISTS(SELECT 1 FROM schema_migration WHERE version = 190),
+               EXISTS(SELECT 1 FROM schema_migration WHERE version = 191),
+               EXISTS(SELECT 1 FROM schema_migration WHERE version = 192),
+               EXISTS(SELECT 1 FROM schema_migration WHERE version = 193)
         "#,
         [],
         |row| {
@@ -5415,6 +5658,11 @@ fn load_current_migration_state(
                 v186: row.get(116)?,
                 v187: row.get(117)?,
                 v188: row.get(118)?,
+                v189: row.get(119)?,
+                v190: row.get(120)?,
+                v191: row.get(121)?,
+                v192: row.get(122)?,
+                v193: row.get(123)?,
             })
         },
     )
@@ -7579,6 +7827,29 @@ impl Database {
             "#,
             [&now],
         )?;
+        let lost_batches = {
+            let mut query = transaction.prepare(
+                "SELECT id FROM agent_run WHERE invocation_kind = 'batch'
+                 AND status IN ('running', 'waiting') AND cancel_requested_at IS NULL
+                 AND EXISTS (SELECT 1 FROM runtime_input_delivery AS input
+                     WHERE input.agent_run_id = agent_run.id
+                     AND (input.status IN ('accepted', 'delivery_unknown')
+                         OR (input.status = 'prepared' AND input.dispatch_started_at IS NOT NULL)))",
+            )?;
+            query
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for run_id in &lost_batches {
+            crate::runtime::settle_lost_agent_run_in_tx(
+                &transaction,
+                run_id,
+                &crate::command::ActorRef::System {
+                    component_id: "runtime-recovery-coordinator".into(),
+                },
+                &now,
+            )?;
+        }
         let accepted_input_recovery_blockers_created = transaction.execute(
             r#"
             UPDATE agent_run
@@ -7681,7 +7952,8 @@ impl Database {
         )?;
         let summary = V2RecoverySummary {
             runs_waiting_for_recovery,
-            accepted_input_recovery_blockers_created,
+            accepted_input_recovery_blockers_created: accepted_input_recovery_blockers_created
+                + lost_batches.len() as i64,
             actions_returned_to_prepared,
             actions_marked_unknown,
             intercepted_actions_failed_closed,
@@ -8541,19 +8813,34 @@ impl Database {
                 migration_step!("migration_183", pending_draft::migrate(self));
             }
             if !self.schema_migration_applied(184)? {
-                migration_step!("migration_184", run_continuation::migrate(self));
+                migration_step!("migration_184", self.migrate_cline_runtime_v184());
             }
             if !self.schema_migration_applied(185)? {
-                migration_step!("migration_185", mission_description::migrate(self));
+                migration_step!("migration_185", self.migrate_command_code_runtime_v185());
             }
             if !self.schema_migration_applied(186)? {
-                migration_step!("migration_186", user_anchors::migrate(self));
+                migration_step!("migration_186", run_continuation::migrate(self));
             }
             if !self.schema_migration_applied(187)? {
-                migration_step!("migration_187", message_mentions::migrate(self));
+                migration_step!("migration_187", mission_description::migrate(self));
             }
             if !self.schema_migration_applied(188)? {
-                migration_step!("migration_188", self.migrate_member_confirmation_v188());
+                migration_step!("migration_188", user_anchors::migrate(self));
+            }
+            if !self.schema_migration_applied(189)? {
+                migration_step!("migration_189", message_mentions::migrate(self));
+            }
+            if !self.schema_migration_applied(190)? {
+                migration_step!("migration_190", run_continuation::migrate_requests(self));
+            }
+            if !self.schema_migration_applied(191)? {
+                migration_step!("migration_191", member_environment::migrate(self));
+            }
+            if !self.schema_migration_applied(192)? {
+                migration_step!("migration_192", member_environment::migrate_sessions(self));
+            }
+            if !self.schema_migration_applied(193)? {
+                migration_step!("migration_193", self.migrate_member_confirmation_v193());
             }
             if let Err(error) =
                 crate::notification::maintain_notification_episode_retention(self.connection())
@@ -9324,19 +9611,34 @@ impl Database {
             migration_step!("migration_183", pending_draft::migrate(self));
         }
         if !self.schema_migration_applied(184)? {
-            migration_step!("migration_184", run_continuation::migrate(self));
+            migration_step!("migration_184", self.migrate_cline_runtime_v184());
         }
         if !self.schema_migration_applied(185)? {
-            migration_step!("migration_185", mission_description::migrate(self));
+            migration_step!("migration_185", self.migrate_command_code_runtime_v185());
         }
         if !self.schema_migration_applied(186)? {
-            migration_step!("migration_186", user_anchors::migrate(self));
+            migration_step!("migration_186", run_continuation::migrate(self));
         }
         if !self.schema_migration_applied(187)? {
-            migration_step!("migration_187", message_mentions::migrate(self));
+            migration_step!("migration_187", mission_description::migrate(self));
         }
         if !self.schema_migration_applied(188)? {
-            migration_step!("migration_188", self.migrate_member_confirmation_v188());
+            migration_step!("migration_188", user_anchors::migrate(self));
+        }
+        if !self.schema_migration_applied(189)? {
+            migration_step!("migration_189", message_mentions::migrate(self));
+        }
+        if !self.schema_migration_applied(190)? {
+            migration_step!("migration_190", run_continuation::migrate_requests(self));
+        }
+        if !self.schema_migration_applied(191)? {
+            migration_step!("migration_191", member_environment::migrate(self));
+        }
+        if !self.schema_migration_applied(192)? {
+            migration_step!("migration_192", member_environment::migrate_sessions(self));
+        }
+        if !self.schema_migration_applied(193)? {
+            migration_step!("migration_193", self.migrate_member_confirmation_v193());
         }
         if let Err(error) =
             crate::notification::maintain_notification_episode_retention(self.connection())
@@ -28845,11 +29147,11 @@ impl Database {
         Ok(())
     }
 
-    /// migration 188: member.create confirmation state machine (preview/event/
+    /// migration 193: member.create confirmation state machine (preview/event/
     /// capability/publish-intent tables) + reversible archived presence status.
-    /// Source v1.72/137; post state v1.72/138 == Current. SQL validated end-to-end against
+    /// Source v1.72/142; post state v1.72/143 == Current. SQL validated end-to-end against
     /// SQLite 3.43.2 (see p0-v24-sql-harness.py in the plan notes).
-    fn migrate_member_confirmation_v188(&mut self) -> Result<()> {
+    fn migrate_member_confirmation_v193(&mut self) -> Result<()> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -28858,9 +29160,9 @@ impl Database {
                 classify_database_contract(&tx)?,
                 DatabaseContractClassification::SupportedMigrationSource(ref marker)
                     if marker.contract_version == "v1.72"
-                        && marker.projection_schema_version == 137
+                        && marker.projection_schema_version == 142
             ),
-            "member confirmation migration requires the v1.72/schema 137 source"
+            "member confirmation migration requires the v1.72/schema 142 source"
         );
         tx.execute_batch(
             r#"
@@ -28972,8 +29274,8 @@ impl Database {
                 resolved_at TEXT
             );
 
-            INSERT INTO schema_migration VALUES (188, datetime('now'));
-            UPDATE rovai_data_contract SET projection_schema_version=138, updated_at=datetime('now') WHERE singleton=1;
+            INSERT INTO schema_migration VALUES (193, datetime('now'));
+            UPDATE rovai_data_contract SET projection_schema_version=143, updated_at=datetime('now') WHERE singleton=1;
             "#,
         )?;
         anyhow::ensure!(
@@ -28993,6 +29295,137 @@ impl Database {
             ],
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    fn migrate_cline_runtime_v184(&mut self) -> Result<()> {
+        self.connection.execute_batch("PRAGMA foreign_keys=OFF;")?;
+        let result = (|| -> Result<()> {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            anyhow::ensure!(
+                matches!(
+                    classify_database_contract(&tx)?,
+                    DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                        if marker.contract_version == "v1.72"
+                            && marker.projection_schema_version == 133
+                ),
+                "Cline runtime migration requires the exact v1.72/schema 133 source"
+            );
+            let tables = DSH_RUNTIME_TABLES
+                .iter()
+                .chain(DSH_SKILL_TABLES.iter())
+                .copied()
+                .collect::<Vec<_>>();
+            let counts = tables
+                .iter()
+                .map(|table| {
+                    tx.query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                })
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rewrite_cline_runtime_closed_sets(&tx, false)?;
+            anyhow::ensure!(
+                cline_runtime_v184_schema_matches(&tx)?,
+                "Cline runtime migration did not expand all closed sets"
+            );
+            for (table, count) in tables.iter().zip(counts) {
+                anyhow::ensure!(
+                    tx.query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |row| {
+                        row.get::<_, i64>(0)
+                    })? == count,
+                    "Cline runtime migration changed existing {table} rows"
+                );
+            }
+            tx.execute_batch(
+                "INSERT INTO schema_migration(version, applied_at) VALUES (184, datetime('now'));\
+                 UPDATE rovai_data_contract SET contract_version='v1.72', projection_schema_version=134,\
+                     reset_reason=NULL, updated_at=datetime('now') WHERE singleton=1;",
+            )?;
+            validate_migration_foreign_keys(&tx, &tables)?;
+            anyhow::ensure!(
+                matches!(
+                    classify_database_contract(&tx)?,
+                    DatabaseContractClassification::SupportedMigrationSource(ref marker) if marker.projection_schema_version == 134
+                ),
+                "Cline runtime migration failed current schema admission"
+            );
+            tx.commit()?;
+            Ok(())
+        })();
+        let foreign_keys_result = self.connection.execute_batch("PRAGMA foreign_keys=ON;");
+        result?;
+        foreign_keys_result?;
+        Ok(())
+    }
+
+    fn migrate_command_code_runtime_v185(&mut self) -> Result<()> {
+        self.connection.execute_batch("PRAGMA foreign_keys=OFF;")?;
+        let result = (|| -> Result<()> {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            anyhow::ensure!(
+                matches!(
+                    classify_database_contract(&tx)?,
+                    DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                        if marker.contract_version == "v1.72"
+                            && marker.projection_schema_version == 134
+                ),
+                "Command Code runtime migration requires the exact v1.72/schema 134 source"
+            );
+            let tables = DSH_RUNTIME_TABLES
+                .iter()
+                .chain(DSH_SKILL_TABLES.iter())
+                .copied()
+                .collect::<Vec<_>>();
+            let counts = tables
+                .iter()
+                .map(|table| {
+                    tx.query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                })
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if !cline_runtime_v184_schema_matches(&tx)? {
+                // Main's receipt 184 belongs to continuation, not the Preview
+                // catalog. Add both catalog entries atomically under receipt 185.
+                rewrite_cline_runtime_closed_sets(&tx, false)?;
+            }
+            rewrite_command_code_runtime_closed_sets(&tx, false)?;
+            anyhow::ensure!(
+                command_code_runtime_v185_schema_matches(&tx)?,
+                "Command Code runtime migration did not expand all closed sets"
+            );
+            for (table, count) in tables.iter().zip(counts) {
+                anyhow::ensure!(
+                    tx.query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |row| {
+                        row.get::<_, i64>(0)
+                    })? == count,
+                    "Command Code runtime migration changed existing {table} rows"
+                );
+            }
+            tx.execute_batch(
+                "INSERT INTO schema_migration(version, applied_at) VALUES (185, datetime('now'));\
+                 UPDATE rovai_data_contract SET contract_version='v1.72', projection_schema_version=135,\
+                     reset_reason=NULL, updated_at=datetime('now') WHERE singleton=1;",
+            )?;
+            validate_migration_foreign_keys(&tx, &tables)?;
+            anyhow::ensure!(
+                matches!(
+                    classify_database_contract(&tx)?,
+                    DatabaseContractClassification::SupportedMigrationSource(ref marker) if marker.projection_schema_version == 135
+                ),
+                "Command Code runtime migration failed current schema admission"
+            );
+            tx.commit()?;
+            Ok(())
+        })();
+        let foreign_keys_result = self.connection.execute_batch("PRAGMA foreign_keys=ON;");
+        result?;
+        foreign_keys_result?;
         Ok(())
     }
 
@@ -34539,6 +34972,78 @@ fn downgrade_navigation_summary_for_test(connection: &Connection) {
         UPDATE rovai_data_contract SET projection_schema_version=126 WHERE singleton=1;",
         )
         .unwrap();
+}
+
+#[cfg(test)]
+fn downgrade_command_code_catalog_for_test(connection: &Connection) {
+    run_continuation::downgrade_for_test(connection);
+    let applied: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migration WHERE version=185)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if !applied {
+        return;
+    }
+    connection
+        .execute_batch("PRAGMA foreign_keys=OFF;")
+        .unwrap();
+    let tx = connection.unchecked_transaction().unwrap();
+    rewrite_command_code_runtime_closed_sets(&tx, true).unwrap();
+    tx.execute_batch("DELETE FROM schema_migration WHERE version=185; UPDATE rovai_data_contract SET projection_schema_version=134 WHERE singleton=1;").unwrap();
+    tx.commit().unwrap();
+    connection.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+}
+
+#[cfg(test)]
+fn downgrade_member_confirmation_for_test(connection: &Connection) {
+    let applied: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migration WHERE version=193)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if !applied {
+        return;
+    }
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+        DROP TABLE member_avatar_publish_intent;
+        DROP TABLE member_create_capability;
+        DROP TABLE member_confirmation_event;
+        DROP TABLE member_create_preview;
+        DELETE FROM schema_migration WHERE version=193;
+        UPDATE rovai_data_contract SET projection_schema_version=142 WHERE singleton=1;
+        PRAGMA foreign_keys=ON;",
+        )
+        .unwrap();
+}
+
+#[cfg(test)]
+fn downgrade_cline_catalog_for_test(connection: &Connection) {
+    downgrade_command_code_catalog_for_test(connection);
+    let applied: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migration WHERE version=184)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if !applied {
+        return;
+    }
+    connection
+        .execute_batch("PRAGMA foreign_keys=OFF;")
+        .unwrap();
+    let tx = connection.unchecked_transaction().unwrap();
+    rewrite_cline_runtime_closed_sets(&tx, true).unwrap();
+    tx.execute_batch("DELETE FROM schema_migration WHERE version=184; UPDATE rovai_data_contract SET projection_schema_version=133 WHERE singleton=1;").unwrap();
+    tx.commit().unwrap();
+    connection.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
 }
 
 #[cfg(test)]
@@ -40342,7 +40847,6 @@ mod tests {
             &transaction,
             &camp_id,
             "v162-requeue-message",
-            1,
             &["agent_1".to_string()],
             "2026-09-18T00:00:00Z",
         )
@@ -40420,10 +40924,15 @@ mod tests {
         user_projection::migrate(&mut database).unwrap();
         member_creation::migrate(&mut database).unwrap();
         pending_draft::migrate(&mut database).unwrap();
+        database.migrate_cline_runtime_v184().unwrap();
+        database.migrate_command_code_runtime_v185().unwrap();
         run_continuation::migrate(&mut database).unwrap();
         mission_description::migrate(&mut database).unwrap();
         user_anchors::migrate(&mut database).unwrap();
         message_mentions::migrate(&mut database).unwrap();
+        run_continuation::migrate_requests(&mut database).unwrap();
+        member_environment::migrate(&mut database).unwrap();
+        member_environment::migrate_sessions(&mut database).unwrap();
         let successor_run_id = claim_waiting_delivery_batches(&mut database, 1)
             .unwrap()
             .pop()
@@ -40670,6 +41179,200 @@ mod tests {
         }
     }
 
+    // Each deployed catalog source owns an atomic CHECK-table + receipt transition.
+    // Receipt 184 was independently deployed by main/continuation and Preview/Cline.
+    // Both exact sources must preserve data and roll back all catalog changes together.
+    #[test]
+    fn runtime_catalog_migrations_preserve_rows_and_roll_back_with_their_receipts() {
+        type Rewrite = fn(&Transaction<'_>, bool) -> Result<()>;
+        type Matches = fn(&Connection) -> rusqlite::Result<bool>;
+        type Migrate = fn(&mut Database) -> Result<()>;
+        for (version, schema, main_continuation, rewrite, schema_matches, migrate) in [
+            (
+                184,
+                133,
+                false,
+                rewrite_cline_runtime_closed_sets as Rewrite,
+                cline_runtime_v184_schema_matches as Matches,
+                Database::migrate_cline_runtime_v184 as Migrate,
+            ),
+            (
+                185,
+                134,
+                false,
+                rewrite_command_code_runtime_closed_sets as Rewrite,
+                command_code_runtime_v185_schema_matches as Matches,
+                Database::migrate_command_code_runtime_v185 as Migrate,
+            ),
+            (
+                185,
+                134,
+                true,
+                rewrite_command_code_runtime_closed_sets as Rewrite,
+                command_code_runtime_v185_schema_matches as Matches,
+                Database::migrate_command_code_runtime_v185 as Migrate,
+            ),
+            (
+                186,
+                135,
+                true,
+                rewrite_command_code_runtime_closed_sets as Rewrite,
+                command_code_runtime_v185_schema_matches as Matches,
+                run_continuation::migrate as Migrate,
+            ),
+        ] {
+            let (mut database, directory) = crate::test_support::seeded_runtime_database();
+            user_anchors::downgrade_for_test(database.connection());
+            let native_description = if version == 186 {
+                let created = crate::mission::MissionService::default().create(&mut database, &crate::command::CommandEnvelope {
+                    command_id: "main-185-migration".into(), actor: crate::command::ActorRef::User{user_id:"local_user".into()}, camp_id:None, expected_versions:vec![],execution_epoch:None,
+                    payload: serde_json::from_value(serde_json::json!({"title":"Preserved", "descriptionContent":[{"kind":"text","text":"literal @名字\n"},{"kind":"member_mention","agentId":"agent_1"}], "projectPath":"/tmp", "projectBindingKind":"directory", "memberAgentIds":["agent_1"], "defaultLeadAgentId":"agent_1"})).unwrap(),
+                }).unwrap();
+                let id = created.result.payload["missionId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let content: String = database
+                    .connection()
+                    .query_row(
+                        "SELECT content_json FROM mission_description WHERE mission_id=?1",
+                        [&id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                database
+                    .connection()
+                    .execute_batch("DELETE FROM schema_migration WHERE version=187")
+                    .unwrap();
+                Some((id, content))
+            } else {
+                mission_description::downgrade_for_test(database.connection());
+                None
+            };
+            if !main_continuation {
+                run_continuation::downgrade_for_test(database.connection());
+            }
+            if version == 184 {
+                downgrade_command_code_catalog_for_test(database.connection());
+            }
+            database
+                .connection()
+                .execute_batch("PRAGMA foreign_keys=OFF;")
+                .unwrap();
+            {
+                let tx = database.connection().unchecked_transaction().unwrap();
+                rewrite(&tx, true).unwrap();
+                if main_continuation {
+                    rewrite_cline_runtime_closed_sets(&tx, true).unwrap();
+                    tx.execute_batch("DELETE FROM schema_migration WHERE version=186")
+                        .unwrap();
+                }
+                tx.execute_batch(
+                &format!("DELETE FROM schema_migration WHERE version={version}; UPDATE rovai_data_contract SET projection_schema_version={schema} WHERE singleton=1;"),
+            )
+            .unwrap();
+                tx.commit().unwrap();
+            }
+            database
+                .connection()
+                .execute_batch("PRAGMA foreign_keys=ON;")
+                .unwrap();
+            let source_classification = classify_database_contract(database.connection()).unwrap();
+            assert!(
+                matches!(
+                    source_classification,
+                    DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                        if marker.contract_version == "v1.72" && marker.projection_schema_version == schema
+                ),
+                "{source_classification:?}"
+            );
+            if main_continuation {
+                // A matching marker with a partial continuation schema must fail closed.
+                database
+                    .connection()
+                    .execute_batch(
+                        "SAVEPOINT damaged_source; DROP TRIGGER camp_run_continuation_immutable",
+                    )
+                    .unwrap();
+                assert!(!matches!(
+                    classify_database_contract(database.connection()).unwrap(),
+                    DatabaseContractClassification::SupportedMigrationSource(_)
+                ));
+                database
+                    .connection()
+                    .execute_batch("ROLLBACK TO damaged_source; RELEASE damaged_source")
+                    .unwrap();
+            }
+            let before: (i64, i64) = database.connection().query_row(
+            "SELECT (SELECT COUNT(*) FROM agent_profile), (SELECT COUNT(*) FROM skill_group_assignment)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+            database.connection().execute_batch(&format!("CREATE TEMP TRIGGER fail_command_code_receipt BEFORE INSERT ON schema_migration WHEN NEW.version={version} BEGIN SELECT RAISE(ABORT,'command_code rollback fixture'); END;")).unwrap();
+            assert!(
+                migrate(&mut database)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("command_code rollback fixture")
+            );
+            assert!(!schema_matches(database.connection()).unwrap());
+            if main_continuation {
+                assert!(!cline_runtime_v184_schema_matches(database.connection()).unwrap());
+                assert!(run_continuation::schema_matches(database.connection()).unwrap());
+            }
+            assert!(matches!(
+                classify_database_contract(database.connection()).unwrap(),
+                DatabaseContractClassification::SupportedMigrationSource(ref marker)
+                    if marker.projection_schema_version == schema
+            ));
+            database
+                .connection()
+                .execute_batch("DROP TRIGGER fail_command_code_receipt")
+                .unwrap();
+            migrate(&mut database).unwrap();
+            assert!(schema_matches(database.connection()).unwrap());
+            assert!(matches!(
+                classify_database_contract(database.connection()).unwrap(),
+                DatabaseContractClassification::Current(_)
+                    | DatabaseContractClassification::SupportedMigrationSource(_)
+            ));
+            let after: (i64, i64) = database.connection().query_row(
+            "SELECT (SELECT COUNT(*) FROM agent_profile), (SELECT COUNT(*) FROM skill_group_assignment)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+            assert_eq!(after, before);
+            drop(database);
+            let reopened = Database::open(&directory).unwrap();
+            assert!(reopened.schema_migration_applied(version).unwrap());
+            assert!(reopened.schema_migration_applied(186).unwrap());
+            assert!(reopened.schema_migration_applied(187).unwrap());
+            if let Some((id, content)) = native_description {
+                let actual: String = reopened
+                    .connection()
+                    .query_row(
+                        "SELECT content_json FROM mission_description WHERE mission_id=?1",
+                        [&id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    actual, content,
+                    "main's structured atoms must not become literal text"
+                );
+            }
+            assert!(run_continuation::schema_matches(reopened.connection()).unwrap());
+            assert!(cline_runtime_v184_schema_matches(reopened.connection()).unwrap());
+            assert!(command_code_runtime_v185_schema_matches(reopened.connection()).unwrap());
+            assert!(matches!(
+                classify_database_contract(reopened.connection()).unwrap(),
+                DatabaseContractClassification::Current(_)
+            ));
+            drop(reopened);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
     fn migration_state_through(version: i64) -> CurrentMigrationState {
         CurrentMigrationState {
             v66: version >= 66,
@@ -40791,6 +41494,11 @@ mod tests {
             v186: version >= 186,
             v187: version >= 187,
             v188: version >= 188,
+            v189: version >= 189,
+            v190: version >= 190,
+            v191: version >= 191,
+            v192: version >= 192,
+            v193: version >= 193,
         }
     }
 
@@ -40985,32 +41693,63 @@ mod tests {
                 "current",
                 CURRENT_DATA_CONTRACT_VERSION,
                 CURRENT_PROJECTION_SCHEMA_VERSION,
+                193,
+            ),
+            (
+                "v1.72/schema 142 before member confirmation security",
+                "v1.72",
+                142,
+                192,
+            ),
+            (
+                "v1.72/schema 141 before session environments",
+                "v1.72",
+                141,
+                191,
+            ),
+            (
+                "v1.72/schema 140 before member environments",
+                "v1.72",
+                140,
+                190,
+            ),
+            (
+                "v1.72/schema 139 before continuation request convergence",
+                "v1.72",
+                139,
+                189,
+            ),
+            (
+                "v1.72/schema 138 before Message Mention convergence",
+                "v1.72",
+                138,
                 188,
             ),
             (
-                "v1.72/schema 137 before member confirmation security",
+                "v1.72/schema 137 before direct reply convergence",
                 "v1.72",
                 137,
                 187,
             ),
             (
-                "v1.72/schema 136 before Message Mentions",
+                "v1.72/schema 136 before Mission description convergence",
                 "v1.72",
                 136,
                 186,
             ),
             (
-                "v1.72/schema 135 before direct reply index",
+                "v1.72/schema 135 before continuation convergence",
                 "v1.72",
                 135,
                 185,
             ),
             (
-                "v1.72/schema 134 before mission member references",
+                "v1.72/schema 134 before Command Code catalog",
                 "v1.72",
                 134,
                 184,
             ),
+            ("v1.72/schema 133 before Cline catalog", "v1.72", 133, 183),
             (
                 "v1.72/schema 132 before pending draft retention",
                 "v1.72",
@@ -41518,7 +42257,7 @@ mod tests {
         }
 
         assert!(migration_state_through(141).admits("v1.52", 92, V142_CLASSIFIER_VERSION));
-        let current = migration_state_through(188);
+        let current = migration_state_through(193);
         let v092_source = migration_state_through(91);
         let mut missing_intermediate = current;
         missing_intermediate.v84 = false;
@@ -41575,11 +42314,20 @@ mod tests {
         let mut missing_pending_draft = current;
         missing_pending_draft.v183 = false;
         let mut missing_member_confirmation = current;
-        missing_member_confirmation.v188 = false;
+        missing_member_confirmation.v193 = false;
+        let mut missing_convergence = current;
+        missing_convergence.v186 = false;
         let rejected = [
             (
                 "current marker without member confirmation security",
                 missing_member_confirmation,
+                CURRENT_DATA_CONTRACT_VERSION,
+                CURRENT_PROJECTION_SCHEMA_VERSION,
+                V147_CLASSIFIER_VERSION,
+            ),
+            (
+                "current marker without catalog/continuation convergence",
+                missing_convergence,
                 CURRENT_DATA_CONTRACT_VERSION,
                 CURRENT_PROJECTION_SCHEMA_VERSION,
                 V147_CLASSIFIER_VERSION,
@@ -42064,7 +42812,7 @@ mod tests {
             )
             .expect("current contract marker should load");
 
-        assert_eq!(state, migration_state_through(187));
+        assert_eq!(state, migration_state_through(192));
         assert!(state.admits(&contract, schema, &classifier));
         assert!(has_admissible_data_contract(
             &directory.join("rovai.sqlite")
@@ -42906,12 +43654,13 @@ mod tests {
             event_count
         );
         let configuration = crate::runtime_startup::RuntimeStartupConfiguration {
-            custom_api_snapshot: None,
-            program_path: None,
-            environment: vec![crate::runtime_startup::RuntimeEnvironmentVariable {
-                name: "HTTP_PROXY".into(),
-                value: "http://localhost:8080".into(),
-            }],
+            program_path: Some(
+                directory
+                    .join("fixture-codex")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ..Default::default()
         };
         let saved = crate::runtime_startup::save(
             &mut database,
@@ -44524,6 +45273,8 @@ mod tests {
                     | SkillDeliveryGroupKey::Pi
                     | SkillDeliveryGroupKey::Zcode
                     | SkillDeliveryGroupKey::Dsh
+                    | SkillDeliveryGroupKey::Cline
+                    | SkillDeliveryGroupKey::CommandCode
             )
         }) {
             for (skill_id, revision_id) in [
@@ -44740,6 +45491,8 @@ mod tests {
                     | SkillDeliveryGroupKey::Pi
                     | SkillDeliveryGroupKey::Zcode
                     | SkillDeliveryGroupKey::Dsh
+                    | SkillDeliveryGroupKey::Cline
+                    | SkillDeliveryGroupKey::CommandCode
             )
         }) {
             for (skill_id, revision_id) in [
@@ -44921,6 +45674,8 @@ mod tests {
                     | SkillDeliveryGroupKey::Pi
                     | SkillDeliveryGroupKey::Zcode
                     | SkillDeliveryGroupKey::Dsh
+                    | SkillDeliveryGroupKey::Cline
+                    | SkillDeliveryGroupKey::CommandCode
             )
         }) {
             for (skill_id, revision_id) in [
@@ -45280,6 +46035,8 @@ mod tests {
                     | SkillDeliveryGroupKey::Pi
                     | SkillDeliveryGroupKey::Zcode
                     | SkillDeliveryGroupKey::Dsh
+                    | SkillDeliveryGroupKey::Cline
+                    | SkillDeliveryGroupKey::CommandCode
             )
         }) {
             for (skill_id, revision_id) in [

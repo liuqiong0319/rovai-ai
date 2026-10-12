@@ -18,6 +18,7 @@ import type {
   NavigationThreadItem,
   NavigationThreadReadState,
   NavigationThreadTarget,
+  NavigationThreadGroup,
   NavigationSnapshot,
   ProjectNavigationGroup,
   SettingsSection
@@ -103,11 +104,23 @@ export function activateProjectNavigationRow(
 
 export function navigationPaginationControls(
   visibleCount: number,
-  totalCount: number
+  hasMore: boolean
 ): { showMore: boolean; showCollapse: boolean } {
   return {
-    showMore: visibleCount < totalCount,
+    showMore: hasMore,
     showCollapse: visibleCount > NAVIGATION_INITIAL_VISIBLE_CAMPS
+  }
+}
+
+export function navigationGroupWindow(
+  group: NavigationThreadGroup,
+  limit: number,
+  pinnedThreadIds: ReadonlySet<string>
+): { threads: NavigationThreadItem[]; hasMore: boolean } {
+  const unpinned = group.recentThreads.filter(thread => !pinnedThreadIds.has(thread.id))
+  return {
+    threads: unpinned.slice(0, limit),
+    hasMore: unpinned.length > limit || group.recentThreads.length < group.totalCount
   }
 }
 
@@ -241,13 +254,11 @@ export function ThreadNavigation({
   const pinnedProjects = pins
     .filter((pin) => pin.kind === 'project')
     .flatMap((pin) => projectByKey.get(pin.targetKey) ?? [])
-  const quickChatRecentThreads = navigation?.quickChat.recentThreads ?? []
   const quickChatTotalCount = navigation?.quickChat.totalCount ?? 0
-  const visibleCount = (groupKey: string, threads: readonly NavigationThreadItem[]): number => Math.min(
-    threads.length,
-    groupLimits[groupKey] ?? NAVIGATION_INITIAL_VISIBLE_CAMPS
+  const groupWindow = (groupKey: string, group: NavigationThreadGroup) => navigationGroupWindow(
+    group, groupLimits[groupKey] ?? NAVIGATION_INITIAL_VISIBLE_CAMPS, pinnedThreadIds
   )
-  const quickChatVisibleCount = visibleCount('quick-chat', quickChatRecentThreads)
+  const quickChatWindow = groupWindow('quick-chat', navigation?.quickChat ?? { recentThreads: [], totalCount: 0 })
   const updateBadge = appUpdateBadgePresentation(updateSnapshot)
 
   useEffect(() => {
@@ -262,15 +273,13 @@ export function ThreadNavigation({
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [disabled, platform])
 
-  const showMore = async (
-    groupKey: string,
-    currentCount: number
-  ): Promise<void> => {
+  const showMore = async (groupKey: string): Promise<void> => {
     if (loadingGroupsRef.current.has(groupKey)) return
     loadingGroupsRef.current = new Set(loadingGroupsRef.current).add(groupKey)
     setLoadingGroups(new Set(loadingGroupsRef.current))
     try {
-      await onGroupLimitChange(groupKey, currentCount + (mobile ? NAVIGATION_INITIAL_VISIBLE_CAMPS : NAVIGATION_MORE_CAMPS_STEP))
+      const currentLimit = groupLimits[groupKey] ?? NAVIGATION_INITIAL_VISIBLE_CAMPS
+      await onGroupLimitChange(groupKey, currentLimit + (mobile ? NAVIGATION_INITIAL_VISIBLE_CAMPS : NAVIGATION_MORE_CAMPS_STEP))
     } catch (error) {
       onError(error)
     } finally {
@@ -470,16 +479,15 @@ export function ThreadNavigation({
             ))}
             {pinnedProjects.map((project) => {
               const groupKey = projectKey(project)
-              const count = visibleCount(groupKey, project.recentThreads)
+              const window = groupWindow(groupKey, project)
               return <ThreadGroup
                 key={`pinned-${project.projectKey}`}
                 groupKey={groupKey}
                 pinTargetKey={project.projectKey}
                 label={project.name}
                 totalCount={project.totalCount}
-                visibleCount={count}
-                threads={project.recentThreads.slice(0, count)
-                  .filter((thread) => !pinnedThreadIds.has(thread.id))}
+                threads={window.threads}
+                hasMore={window.hasMore}
                 projectExpanded={!collapsedProjectGroups.has(groupKey)}
                 loadingMore={loadingGroups.has(groupKey)}
                 activeThreadId={activeThreadId}
@@ -488,7 +496,7 @@ export function ThreadNavigation({
                 currentProject={currentProjectKey === project.projectKey}
                 createDisabled={creatingConversation}
                 pinned
-                onShowMore={() => void showMore(groupKey, count)}
+                onShowMore={() => void showMore(groupKey)}
                 onCollapseThreads={() => collapseGroupThreads(groupKey)}
                 onToggleExpanded={() => toggleProjectGroup(groupKey)}
                 onSelectProject={() => onSelectProject(project)}
@@ -516,7 +524,7 @@ export function ThreadNavigation({
           {navigation?.projects.map((project) => {
             const groupKey = projectKey(project)
             if (pins.some((pin) => pin.kind === 'project' && pin.targetKey === project.projectKey)) return null
-            const count = visibleCount(groupKey, project.recentThreads)
+            const window = groupWindow(groupKey, project)
             return (
               <ThreadGroup
                 key={project.projectKey}
@@ -524,9 +532,8 @@ export function ThreadNavigation({
                 pinTargetKey={project.projectKey}
                 label={project.name}
                 totalCount={project.totalCount}
-                visibleCount={count}
-                threads={project.recentThreads.slice(0, count)
-                  .filter((thread) => !pinnedThreadIds.has(thread.id))}
+                threads={window.threads}
+                hasMore={window.hasMore}
                 projectExpanded={!collapsedProjectGroups.has(groupKey)}
                 loadingMore={loadingGroups.has(groupKey)}
                 activeThreadId={activeThreadId}
@@ -535,7 +542,7 @@ export function ThreadNavigation({
                 currentProject={currentProjectKey === project.projectKey}
                 createDisabled={creatingConversation}
                 pinned={pins.some((pin) => pin.kind === 'project' && pin.targetKey === project.projectKey)}
-                onShowMore={() => void showMore(groupKey, count)}
+                onShowMore={() => void showMore(groupKey)}
                 onCollapseThreads={() => collapseGroupThreads(groupKey)}
                 onToggleExpanded={() => toggleProjectGroup(groupKey)}
                 onSelectProject={() => onSelectProject(project)}
@@ -562,9 +569,8 @@ export function ThreadNavigation({
             groupKey="quick-chat"
             label={uiAttribute("快速对话")}
             totalCount={quickChatTotalCount}
-            visibleCount={quickChatVisibleCount}
-            threads={quickChatRecentThreads.slice(0, quickChatVisibleCount)
-              .filter((thread) => !pinnedThreadIds.has(thread.id))}
+            threads={quickChatWindow.threads}
+            hasMore={quickChatWindow.hasMore}
             projectExpanded={!collapsedProjectGroups.has('quick-chat')}
             loadingMore={loadingGroups.has('quick-chat')}
             activeThreadId={activeThreadId}
@@ -572,7 +578,7 @@ export function ThreadNavigation({
             openingThreadId={openingThreadId}
             currentProject={currentProjectKey === 'quick-chat'}
             createDisabled={creatingConversation}
-            onShowMore={() => void showMore('quick-chat', quickChatVisibleCount)}
+            onShowMore={() => void showMore('quick-chat')}
             onCollapseThreads={() => collapseGroupThreads('quick-chat')}
             onToggleExpanded={() => toggleProjectGroup('quick-chat')}
             onSelectProject={() => onSelectProject(null)}
@@ -927,7 +933,7 @@ function ThreadGroup({
   label,
   totalCount,
   threads,
-  visibleCount,
+  hasMore,
   projectExpanded,
   loadingMore,
   activeThreadId,
@@ -959,7 +965,7 @@ function ThreadGroup({
   label: string
   totalCount: number
   threads: NavigationThreadItem[]
-  visibleCount: number
+  hasMore: boolean
   projectExpanded: boolean
   loadingMore: boolean
   activeThreadId: string | null
@@ -1018,7 +1024,7 @@ function ThreadGroup({
   }
   const pressMenu = useNavigationPressMenu(!!pinTargetKey && projectMenuItems.length > 0)
   const contentId = `camp-group-content-${groupKey.replace(/[^a-zA-Z0-9_-]/g, '-')}`
-  const paginationControls = navigationPaginationControls(visibleCount, totalCount)
+  const paginationControls = navigationPaginationControls(threads.length, hasMore)
   return (
     <section className="camp-nav-group" data-group={groupKey}>
       <div className={`project-heading-row ${currentProject ? 'current-project' : ''}`} data-menu-open={pressMenu.open || undefined}

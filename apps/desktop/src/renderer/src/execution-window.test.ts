@@ -43,6 +43,64 @@ function source(initial = 100) {
 }
 
 describe('continuous execution history', () => {
+  it('recovers a failed initial tail on invalidation without polling or warming an unopened window', async () => {
+    const { state, request, changes } = source(1)
+    const current = new ExecutionWindow('camp', 'run', 1, request, () => {}, changes)
+    await current.refresh(() => true, true)
+    expect(request).not.toHaveBeenCalled()
+    state.offline = true
+    await current.latest()
+    expect(current.loaded).toBe(false)
+    await current.refresh() // A historical reader still waits for explicit retry.
+    expect(request).toHaveBeenCalledTimes(1)
+    await current.refresh(() => true, true)
+    expect(request).toHaveBeenCalledTimes(2)
+    expect(current.loading).toBe(false)
+    expect(current.error).toBe('offline')
+    state.offline = false
+    await current.refresh(() => true, true)
+    expect(request).toHaveBeenCalledTimes(3)
+    expect(changes).not.toHaveBeenCalled()
+    expect(current.loaded).toBe(true)
+    expect(current.error).toBeNull()
+    expect(current.evidence.map(item => item.sequence)).toEqual([1])
+  })
+
+  it('coalesces invalidations during a slow first page and catches up immediately after it returns', async () => {
+    const { state, request, changes } = source(1)
+    let resolve!: (page: AgentRunExecutionBlockPage) => void
+    const page = await request({ threadId: 'camp', agentRunId: 'run', beforeSequence: null, limit: 1 })
+    const current = new ExecutionWindow('camp', 'run', 1, () => new Promise(done => { resolve = done }), () => {}, changes)
+    const initial = current.latest()
+    state.through = 2
+    await Promise.all(Array.from({ length: 3 }, () => current.refresh(() => true, true)))
+    expect(changes).not.toHaveBeenCalled()
+    resolve(page)
+    await initial
+    await vi.waitFor(() => expect(current.evidence.at(-1)?.sequence).toBe(2))
+    expect(changes).toHaveBeenCalledTimes(1)
+    expect(changes.mock.calls[0][0].afterChangeSequence).toBe(1)
+  })
+
+  it('uses an in-flight invalidation once if the first page fails, then waits for another signal', async () => {
+    const { request, changes } = source(1)
+    let reject!: (reason: Error) => void
+    request.mockImplementationOnce(() => new Promise((_done, fail) => { reject = fail }))
+    request.mockRejectedValueOnce(new Error('still offline'))
+    const current = new ExecutionWindow('camp', 'run', 1, request, () => {}, changes)
+    const initial = current.latest()
+    await current.refresh(() => true, true)
+    await current.refresh(() => true, true)
+    reject(new Error('offline'))
+    await initial
+    await vi.waitFor(() => expect(current.error).toBe('still offline'))
+    expect(request).toHaveBeenCalledTimes(2)
+    expect(current.loading).toBe(false)
+    await current.refresh(() => true, true)
+    expect(current.loaded).toBe(true)
+    expect(request).toHaveBeenCalledTimes(3)
+  })
+
   it('appends the thirteenth live record without hiding the first twelve or shifting the history cursor', async () => {
     const { state, request, changes } = source(12)
     const current = new ExecutionWindow('camp', 'run', 12, request, () => {}, changes)
@@ -190,10 +248,13 @@ describe('continuous execution history', () => {
     let resolve!: (value: AgentRunExecutionBlockPage) => void
     const changed = vi.fn()
     const late = new ExecutionWindow('camp', 'run', 12, () => new Promise(done => { resolve = done }), changed, changes)
-    const loading = late.latest(); late.dispose(); changed.mockClear()
+    const loading = late.latest()
+    await late.refresh(() => true, true)
+    late.dispose(); changed.mockClear()
     resolve(await request({ threadId: 'camp', agentRunId: 'run', beforeSequence: null, limit: 12 }))
     await loading
     expect(late.evidence).toEqual([]); expect(changed).not.toHaveBeenCalled()
+    expect(changes).not.toHaveBeenCalled()
     const cache = new ExecutionWindowCache(2)
     const create = vi.fn((notify: () => void) => new ExecutionWindow('camp', 'run', 12, request, notify, changes))
     const a = cache.acquire('a', create, changed); await a.window.latest(); a.release()

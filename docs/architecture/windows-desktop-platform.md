@@ -3,7 +3,7 @@ document_type: architecture
 architecture: windows-desktop-platform
 authority: windows-desktop-platform-composition
 status: accepted
-last_updated: 2026-10-09
+last_updated: 2026-10-11
 ---
 
 # Windows Desktop Platform
@@ -36,6 +36,11 @@ Host envelope 通过不等于 Runtime 可选。每个 Adapter 还必须通过
 
 These are real two-adapter seams. Domain callers do not select OS implementations or import `windows-sys`; Windows API
 use remains inside the corresponding adapter.
+
+Windows Web credentials have a narrow availability exception inside the storage adapter: `web-auth.json` uses the
+already admitted Core directory as its trust boundary, accepts inherited file permissions, and hardens only new empty
+atomic siblings on a best-effort basis. General private-file rules stay strict. See
+[Windows Web credential exception](../contracts/windows-private-storage-v2.md#windows-web-credential-exception).
 
 ## 3. Managed processes and shutdown
 

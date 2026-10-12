@@ -106,7 +106,6 @@ impl BuiltinToolProcessConfig {
         &self.inner.process_id
     }
 
-    #[cfg(unix)]
     pub(crate) fn cli_executable(&self) -> &Path {
         &self.inner.cli_executable
     }

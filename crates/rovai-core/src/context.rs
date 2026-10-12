@@ -159,7 +159,10 @@ pub const fn charter_delivery_mode_for_adapter(adapter_kind: AdapterKind) -> Cha
         AdapterKind::CodexCli | AdapterKind::ClaudeCodeCli | AdapterKind::GrokBuild => {
             CharterDeliveryMode::NativeAppend
         }
-        AdapterKind::Pi | AdapterKind::DeepseekHarness => CharterDeliveryMode::ManagedSystemPrompt,
+        AdapterKind::Pi
+        | AdapterKind::DeepseekHarness
+        | AdapterKind::CommandCodeCli
+        | AdapterKind::ClineCli => CharterDeliveryMode::ManagedSystemPrompt,
         AdapterKind::OpencodeCli
         | AdapterKind::CopilotCli
         | AdapterKind::AntigravityApp
@@ -8680,7 +8683,13 @@ mod tests {
                 AdapterKind::CodexCli | AdapterKind::ClaudeCodeCli | AdapterKind::GrokBuild
             ) {
                 CharterDeliveryMode::NativeAppend
-            } else if matches!(adapter_kind, AdapterKind::Pi | AdapterKind::DeepseekHarness) {
+            } else if matches!(
+                adapter_kind,
+                AdapterKind::Pi
+                    | AdapterKind::DeepseekHarness
+                    | AdapterKind::CommandCodeCli
+                    | AdapterKind::ClineCli
+            ) {
                 CharterDeliveryMode::ManagedSystemPrompt
             } else {
                 CharterDeliveryMode::FirstPayload
@@ -9861,6 +9870,7 @@ mod slow_tests {
                     expected_versions: Vec::new(),
                     execution_epoch: None,
                     payload: SetMemberRuntimeConfigurationCommand {
+                        environment_update: None,
                         agent_id: "agent_1".to_string(),
                         expected_version: profile.version,
                         adapter_kind: AdapterKind::CodexCli,
@@ -14458,7 +14468,7 @@ mod slow_tests {
         assert!(BUILTIN_CLI_CHARTER.len() <= 2_560);
         assert_eq!(
             BUILTIN_CLI_CHARTER,
-            "Rovai Built-in CLI Contract\n\n- Use the local `rovai` CLI for the complete built-in operation catalog: `rovai send`; `rovai member list|get|create|update`; `rovai task create|get|list|update`; `rovai thread list|search|read|runs`; `rovai history search`; `rovai memory view|search|read|write`; and `rovai mission list|get|update|status`.\n- Use `rovai --help` to choose an operation and its exact `--help` for syntax. Reuse help already available in the current Native Session.\n- Commands accept exactly one input source: direct flags, one JSON object from stdin/heredoc, or `--input-file <path>`. Do not merge sources.\n- `rovai send` always publishes one public Thread message. When the current responsibility has a Thread-visible answer, result, status, or summary, successfully call it before ending; Runtime narration and Runtime final responses are not Thread messages.\n- Use `--public-only` when the message must not wake an Agent.\n- Without `--public-only`, `--to` may schedule work. Agent addressing is not CC; use it only for a concrete new action or blocking question, never for acknowledgement, agreement, thanks, closure, standby, no-new-information, or repeated conclusions. Member calls do not require courtesy replies.\n- Ordinary Thread messages are visible to the User. Use `--to-user` only for a new decision, answer or action needed from them, or an explicitly requested important-result notification.\n- A successful `rovai send` proves only that its message and effects were committed; it does not prove that recipient work has started or completed.\n"
+            "Rovai Built-in CLI Contract\n\n- Use the local `rovai` CLI for the complete built-in operation catalog: `rovai send`; `rovai member list|get|create|update`; `rovai task create|get|list|update`; `rovai thread list|search|read|runs`; `rovai history search`; `rovai memory view|search|read|write`; and `rovai mission list|get|update|status`.\n- Use `rovai --help` to choose an operation and its exact `--help` for syntax. Reuse help already available in the current Native Session.\n- `rovai send` always publishes one public Thread message. When the current responsibility has a Thread-visible answer, result, status, or summary, successfully call it before ending; Runtime narration and Runtime final responses are not Thread messages.\n- Use `--public-only` when the message must not wake an Agent.\n- Without `--public-only`, `--to` may schedule work. Agent addressing is not CC; use it only for a concrete new action or blocking question, never for acknowledgement, agreement, thanks, closure, standby, no-new-information, or repeated conclusions. Member calls do not require courtesy replies.\n- Ordinary Thread messages are visible to the User. Use `--to-user` only for a new decision, answer or action needed from them, or an explicitly requested important-result notification.\n- A successful `rovai send` proves only that its message and effects were committed; it does not prove that recipient work has started or completed.\n"
         );
         assert!(!BUILTIN_CLI_CHARTER.contains("inline Agent addressing"));
         assert!(
@@ -14502,7 +14512,7 @@ mod slow_tests {
         assert!(!charter.contains("nextBodyOffset is the Unicode-scalar bodyOffset"));
         assert!(!charter.contains("--camp-id"));
         assert!(!charter.contains("`rovai member call`"));
-        assert!(charter.contains("`--input-file <path>`"));
+        assert!(!charter.contains("--input-file"));
         assert!(!charter.contains("Every eligible member can invoke every published command"));
         assert!(
             !charter.contains("without one, publicly report uncertainty and stop the mutation")

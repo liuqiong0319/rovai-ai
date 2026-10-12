@@ -1,5 +1,5 @@
 import { useThreadClient } from './camp-client'
-import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { AgentRunView, AgentRunExecutionBlockPage, AgentRunExecutionBlockChanges, AgentRunExecutionEvidenceView } from '@contracts'
 import { ExecutionWindow, executionWindowPageSize, executionWindowCacheFor } from './execution-window'
 
@@ -18,7 +18,7 @@ function hasRecentExecutionReadingIntent(host: HTMLElement): boolean {
     && performance.now() - markedAt <= EXECUTION_READING_INTENT_MAX_AGE_MS
 }
 
-export function useExecutionWindow(enabled: boolean, threadId: string, run: AgentRunView, liveRevision: unknown, contentRevision: unknown) {
+export function useExecutionWindow(enabled: boolean, threadId: string, run: AgentRunView, liveRevision: unknown, contentRevision: unknown, tailOnly = false) {
   const client = useThreadClient()
   const root = useRef<HTMLDivElement>(null)
   const store = useRef<ExecutionWindow | null>(null)
@@ -70,8 +70,10 @@ export function useExecutionWindow(enabled: boolean, threadId: string, run: Agen
   useLayoutEffect(() => {
     if (!enabled) return undefined
     const host = scrollHost()
-    const retained = executionWindowCacheFor(client).acquire(`${threadId}:${run.id}:${run.executionEpoch}`,
-      notify => new ExecutionWindow(threadId, run.id, executionWindowPageSize(host?.clientHeight || 500),
+    // A one-line activity preview follows the latest block independently of the
+    // drawer's historical reading window, using the same bounded reader/cache.
+    const retained = executionWindowCacheFor(client).acquire(`${threadId}:${run.id}:${run.executionEpoch}${tailOnly ? ':tail' : ''}`,
+      notify => new ExecutionWindow(threadId, run.id, tailOnly ? 1 : executionWindowPageSize(host?.clientHeight || 500),
         params => client.request<AgentRunExecutionBlockPage>('agentRunExecution.page', { ...params, projection: 'blocks' }), notify,
         params => client.request<AgentRunExecutionBlockChanges>('agentRunExecution.changes', { ...params, projection: 'blocks' })),
       () => changed(value => value + 1))
@@ -113,7 +115,7 @@ export function useExecutionWindow(enabled: boolean, threadId: string, run: Agen
       pendingRefresh.current = null
       anchor.current = null
     }
-  }, [client, enabled, threadId, run.id, run.executionEpoch])
+  }, [client, enabled, threadId, run.id, run.executionEpoch, tailOnly])
 
   useLayoutEffect(() => {
     if (!enabled || latest?.runId !== run.id || latest.request === handledLatest.current
@@ -131,16 +133,31 @@ export function useExecutionWindow(enabled: boolean, threadId: string, run: Agen
     return () => latest.setHasNewer(false)
   }, [latest?.runId, latest?.setHasNewer, run.id])
 
-  useEffect(() => {
-    if (!enabled || !store.current || pendingRefresh.current !== null) return
-    if (initialInvalidation.current) { initialInvalidation.current = false; return }
+  const scheduleRefresh = useCallback(() => {
+    if (!store.current || pendingRefresh.current !== null) return
     pendingRefresh.current = window.setTimeout(() => {
       pendingRefresh.current = null
-      const following = (): boolean => !readingHistory.current && scrollHost()?.dataset.followingLatest === 'true'
+      const following = (): boolean => tailOnly || !readingHistory.current
+        && root.current?.closest<HTMLElement>('.execution-drawer-body')?.dataset.followingLatest === 'true'
       if (following()) followAfterLoad.current = 'live'
-      void store.current?.refresh(following)
+      void store.current?.refresh(following, tailOnly)
     }, 300)
-  }, [enabled, run.updatedAt, run.executionEvidenceChangeSequence, run.status, liveRevision])
+  }, [tailOnly])
+
+  useEffect(() => {
+    if (!enabled) return
+    if (initialInvalidation.current) { initialInvalidation.current = false; return }
+    scheduleRefresh()
+  }, [client, enabled, threadId, run.id, run.executionEpoch, run.updatedAt, run.executionEvidenceChangeSequence, run.status, liveRevision, scheduleRefresh])
+
+  useEffect(() => {
+    if (!enabled || !tailOnly) return
+    // A reconnect can leave every Run scalar unchanged. Its resync notification
+    // must still repair a failed initial tail read through the same bounded path.
+    return client.onInvalidated?.(change => {
+      if (!change || change.resync) scheduleRefresh()
+    })
+  }, [client, enabled, tailOnly, scheduleRefresh])
 
   useLayoutEffect(() => {
     const current = store.current
@@ -294,6 +311,8 @@ export function useExecutionWindow(enabled: boolean, threadId: string, run: Agen
     contentCache: store.current?.content ?? null,
     setViewport: (first: number, last: number) => store.current?.setViewport(first, last),
     blocks: store.current?.blocks ?? [],
+    runtimePhase: store.current?.runtimePhase,
+    runtimeThinkingTitle: store.current?.runtimeThinkingTitle,
     root, evidence,
     loading: enabled && (store.current?.loading || (!store.current?.loaded && !store.current?.error)),
     direction: store.current?.direction ?? 'latest',

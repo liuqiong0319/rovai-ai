@@ -8,7 +8,13 @@ export const pause = ms => new Promise(resolve => setTimeout(resolve, ms))
 // profile and process; this helper never attaches to a user's existing browser.
 export async function launchAcceptanceBrowser({ executable, args, env = process.env }) {
   const child = spawn(executable, args, { env, stdio: ['ignore', 'pipe', 'pipe'] })
-  const closed = new Promise(resolve => child.once('close', resolve))
+  // Crashpad may inherit stderr beyond Chrome's lifetime. Wait for our process,
+  // then close the log pipes instead of waiting indefinitely for that descendant.
+  let launchError
+  const closed = new Promise(resolve => {
+    child.once('exit', resolve)
+    child.once('error', error => { launchError = error; resolve() })
+  })
   let log = ''
   const collect = chunk => { log = (log + chunk).slice(-65_000) }
   child.stdout.on('data', collect)
@@ -18,14 +24,15 @@ export async function launchAcceptanceBrowser({ executable, args, env = process.
     socket?.close()
     child.kill('SIGTERM')
     const timer = setTimeout(() => child.kill('SIGKILL'), 15_000)
-    try { await closed } finally { clearTimeout(timer) }
+    try { await closed } finally { clearTimeout(timer); child.stdout.destroy(); child.stderr.destroy() }
   }
   try {
     let port
     for (let i = 0; i < 150; i++) {
       port = log.match(/DevTools listening on ws:\/\/127\.0\.0\.1:(\d+)/)?.[1]
       if (port) break
-      if (child.exitCode !== null) throw Error(log.slice(-2000))
+      if (launchError) throw launchError
+      if (child.exitCode !== null || child.signalCode !== null) throw Error(log.slice(-2000))
       await pause(100)
     }
     assert.ok(port, log.slice(-2000))

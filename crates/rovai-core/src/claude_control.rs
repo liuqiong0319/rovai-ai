@@ -115,24 +115,13 @@ impl ClaudeControl {
         self.credential_redactor = redactor;
     }
 
-    pub(crate) fn redact_frame(&self, value: &Value) -> Result<Vec<u8>> {
-        let mut value = value.clone();
-        if let Some(redactor) = &self.credential_redactor {
-            redactor.value(&mut value);
-        }
-        Ok(serde_json::to_vec(&value)?)
-    }
-
     pub(crate) fn redact_text(&self, value: &str) -> String {
         self.credential_redactor
             .as_ref()
             .map_or_else(|| value.to_owned(), |redactor| redactor.text(value))
     }
 
-    fn emit(&self, event_type: &'static str, mut payload: Value) {
-        if let Some(redactor) = &self.credential_redactor {
-            redactor.value(&mut payload);
-        }
+    fn emit(&self, event_type: &'static str, payload: Value) {
         if let Some(events) = &self.events {
             let _ = events.send(ClaudeCodeRuntimeEvent {
                 event_type,
@@ -617,8 +606,16 @@ mod tests {
     async fn native_decisions_are_serialized_by_id_and_close_only_after_the_last_idle_result() {
         use tokio::io::{AsyncBufReadExt, BufReader};
         let (events, mut received) = mpsc::unbounded_channel();
-        let (control, ready, writes) =
+        let (mut control, ready, writes) =
             ClaudeControl::new("session".into(), "acceptEdits".into(), Some(events));
+        Arc::get_mut(&mut control)
+            .unwrap()
+            .set_credential_redactor(Some(
+                rovai_core::runtime_custom_api::CredentialRedactor::from_values(vec![
+                    "tool-a".into(),
+                    "rovai send".into(),
+                ]),
+            ));
         let (stdin, output) = tokio::io::duplex(8192);
         let mut output = BufReader::new(output);
         let writer = tokio::spawn(write_control_stream(stdin, control.clone(), writes));

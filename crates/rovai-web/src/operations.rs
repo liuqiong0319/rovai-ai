@@ -140,6 +140,19 @@ pub enum Operation {
     McpImport,
     #[serde(rename = "runtime.startup.get")]
     RuntimeStartupGet,
+    #[serde(rename = "member.runtimeEnvironment.get")]
+    MemberEnvironmentGet,
+    #[serde(rename = "conversations.memberSession.get")]
+    MemberSessionGet,
+    #[serde(rename = "conversations.restartNativeSession")]
+    MemberSessionRestart,
+    #[serde(rename = "runtime.environmentLegacy.list")]
+    RuntimeEnvironmentLegacyList,
+    #[serde(rename = "runtime.environmentLegacy.get")]
+    RuntimeEnvironmentLegacyGet,
+    #[serde(rename = "runtime.environmentLegacy.acknowledge")]
+    RuntimeEnvironmentLegacyAcknowledge,
+
     #[serde(rename = "runtime.startup.save")]
     RuntimeStartupSave,
     #[serde(rename = "runtime.startup.inspect")]
@@ -463,6 +476,13 @@ impl Operation {
             Self::McpScan => "mcp.import.scan",
             Self::McpImport => "mcp.import.commit",
             Self::RuntimeStartupGet => "runtime.startup.get",
+            Self::MemberEnvironmentGet => "member.runtimeEnvironment.get",
+            Self::MemberSessionGet => "conversations.memberSession.get",
+            Self::MemberSessionRestart => "conversations.restartNativeSession",
+            Self::RuntimeEnvironmentLegacyList => "runtime.environmentLegacy.list",
+            Self::RuntimeEnvironmentLegacyGet => "runtime.environmentLegacy.get",
+            Self::RuntimeEnvironmentLegacyAcknowledge => "runtime.environmentLegacy.acknowledge",
+
             Self::RuntimeStartupSave => "runtime.startup.save",
             Self::RuntimeStartupInspect => "runtime.startup.inspect",
             Self::RuntimeStartupCheck => "runtime.startup.check",

@@ -3,7 +3,7 @@ document_type: contract
 contract: windows-private-storage-v2
 status: accepted
 source_version: v1.15
-last_updated: 2026-10-06
+last_updated: 2026-10-11
 ---
 
 # Windows Private Storage v2
@@ -54,6 +54,20 @@ same-SID isolation.
 `LocalAppData Known Folder\\Rovai AI Bootstrap\\<instance-key>` 壳层 profile。它只容纳 Electron 本机状态与稳定实例锁，
 不承载 Core authority 或 Runtime files；使用与正式 root 相同的 creation-time protected DACL / identity admission。
 只有 primary 准备正式布局，失败不向该 profile 传递 Core data path。正式 v2 布局与 Runtime 平台资格不变。
+
+## Windows Web credential exception
+
+Only `web-auth.json` inside an already admitted Core data directory accepts ordinary inherited file ACLs.
+It does not require a protected flag, exact ACE count/principals/masks or permission to change the existing file's DACL.
+Reads leave the file unchanged. New atomic siblings inherit the admitted directory and attempt DACL hardening before
+writing credential bytes; failure of that optional hardening does not block real I/O. The native atomic replacement
+remains the commit point. Directory admission, file identity/type and reparse checks remain mandatory.
+Core/Server retain initial data-directory admission; subsequent credential I/O rechecks native directory path, volume
+and stable identity without imposing the exact writable directory ACL template again on read-only Token lookup.
+
+This exception does not relax the general private-file APIs, data-root admission, Named Pipe, Job or Runtime storage
+policy, nor any non-Windows behavior. The complete lifecycle and error contract is
+[Host Web v4](host-web-v4.md#windows-web-凭据可用性).
 
 ## References
 

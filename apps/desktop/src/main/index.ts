@@ -262,6 +262,7 @@ const allowedMethods = new Set<CoreMethod>([
   'mcp.servers.delete',
   'mcp.import.scan',
   'mcp.import.commit',
+  'conversations.memberSession.get',
   'conversations.restartNativeSession',
   'app.info',
   'threads.creationPreflight',
@@ -1202,31 +1203,46 @@ ipcMain.handle('rovai:request', async (_event, method: CoreMethod, params?: unkn
 ipcMain.handle('rovai:supervisor-get-snapshot', () => core.getSnapshot())
 
 ipcMain.handle('rovai:host-web', async (event, operation: unknown, value: unknown) => {
-  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents
-    || event.senderFrame !== event.sender.mainFrame) {
-    throw new Error('Host controls require a local Desktop window')
+  try {
+    const result = await (async () => {
+      if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents
+        || event.senderFrame !== event.sender.mainFrame) {
+        throw new Error('Host controls require a local Desktop window')
+      }
+      if (operation === 'token' || operation === 'status' || operation === 'stop' || operation === 'rotate' || operation === 'loginTicket') {
+        return core.request(`host.web.${operation}`)
+      }
+      if (operation !== 'start' || !value || typeof value !== 'object') {
+        throw new Error('Unsupported Host Web operation')
+      }
+      const input = value as Record<string, unknown>
+      if (typeof input.listen !== 'string' || typeof input.allowInsecureLan !== 'boolean'
+        || (input.publicOrigin !== undefined && typeof input.publicOrigin !== 'string')
+        || Object.keys(input).some((key) => !['listen', 'publicOrigin', 'allowInsecureLan'].includes(key))) {
+        throw new Error('Invalid Host Web settings')
+      }
+      await hostGeneralPreferences().get()
+      // Assets are selected by Main, never by a renderer-supplied filesystem path.
+      return core.request('host.web.start', {
+        ...input,
+        uiDirectory: app.isPackaged
+          ? join(process.resourcesPath, 'web-ui')
+          : join(app.getAppPath(), 'out', 'web')
+      })
+    })()
+    return { kind: 'value', value: result }
+  } catch (error) {
+    if (error instanceof RovaiRequestError) {
+      return { kind: 'failure', failure: error.toFailure() }
+    }
+    return { kind: 'failure', failure: {
+      kind: 'infrastructure_failure', code: 'desktop_host_web_failed',
+      message: '远程连接操作未完成，请稍后重试。', retryable: false,
+      generation: core.getSnapshot().generation, details: {}
+    } }
   }
-  if (operation === 'token' || operation === 'status' || operation === 'stop' || operation === 'rotate' || operation === 'loginTicket') {
-    return core.request(`host.web.${operation}`)
-  }
-  if (operation !== 'start' || !value || typeof value !== 'object') {
-    throw new Error('Unsupported Host Web operation')
-  }
-  const input = value as Record<string, unknown>
-  if (typeof input.listen !== 'string' || typeof input.allowInsecureLan !== 'boolean'
-    || (input.publicOrigin !== undefined && typeof input.publicOrigin !== 'string')
-    || Object.keys(input).some((key) => !['listen', 'publicOrigin', 'allowInsecureLan'].includes(key))) {
-    throw new Error('Invalid Host Web settings')
-  }
-  await hostGeneralPreferences().get()
-  // Assets are selected by Main, never by a renderer-supplied filesystem path.
-  return core.request('host.web.start', {
-    ...input,
-    uiDirectory: app.isPackaged
-      ? join(process.resourcesPath, 'web-ui')
-      : join(app.getAppPath(), 'out', 'web')
-  })
 })
+
 ipcMain.handle('rovai:supervisor-retry', () => {
   if (windowsBootstrap?.kind === 'blocked' && core.getSnapshot().capabilities.fullCoreRetry) {
     // sessionData must be bound before ready. Retry the same root in a fresh

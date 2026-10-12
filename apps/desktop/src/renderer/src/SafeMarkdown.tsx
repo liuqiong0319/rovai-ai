@@ -1,6 +1,8 @@
 import { createContext, isValidElement, useContext, useEffect, useState, useLayoutEffect, useMemo, useRef, type JSX, type ReactNode } from 'react'
 import Markdown, { defaultUrlTransform } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import remarkCjkFriendly from 'remark-cjk-friendly/parseOnly'
+import remarkCjkFriendlyStrikethrough from 'remark-cjk-friendly-gfm-strikethrough/parseOnly'
 import { FILE_REFERENCE_FRAGMENT, FileReferenceLink, type FileReferenceActivation } from './FileReferenceLink'
 import { ResourceReferenceIcon } from './FilePreviewTabIcon'
 import { remarkRepairCjkUrlTail } from './remark-repair-cjk-url-tail'
@@ -224,6 +226,8 @@ export function SafeMarkdown({
       <Markdown
         remarkPlugins={[
           [remarkGfm, { singleTilde: false }],
+          remarkCjkFriendly,
+          [remarkCjkFriendlyStrikethrough, { singleTilde: false }],
           remarkRepairCjkUrlTail,
           ...(fileReferencesEnabled ? [mode === 'message' ? remarkMessageFileLinks : remarkFileLinks] : []),
           [remarkLeadingContent, { enabled: hasLeadingContent, inline: inlineLeadingContent }]

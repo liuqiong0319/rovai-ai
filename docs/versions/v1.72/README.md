@@ -6,10 +6,197 @@ authority: version-scope-and-status
 design_status: confirmed
 implementation_status: in_progress
 model_context_change: true
-last_updated: 2026-10-08
+last_updated: 2026-10-11
 ---
 
 # Rovai-ai v1.72：Lark 独立渠道
+
+## 会话内队员占位（2026-10-11）
+
+按 User 确认的 v10「停止区分隔」及后续 v8 默认色修正，在公开会话末尾投影正在执行的队员：
+单行正文／命令、Run 身份衔接、确认停止及中断重试。停止按钮默认中性色，悬浮变红。
+复用现有 Evidence、精确 Run Stop 和独立续做命令；Core 从持久化续做 Delivery 派生受理事实，
+切群／刷新后旧失败入口保持收起。单行预览首次读取失败可随更新／重连恢复，慢请求保留更新并补拉；
+旧恢复记录与实时事件按版本合并，不覆盖新正文。排队不占位，不创建公开消息，不改变模型上下文或数据库结构。
+当前边界见 [Run Process Detail Surface v49](../../contracts/run-process-detail-surface-v49.md)，验证与交付见
+[实施记录](implementation-plan.md#会话内队员占位)。
+
+## Windows Web 凭据可用性（2026-10-11）
+
+在已准入 Core 数据目录内，Windows `web-auth.json` 接受正常继承权限；只对新建的原子写入临时文件
+尽力加固，不再以精确文件 ACL 模板阻断远程连接。保留目录/路径/内容检查、先落盘再更新状态与显式重置语义。
+Host、HTTP 与 Desktop 使用脱敏的读取、保存、内容和路径错误；正常继承不产生修复流程或警告。
+当前合同见 [Host Web v4](../../contracts/host-web-v4.md#windows-web-凭据可用性)，取舍见
+[V1.72-D34](decisions.md#v1-72-d34)，验证与未测范围见[实施记录](implementation-plan.md#windows-web-凭据可用性2026-10-11)。
+
+## 已实现：Send 正文文件输入
+
+[已确认正文文件方案与模型上下文对照 r5](model-context-change-send-input-file.md)在同一 `--input-file`
+入口支持正文文件，并保留符合现有 Send Schema 的完整 JSON 请求。文档包含 Bootstrap、Send help、
+`cli-operations`、根 help 的精确前后文本及其他上下文入口审计；清理重复指导，不增加 TMP 目录教学，旧格式兼容只留在实现中。
+User 消息 19 已授权独立 worktree 实施。当前合同为 [Built-in Tool Transport v37](../../contracts/builtin-tool-transport-v37.md)，
+代码与确定性验证已完成；真实模型 Gate、旧 Session 连续发送和回滚实测尚未运行。
+具体结果、测试准入与限制见[实施记录](implementation-plan.md#send-正文文件输入)。
+
+## 队员运行环境（2026-10-11）
+
+环境配置从 Agents 移至 Teammates，按队员实例与 Runtime 保存 Host 私有 JSON 覆盖。R4 紧凑双语编辑器
+沿用保存/放弃，移除旧 Agents 编辑区域及活动环境层；旧值以只读归档在“需要处理的问题”提示手动迁移。
+Migration 191 建立私有存储，192 发布 schema 142 并关联 Conversation 快照。按 User 后续规则，
+环境在队员会话创建时固定，冷恢复沿用，保存只影响新建或显式重置的会话；不提供环境摘要或凭据组合确认。
+Pi、ZCode、Fleet 收窄到同一 Camp/队员/当前会话，保留各 Adapter 的恢复、停止与后台消息机制。
+合同见 [Runtime Launch v58](../../contracts/runtime-launch-and-verification-v58.md)；
+测试归属见[队员环境 owner](../../development/testing.md#队员运行环境-owner2026-10-11)。
+可重复命令、实测结果和边界见[验收记录](../../research/member-runtime-environment-acceptance.md)。
+真实 Claude Code 2.1.287 已用两个 loopback 接口、不同假凭据/模型及冲突原生设置验证并行路由。
+其他 Runtime 不由这项测试推断 Provider 兼容性，Warm 与字面量子进程边界另由自动化测试覆盖。
+
+## 并行交付：OpenCode V1/V2
+
+按 User 的可用性优先、最小必要改动意见，单一 OpenCode Adapter 在配置冻结前识别所选程序，
+分流原生权限、旧压缩插件与用量来源，复用既有 Host、Session、Bootstrap 和工具授权。
+范围、必要决定与逐版本验证见 [OpenCode V1/V2 实施记录](opencode-v1-v2-implementation.md)。
+V1 移除 Rovai 强加的 `--pure`，恢复现有压缩监听及原生用户插件加载；保留显式环境设置。
+工具权限不是插件沙箱，修复前对照及开发构建验收分别记录，不用普通协作样本替代压缩连续性验证。
+本机 V1 `1.18.32` 与 Brew V2 `2.0.25` 已完成真实开发版、协作、审批/取消、压缩补发与 MCP 回归。
+V1 初始化单独保留 90 秒窗口，容纳原生冷启动依赖锁的 60 秒过期；不删除用户锁或重发任务。
+不增加版本资格门禁或安装管理，不变更数据库 schema、版本指针或模型上下文格式。
+Windows V1 已补齐原生压缩监听插件的安装路径，复用平台私有存储与现有 relay；跨平台配置回归
+及验证边界见[Windows 安装修复](opencode-v1-v2-implementation.md#windows-v1-压缩监听安装2026-10-11)。
+
+## Kimi 使用官方 Provider 配置（2026-10-10）
+
+按 User 要求退役 Rovai 专属 `kimi-code.env`、`ROVAI_KIMI_CONFIG` 与模型变量注入。
+正式运行、健康检查和模型目录探测由 Kimi 读取官方配置；旧文件不再影响启动或 Host 复用，
+不自动迁移、覆盖配置或删除历史。当前合同为 [Runtime Launch v58](../../contracts/runtime-launch-and-verification-v58.md)，
+理由见 [V1.72-D32](decisions.md#v1-72-d32)，验证记录见[实施计划](implementation-plan.md#2026-10-10-kimi-官方-provider-配置)。
+
+## Claude Code / Codex 原生自动记忆（2026-10-10）
+
+受管执行固定关闭 Runtime 原生自动记忆，保留 Rovai Memory、项目规则、原生持久化与原 ID Resume。
+Claude 继续使用既有私有 settings 文件与子进程 env 双重覆盖，Fast 三态和 Bootstrap 不变；Codex 在 App-Server
+启动时传入三个配置覆盖，仅修订 Host 进程兼容摘要，不使 Native Binding 换代。不修改用户原生配置或已有记忆，
+不控制外部 Runtime，不热替换正在运行的旧 Core/Run，不新增检测门禁。
+当前边界见[受管原生自动记忆](../../architecture/runtime-catalog-boundaries.md#受管执行的原生自动记忆)，
+实测版本、测试与限制见[验收记录](../../research/native-auto-memory/verification-2026-10-10.md)。
+
+## Pi 思考强度与目录观察（2026-10-10）
+
+按 User 批复收紧为目录准入/提交/读取解耦、同模型续接避免重复选模、目录观察非破坏性使用。
+复用表、Check Manager、临时探测 Host、整目录缓存和任务租约，不新增缓存、Provider 健康或默认值管理系统。
+能力由 Core 解析为 thinking_level，既有控件与 Run 冻结历史消费；保存不依赖目录健康。
+当前字段和执行顺序见 [Runtime Launch v55](../../contracts/runtime-launch-and-verification-v55.md)，
+验证与边界见[实施计划](implementation-plan.md#2026-10-10-pi-目录观察与思考强度)。
+
+## Cline / Command Code 保留 ACP，暂缓公开（2026-10-09，User 105）
+
+停止 headless 候选并删除专属 Rust transport/activity、测试和 Python 探针；原始报告与脱敏证据保留，
+复现代码改指向退役前提交。两个官方 ACP 实现及 System、权限、工具、恢复和共享进程能力继续保留。
+Command Code 与 Cline 一样撤回 Preview，所有平台 NotQualified；设置、新手引导、队员/Skill 选择、
+安装引导和监控筛选不再展示。旧身份、配置与公开历史不删除、不迁移，隐藏不改变旧 Run 事实。
+
+Cline ACP 自动压缩仍未接通；Command ACP 自定义 BYOK 目录/切换、`acp --model` 启动选择及已测 BYOK
+MCP 实际调用仍有缺口。精确版本、通过范围与未知项见[兼容性清单](../../runtime-compatibility.md)。
+这是公开范围收敛，没有更换 Runtime 或新增后备链路；下文 Preview/headless 是实施历史。
+
+2026-10-10 合流主干内部续做请求等后续修复；190/schema 140 兼容主干与 Preview 的同号旧收据，
+保留用户历史与 ACP 身份，不改变上述隐藏范围。迁移与验证见[实施计划](implementation-plan.md#2026-10-10-两个隐藏-acp-与最新主干合流)。
+
+## Cline 暂缓公开（2026-10-09）
+
+User 99 因原生 ACP 自动 compaction 缺口要求暂不对外暴露 Cline。所有平台回到 NotQualified，
+移除设置、新手引导、成员选择和安装引导入口；已存身份、配置与历史保持可读，官方 ACP 实现保留。
+没有重新引入 Hub、版本或账号白名单。当前范围见 [Runtime Catalog Boundaries](../../architecture/runtime-catalog-boundaries.md#cline-实施边界)，
+理由见 [V1.72-D31](decisions.md#v1-72-d31)。下文 Cline Preview 与各轮成功均为此前实施证据。
+
+Command Code 1.74.1/1.79.1 的 BYOK 默认 first/warm/cold 本轮真实通过，两种 ACP 显式模型选择均被
+原生目录拒绝。OpenCode/Pi 以合成 Provider 完成切换与恢复对照；生产模型目录继续尊重原生广告，
+未伪造显式支持。见[模型选择报告](../../research/command-code-runtime/model-selection-2026-10-09.md)。
+
+## Cline 官方 ACP 与 Hub 退役（2026-10-08）
+
+User 95 已替换此前 Hub 方向。Cline 唯一执行链为选中安装的 `cline --acp` 与共享 ACP Host/Fleet，
+恢复原生不可变 System Rule、工具解码、审批、监控与 session/load 重放隔离。删除 Hub 代码、依赖、
+专属登录 UI/IPC 和测试入口，保留 Pi 结算与通用进程回收。不恢复版本、账号白名单或强制 cold。
+旧 Hub Binding 仅在新输入前按共享不兼容替换，公开数据及原生历史保留；不迁移或重放旧输入。
+当前合同 [Runtime Launch v54](../../contracts/runtime-launch-and-verification-v54.md)，理由
+[V1.72-D30](decisions.md#v1-72-d30)，[输入说明](model-context-change-cline-acp.md)。
+实际结果见 [ACP 退役验收](../../research/cline-runtime/acp-retirement-2026-10-08.md)，旧 Hub 报告均为历史证据。
+切换时保持 Preview，现已按上节撤回；ACP compact 缺口和实际安装的能力失败不宣称修复。后端切换本身不改 schema；主干合流迁移见下节，current_version 不变。
+
+## 主干与 Preview 数据合流（2026-10-08）
+
+当前 schema 为 **139**。Migration 184 / schema 134 在主干用于继续执行，在 Preview 用于 Cline catalog；
+Migration 185 / schema 135 在主干用于结构化 Mission 描述，在 Preview 用于 Command Code catalog。
+Classifier 按完整结构、收据及旧 classifier 识别来源，拒绝部分结构，不能只凭编号推断已具备能力。
+Migration 186 将两边的 catalog 与继续执行结构汇合到 schema 136；Migration 187 保留主干已有的
+Mission 描述 Atom，或为 Preview 回填原文字，统一到 schema 137。结构、收据与 marker 在同一事务提交。
+随后主干 `c2281636` 的 Migration 186 / schema 136 已交付直接回复索引；该来源不具备 Preview catalog。
+Classifier 按结构区分两种 186，先保留主干已有描述，再由 Migration 188 原子收敛 catalog 与索引到 schema 138。
+既有 186 收据不改写，已存在的索引和结构化描述不重建；Preview/137 则只补索引。
+旧业务行、冻结证据、结构化提及和继续执行授权不重建、不重投；失败一起回滚。既有迁移 owner 覆盖
+两种 134、两种 135、136 来源和写入失败；下文旧编号仅描述当时分支状态。
+
+主干 `81f8b1fc` 的 Migration 187/schema 137 已包含 Mention v33，Preview 的同编号只包含 Mission 描述。
+合流保留两种完整格式来源与原 187 收据：先由 188 补齐 catalog/索引，再由 189/schema 139
+为旧格式扩展 Mention 约束；已有 v33 只补收敛收据，不重建表或重算冻结记录。部分 v33 结构拒绝升级。
+
+## 并行实施：Command Code 与 Cline
+
+合入主干 `b2c9c976` 后，Command Code 内部 headless transport 与 Cline 官方 ACP Host 适配当前
+Usage v8 / Execution Metrics v7。真实 sub2api/gpt-6-sol 调用取得 input、output、cache read/write，
+Cline 另有可选 reasoning；最新根调用输入独立投影 Context used。初轮窗口、比例和费用未知，
+不增加指标定时器或输出测速。[真实数值、测试与层级边界](../../research/runtime-monitoring/command-cline-verification-2026-10-04.md)
+区分 Core 传输/Host 证据与产品路径，两个 Runtime 都没有由此取得 First-Class。
+
+随后 Cline 在隔离打包 App 中配置叮叮、芝士并完成四轮真实发送：首次、warm、第二名队员、App/Core
+重启后的精确 cold 恢复；公开回帖来自 bundled CLI，17 次模型调用的 Usage 与 Context 已持久化，
+执行面板可查看 toks 与已知 Context used。[开发包验收](../../research/cline-runtime/app-send-verification-2026-10-04.md)
+记录原生未知字段、空闲关闭清理和仍未完成的能力矩阵；本轮不改变模型上下文方案。
+
+文件复核修复 Cline 单文件读取/编辑的标准 location 映射，两名成员在更新开发包中真实读取、编辑、
+读回，执行面板文件名与可点击预览均通过。Command Code 内部 Activity 保留原生 file_path，并为已选
+Yolo 补齐 headless 写入所需的原生开关；当时只查询普通模型列表，未取得 BYOK 的窗口值。
+[文件与上限证据](../../research/runtime-monitoring/command-cline-files-context-2026-10-04.md)区分 App 和内部传输。
+
+编辑内容随后按 [File Change v7](../../contracts/runtime-file-change-observation-v7.md) 接入：Cline 成功 Update
+补丁和 editor 替换保留为有明确来源标签的补丁片段，Command 可展开增删，Files Changed 保留按序统计；
+Command Code 内部 normalizer 同步候选映射。真实两成员、多文件与连续改回、失败编辑、命令输出、零发送恢复
+及能力发现复核见[差异验收](../../research/runtime-monitoring/command-cline-parity-2026-10-05.md)。
+
+后续窗口补查在同一 Provider 的版本化模型目录取得精确 `gpt-6-sol` 默认窗口 272000、最大可选窗口 872000。
+Cline observer v2 补齐原生模型配置快照与实际 Provider/模型匹配，沿现有 Session Gauge 展示窗口，
+不修改 Bootstrap/Dynamic Context、费用合同或 Renderer 布局；配置和真实验收边界见
+[窗口补采](../../research/runtime-monitoring/command-cline-context-window-2026-10-05.md)。
+
+Cline 增加 closed Runtime/Skill identity、共享 Host 接线与 Migration 184，从 schema 133 升为 **134**，
+macOS arm64 按 [V1.72-D23](decisions.md#v1-72-d23)开放开发 `Preview`，其余平台保持 `NotQualified`；
+完整资格仍在实施。Command Code 随后接入官方 1.74.1 ACP 与共享 Fleet，Migration 185 升至 schema **135**，
+也仅在 macOS arm64 开放 Preview。按 User 后续修复要求，Bootstrap 从旧候选 first_payload 改为受管
+System Mod；[revision 5](model-context-change-command-code-acp.md)与 [V1.72-D25](decisions.md#v1-72-d25)
+记录加载门禁、逐 Session 绑定与失败收敛。Cline 随后按 User 明确指示改为正常 System Rule，
+不再以故意缺失插件的极端场景阻挡。冻结 B 逐 Session 绑定、user P 独立，见
+[Cline System revision 2](model-context-change-cline-system.md)及 [V1.72-D27](decisions.md#v1-72-d27)。
+共享 Core 的 Command 门禁与常驻接线已过；原生默认 BYOK 路径已解决先前额度阻碍，真实模型 A→B→A、
+exact cold、手动/自动压缩后连续性及 App 文件/CLI/warm/重启验证通过。显式自定义模型切换仍被上游拒绝，
+因此保留原生默认哨兵而不伪造目录。Cline ACP 未传 compaction 配置，真实探针未得到完成信号。完整 14 轴对照与实际验证见
+[最新 Checklist](../../research/runtime-monitoring/command-cline-checklist-2026-10-05.md)。
+
+后续真实强杀验收修复共享 ACP leader 退出观察、macOS 身份绑定的后代清理与 Core 启动 ledger 回收，
+并将已交付输入丢失后的领域终态和公开投影对齐现行恢复合同。两 Runtime 的 Runtime/Core/App SIGKILL、
+超过 75 秒无迟到写入、cleanup 后排队输入自动成功均通过。Command 官方 resume/load 会接受不存在历史，
+已增加官方 session/list 精确 ID/cwd 门禁；有效 cold 的 Session/Binding/generation 保留通过。
+范围、失败候选和平台限制见[故障恢复验收](../../research/runtime-monitoring/command-cline-fault-recovery-2026-10-05.md)
+与 [V1.72-D26](decisions.md#v1-72-d26)，不改变两者 Preview 或未闭合的上游差异。
+
+2026-10-06 追加完成 Command 原生私有 MCP 配置与 Cline System 新包真实验收：两者 first/warm/cold、
+文件工具与显式 CLI 发送通过；MCP cwd、字面 env/headers、原生同名优先和更新/撤销边界通过。
+同一服务器 Cline 的 stdio/HTTP 真正调用成功，Command 当前 BYOK deferred tools 仍只发现未调用。
+完整 14 轴、9 Golden Flow 与剩余限制见[追加验收](../../research/runtime-monitoring/command-cline-native-system-2026-10-06.md)。
+
+本切片更新 Runtime Catalog/Monitoring 架构、兼容性清单、研究矩阵、测试说明与当前决定导航。
+活动目录加入 Cline 的保守 run_level 条目，复用既有 ACP typed kind，不改变 activity-v4 或旧 Runtime 解释。
+既有 Usage/Execution Metrics 合同足以表达数值，无新字段合同、Renderer 布局或根 README 支持声明。
 
 ## 普通执行默认无时间上限
 
@@ -23,10 +210,16 @@ Automation 超时与恢复隔离保持。既有冻结预算不改写，预算等
 Automation、预算和文本收尾按业务 deadline／实际失败退避等待。保留普通 Delivery 的单一 Scheduler 与原有
 低频恢复，不新增持久队列或调度框架。原消费者、计时器和验证边界见[验收记录](heartbeat-removal-verification.md)。
 
+## 续做操作退出公开消息
+
+User 已授权停止发布新的续做公屏记录并合入、安装；最新范围见 [r3 输入／历史对照](model-context-change-quiet-continuation.md)。
+续做不新增消息，Migration 188 / schema 138 仅调整内部队列来源及独立 FIFO 序号；
+已生成的记录、原输入、现有锚点、清理与冻结证据保持。
+
 ## 并行实施：用户主动继续执行
 
 User 已确认 [r2 输入对照](model-context-change-run-continuation.md) 并授权独立 worktree 实现、推送。
-[AgentRun Continuation v2](../../contracts/agent-run-continuation-v2.md) 将新授权接入现有 waiting lane；
+[AgentRun Continuation v3](../../contracts/agent-run-continuation-v3.md) 将新授权接入现有 waiting lane；
 每次完整选择原业务输入，现有 builder 重建当前上下文，同一来源可多次独立执行。按钮为 24×24 纯图标，
 原卡片状态不关联新 Run。Migration 184 / schema 134 增量保留旧证据；实现与验证见
 [续做实施记录](run-continuation-implementation.md)。
@@ -359,7 +552,8 @@ Runtime Smoke 为证据，不从合同 accepted 状态推断所有 Provider 都�
 [用户锚点验收](thread-user-anchors-verification.md)。这是局部读取正确性修复，不增加持久副本、全局缓存框架或时间线重构。
 
 本轮以 `4563d23d` 为修正基线，修复缓存清窗和重同步可信状态，正文先显示再请求目录，格式化移出数据库锁，
-消息提示在实际写入路径收集、提交后发送。Migration 186 / schema 136 仅增加直接回复组合索引，无历史回填。
+消息提示在实际写入路径收集、提交后发送。主干最初的 Migration 186 / schema 136 仅增加直接回复组合索引，无历史回填；
+本分支合流后由上节 Migration 188 / schema 138 保留该索引并收敛两种来源。
 
 ## 一键草稿邀请队外队员
 
@@ -381,6 +575,6 @@ User 于 2026-10-08 授权独立 worktree、PR 与 main 合入。Pending Compose
 User 于 2026-10-09 确认[完整方案及补充边界 r1](model-context-change-message-mentions.md)。
 仅公开 batch RUN_INPUT.messages 与 thread.read 正常条目改为 mentions；正文、作者、渠道和非 batch 保持。
 新公开 Formatter/Manifest 33，Profile 10/Facts 9，旧 Run 和成功回执按原版本恢复，无 Session 轮换。
-Migration 187/schema 137 只扩展现有格式约束；当前合同见 [Mention v1](../../contracts/message-mentions-v1.md)、
+主干原 Migration 187/schema 137 只扩展现有格式约束；本分支合流后由 189/schema 139 保留或补齐。当前合同见 [Mention v1](../../contracts/message-mentions-v1.md)、
 [ContextManifest v33](../../contracts/context-manifest-evidence-v33.md)、[History v12](../../contracts/camp-history-v12.md)。
 状态与证据见[确认稿实施记录](model-context-change-message-mentions.md#实施与验证记录)。

@@ -59,6 +59,12 @@ app.whenReady().then(async () => {
     }
     window.webContents.setZoomFactor(2)
     assert.equal(await window.webContents.executeJavaScript("window.quoteTest.theme('day')", true), true)
+    window.webContents.setZoomFactor(1)
+    for (const theme of ['day', 'night']) {
+      await window.webContents.executeJavaScript(`window.quoteTest.theme('${theme}')`, true)
+      await window.webContents.executeJavaScript('window.quoteTest.cjkPreview()', true)
+      writeFileSync(join(dirname(userData), `cjk-${theme}.png`), (await window.webContents.capturePage()).toPNG())
+    }
     console.log(JSON.stringify(report))
     app.exit(0)
   } catch (error) { console.error(error); app.exit(1) }

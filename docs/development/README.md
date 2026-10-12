@@ -129,6 +129,11 @@ App，以受控本机 API 和时钟验证页面框架、截止时间与 authorit
 隔离 Electron 与 500 个合成 Run，验证视口范围、展开、隐藏／恢复、稳定终态停止轮询、
 迟到 Usage 和 Session Context 换代／失效；不启动 Core 或真实 Runtime。
 
+消息区队员占位运行 `pnpm test:run-presence-ui`：隔离 Chrome 挂载生产 ThreadWorkspace，覆盖消息顺序、
+流式单行、停止默认／悬浮色与确认、重试受理后暂缓调度期间切群／刷新、后继失败、执行台多次授权、丢失回执、草稿保留、双主题、三种桌面尺寸、200% 等效缩放及粗指针。`ROVAI_PRESENCE_UI_OUTPUT` 保留截图与报告；
+设置 `ROVAI_PRESENCE_REFERENCE_HTML` 可对照 User 确认的 v10 HTML 停止区分隔几何及排版；停止默认中性色、悬浮红色按后续 v8 修正单独验证。
+非默认 Chrome 路径使用 `ROVAI_TEST_CHROME`。夹具只持久化模拟服务端数据，不启动 Core 或模型；真实 SQLite 受理、重开及未领取窗口由既有 `user_continuation_preserves_source_and_claims_independent_fifo_batches` owner 覆盖。
+
 ## 按任务阅读
 
 | 任务 | 文档 |

@@ -16,6 +16,18 @@ const members = [{
 }]
 
 describe('structured message clipboard', () => {
+  it('keeps authored CJK Markdown intact when copying and pasting a structured message', () => {
+    const content: StructuredThreadMessageContent = [
+      { kind: 'member_mention', agentId: 'agent-alice' },
+      { kind: 'text', text: ' **有冲突。**我上一条建议与 [说明](https://example.com)。' }
+    ]
+    const before = JSON.stringify(content)
+    const data = createStructuredMessageClipboardData(content, members)!
+    expect(data.text).toBe('@爱丽丝 **有冲突。**我上一条建议与 [说明](https://example.com)。')
+    expect(readStructuredMessageClipboardContent(data.html, data.text, members)).toEqual(content)
+    expect(JSON.stringify(content)).toBe(before)
+  })
+
   it('writes current visible text plus an opaque, versioned private envelope', () => {
     const data = createStructuredMessageClipboardData([
       { kind: 'text', text: '请 ' },

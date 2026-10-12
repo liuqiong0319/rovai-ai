@@ -1,5 +1,7 @@
 export * from '../../shared/execution-presentation/safe-markdown-model'
 import remarkGfm from 'remark-gfm'
+import remarkCjkFriendly from 'remark-cjk-friendly/parseOnly'
+import remarkCjkFriendlyStrikethrough from 'remark-cjk-friendly-gfm-strikethrough/parseOnly'
 import remarkParse from 'remark-parse'
 import { unified } from 'unified'
 import { decodeString } from 'micromark-util-decode-string'
@@ -18,6 +20,8 @@ export type MarkdownNode = {
 const safeMarkdownParser = unified()
   .use(remarkParse)
   .use(remarkGfm, { singleTilde: false })
+  .use(remarkCjkFriendly)
+  .use(remarkCjkFriendlyStrikethrough, { singleTilde: false })
 
 // Check decoded Markdown text as well as raw source: an entity such as &#82;
 // must never turn ordinary text into a trusted structured-content placeholder.

@@ -162,21 +162,45 @@ impl CustomApiSnapshot {
 /// Exact scrubbing at private native output boundaries; secrets never enter Debug or serialized state.
 #[derive(Clone)]
 pub struct CredentialRedactor(Vec<String>);
+impl std::fmt::Debug for CredentialRedactor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CredentialRedactor")
+            .field("count", &self.0.len())
+            .finish()
+    }
+}
 impl CredentialRedactor {
+    pub fn from_values(mut values: Vec<String>) -> Self {
+        values.retain(|value| !value.is_empty());
+        values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        values.dedup();
+        Self(values)
+    }
+    pub fn extend(mut self, other: Self) -> Self {
+        self.0.extend(other.0);
+        Self::from_values(self.0)
+    }
     pub fn text(&self, text: &str) -> String {
         self.0
             .iter()
             .filter(|key| !key.is_empty())
             .fold(text.to_owned(), |text, key| text.replace(key, "[redacted]"))
     }
-    pub fn value(&self, value: &mut Value) {
+    /// Produce a display/log copy. Protocol routing and execution must keep the original value.
+    pub fn redacted_value(&self, value: &Value) -> Value {
+        let mut copy = value.clone();
+        self.scrub_value(&mut copy);
+        copy
+    }
+    fn scrub_value(&self, value: &mut Value) {
         match value {
             Value::String(text) => *text = self.text(text),
-            Value::Array(items) => items.iter_mut().for_each(|item| self.value(item)),
+            Value::Array(items) => items.iter_mut().for_each(|item| self.scrub_value(item)),
             Value::Object(object) => {
                 let old = std::mem::take(object);
                 for (name, mut item) in old {
-                    self.value(&mut item);
+                    self.scrub_value(&mut item);
                     object.insert(self.text(&name), item);
                 }
             }

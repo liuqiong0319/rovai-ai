@@ -1,4 +1,6 @@
 import remarkGfm from 'remark-gfm'
+import remarkCjkFriendly from 'remark-cjk-friendly/parseOnly'
+import remarkCjkFriendlyStrikethrough from 'remark-cjk-friendly-gfm-strikethrough/parseOnly'
 import remarkParse from 'remark-parse'
 import { unified } from 'unified'
 
@@ -12,6 +14,8 @@ type MarkdownNode = {
 const safeMarkdownParser = unified()
   .use(remarkParse)
   .use(remarkGfm, { singleTilde: false })
+  .use(remarkCjkFriendly)
+  .use(remarkCjkFriendlyStrikethrough, { singleTilde: false })
 
 const omittedNodeTypes = new Set([
   'definition',

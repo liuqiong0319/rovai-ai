@@ -24,7 +24,10 @@ ipcMain.handle('rovai:request', (_event, _method, params) => params?.kind === 'v
   ? { kind: 'value', value: { unchanged: true, values: [1, null, 'ok'] } }
   : { kind: 'failure', failure: failures[params.index] })
 
-ipcMain.handle('rovai:host-web', (_event, operation, params) => ({ operation, params }))
+const hostWebFailure = { ...failures[0], code: 'HOST_WEB_AUTH_READ_FAILED', message: '无法读取登录凭据：操作系统拒绝访问。原文件已保留。' }
+ipcMain.handle('rovai:host-web', (_event, operation, params) => operation === 'token'
+  ? { kind: 'failure', failure: hostWebFailure }
+  : { kind: 'value', value: { operation, params } })
 
 ipcMain.handle('rovai:general-preferences-set-new-conversation-defaults', (_event, defaults, enableOneClick) => ({ defaults, enableOneClick }))
 ipcMain.handle('rovai:navigation-preferences-set-project-name', (_event, targetKey, name) => ({ targetKey, name }))
@@ -41,6 +44,8 @@ app.whenReady().then(async () => {
     const observations = await window.webContents.executeJavaScript(`(async () => {
       const value = await window.rovai.request('navigation.snapshot', { kind: 'value' })
       const hostWeb = [await window.rovai.hostWeb.status(), await window.rovai.hostWeb.start({ listen: '127.0.0.1:4317' }), await window.rovai.hostWeb.rotate(), await window.rovai.hostWeb.stop()]
+      let hostWebFailure
+      try { await window.rovai.hostWeb.token() } catch (error) { hostWebFailure = error }
       const defaults = { memberAgentIds: ['agent-a'], defaultLeadAgentId: 'agent-a' }
       const savedOnly = await window.rovai.generalPreferences.setNewConversationDefaults(defaults)
       const enabled = await window.rovai.generalPreferences.setNewConversationDefaults(defaults, true)
@@ -65,7 +70,7 @@ app.whenReady().then(async () => {
           ))
         }
       }
-      return { value, failures, savedOnly, enabled, projectName, restoredName, hostWeb, copyPlan, copyResults }
+      return { value, failures, savedOnly, enabled, projectName, restoredName, hostWeb, hostWebFailure, copyPlan, copyResults }
     })()`)
     assert.deepEqual(observations.hostWeb, [
       { operation: 'status', params: undefined },
@@ -74,6 +79,7 @@ app.whenReady().then(async () => {
       { operation: 'stop', params: undefined }
     ])
     assert.deepEqual(observations.value, { unchanged: true, values: [1, null, 'ok'] })
+    assert.deepEqual(observations.hostWebFailure, hostWebFailure, 'Host Web failures must cross the bridge without an Electron exception prefix')
     assert.deepEqual(observations.failures, failures, 'Renderer must receive every structured failure field')
     const defaults = { memberAgentIds: ['agent-a'], defaultLeadAgentId: 'agent-a' }
     assert.deepEqual(observations.savedOnly, { defaults, enableOneClick: false })

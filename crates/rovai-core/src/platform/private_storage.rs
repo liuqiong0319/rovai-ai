@@ -202,6 +202,39 @@ pub fn open_private_read_file(path: &Path) -> Result<File> {
     open_private_read_file_platform(path)
 }
 
+/// The Windows Web credential exception retains path/identity admission. This
+/// marker keeps those failures distinct from credential read/write I/O errors.
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct WebAuthPathError;
+#[cfg(windows)]
+impl std::fmt::Display for WebAuthPathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Web credential path or identity is invalid")
+    }
+}
+#[cfg(windows)]
+impl std::error::Error for WebAuthPathError {}
+
+/// Only `web-auth.json` in an already admitted Core directory uses this policy.
+/// Existing file ACLs are neither matched to a template nor modified.
+#[cfg(windows)]
+pub fn open_web_auth_read_file(data_dir: &Path) -> Result<File> {
+    windows::open_web_auth_read_file(&data_dir.join("web-auth.json"))
+}
+
+/// Same-directory atomic publication for Web credentials only. Hardening a
+/// fresh empty sibling is best-effort; real I/O and identity failures propagate.
+#[cfg(windows)]
+pub fn atomic_write_web_auth_bytes(data_dir: &Path, bytes: &[u8]) -> Result<()> {
+    windows::atomic_write_web_auth_bytes(data_dir, bytes, |handle| {
+        use super::windows_security::{PrivateObjectKind, PrivateSecurityDescriptor};
+        use std::os::windows::io::AsRawHandle;
+        PrivateSecurityDescriptor::new(PrivateObjectKind::File)?
+            .apply_file_dacl(handle.as_raw_handle())
+    })
+}
+
 /// Inspects an existing file and its parent through metadata-only handles.
 /// Read/open failures remain errors; only a verified DACL mismatch returns true.
 #[cfg(windows)]
@@ -437,7 +470,7 @@ fn commit_private_temporary(source: &Path, destination: &Path) -> Result<()> {
 mod windows {
     use std::{
         fs::File,
-        io,
+        io::{self, Write},
         mem::size_of,
         os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
         path::{Component, Path, PathBuf, Prefix},
@@ -459,9 +492,10 @@ mod windows {
             GetVolumeInformationW, GetVolumePathNameW, MOVEFILE_REPLACE_EXISTING,
             MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
         },
-        System::WindowsProgramming::DRIVE_FIXED,
+        System::{SystemServices::MAXIMUM_ALLOWED, WindowsProgramming::DRIVE_FIXED},
     };
 
+    use super::WebAuthPathError;
     use crate::platform::windows_security::{PrivateObjectKind, PrivateSecurityDescriptor};
 
     const HOST_UNSUPPORTED: &str = "windows_storage.host_unsupported";
@@ -639,6 +673,101 @@ mod windows {
             )
         })?;
         Ok(File::from(handle))
+    }
+
+    pub(super) fn open_web_auth_read_file(path: &Path) -> Result<File> {
+        validate_native_absolute_path(path).context(WebAuthPathError)?;
+        let parent = path.parent().context(WebAuthPathError)?;
+        let (_parent_handle, parent_identity) =
+            web_auth_parent(parent).context(WebAuthPathError)?;
+        // No WRITE_DAC, file write or directory write is requested for a read.
+        let handle = open_existing_private_file(path, GENERIC_READ)?;
+        check_web_auth_identity(&handle, parent_identity)?;
+        Ok(File::from(handle))
+    }
+
+    fn web_auth_parent(path: &Path) -> Result<(OwnedHandle, FileIdentity)> {
+        // Core/Server already admitted this selected data directory. Retain
+        // native path, volume and identity checks without reimposing a writable
+        // DACL template on a read-only Token lookup after admission.
+        validate_native_absolute_path(path)?;
+        let handle = open_path(path, ExpectedObjectKind::Directory)?;
+        admit_volume(path)?;
+        let identity = file_identity(&handle)?;
+        let canonical = path.canonicalize()?;
+        let reopened = open_path(&canonical, ExpectedObjectKind::Directory)?;
+        anyhow::ensure!(file_identity(&reopened)? == identity, WebAuthPathError);
+        Ok((handle, identity))
+    }
+
+    fn check_web_auth_identity(handle: &OwnedHandle, parent: FileIdentity) -> Result<()> {
+        let identity =
+            inspect_handle(handle, ExpectedObjectKind::File).context(WebAuthPathError)?;
+        anyhow::ensure!(
+            identity.volume_serial_number == parent.volume_serial_number,
+            WebAuthPathError
+        );
+        Ok(())
+    }
+
+    pub(super) fn atomic_write_web_auth_bytes(
+        data_dir: &Path,
+        bytes: &[u8],
+        harden: impl FnOnce(&OwnedHandle) -> Result<()>,
+    ) -> Result<()> {
+        let (_parent_handle, parent_identity) =
+            web_auth_parent(data_dir).context(WebAuthPathError)?;
+        let destination = data_dir.join("web-auth.json");
+        match std::fs::symlink_metadata(&destination) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            result => {
+                let metadata = result?;
+                anyhow::ensure!(
+                    metadata.is_file() && !metadata.file_type().is_symlink(),
+                    WebAuthPathError
+                );
+                drop(open_web_auth_read_file(&destination)?);
+            }
+        }
+        let temporary = data_dir.join(format!(".web-auth-{}.tmp", uuid::Uuid::new_v4()));
+        let wide = wide_path(&temporary).context(WebAuthPathError)?;
+        let raw = unsafe {
+            // SAFETY: live NUL-terminated path, CREATE_NEW never opens another
+            // object. Inherit the admitted directory's ACL. Required I/O rights
+            // plus MAXIMUM_ALLOWED obtain optional WRITE_DAC only if available.
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE | MAXIMUM_ALLOWED,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                null(),
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        if raw == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error())
+                .context("failed to create Web credential sibling");
+        }
+        let result = (|| -> Result<()> {
+            let handle = owned_handle(raw)?;
+            clear_handle_inheritance(&handle)?;
+            check_web_auth_identity(&handle, parent_identity)?;
+            // Only descriptor construction/application is optional. Never put
+            // path admission, identity checks, writes or rename in this result.
+            let _ = harden(&handle);
+            let mut file = File::from(handle);
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            drop(file);
+            // Native replacement is the commit point: no fallible work follows.
+            commit_private_temporary(&temporary, &destination)
+        })();
+        if result.is_err() {
+            // CREATE_NEW succeeded: only our own sibling may be removed.
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result
     }
 
     pub(super) fn private_file_permissions_need_repair(path: &Path) -> Result<bool> {
@@ -1326,6 +1455,44 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(value, serde_json::json!({"state": "verified"}));
         drop(open_private_read_write_file(&path).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Owns only the Web-specific optional hardening boundary and actual native
+    // replace failures; session durability belongs to rovai-web's reopen test.
+    #[cfg(windows)]
+    #[test]
+    fn web_auth_hardening_failure_preserves_atomic_io_and_path_checks() {
+        let root = std::env::temp_dir().join(format!("rovai-web-auth-storage-{}", Uuid::new_v4()));
+        prepare_private_directory(&root).unwrap();
+        let path = root.join("web-auth.json");
+        let unavailable = |_: &std::os::windows::io::OwnedHandle| {
+            anyhow::bail!("synthetic optional hardening failure")
+        };
+        windows::atomic_write_web_auth_bytes(&root, b"first", unavailable).unwrap();
+        assert!(open_private_read_file(&path).is_err());
+        drop(open_web_auth_read_file(&root).unwrap());
+        windows::atomic_write_web_auth_bytes(&root, b"second", unavailable).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        assert!(atomic_write_private_bytes(&path, b"strict").is_err());
+
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions.clone()).unwrap();
+        assert!(windows::atomic_write_web_auth_bytes(&root, b"lost", unavailable).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            1,
+            "failed writes clean only their sibling"
+        );
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(open_web_auth_read_file(&root).is_err());
+        assert!(windows::atomic_write_web_auth_bytes(&root, b"lost", unavailable).is_err());
+        assert!(path.is_dir());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1,7 +1,7 @@
 ---
 document_type: architecture
 authority: unified-rust-host
-last_updated: 2026-09-25
+last_updated: 2026-10-11
 ---
 
 # 统一 Rust Host
@@ -55,7 +55,10 @@ Host 在准入的 Core data-dir 内持久保存私有认证文档，浏览器 In
 扫码登录的一次性 fragment 票据按下述短期例外处理。
 
 长期登录 Token 使用 256-bit 系统随机数，本机入口初始化、重复查看/复制或显式重置。
-Desktop 与 Server 使用同一私有 `web-auth.json` 持久实现，原独立 `server-token` 仅作首次导入；Token 命令优先读取统一文档。
+Desktop 与 Server 使用同一 `web-auth.json` 持久实现，原独立 `server-token` 仅作首次导入；Token 命令优先读取统一文档。
+Windows 以已准入数据目录的操作系统权限为信任基础，凭据文件接受正常继承 ACL，不承诺独立受保护的精确权限模板。
+平台适配器只为该文件提供保留路径/身份检查的读取与原子保存，额外 DACL 加固尽力完成；其他私有存储规则不变。
+具体读写与失败语义见 [Host Web v4](../contracts/host-web-v4.md#windows-web-凭据可用性)。
 Host 保存 Bearer 的带类型摘要、编辑 ID、绝对到期时间和最近认证时间，认证使用恒定时间比较。
 Session 上限保持 32；容量满时回收最久未使用且没有在途请求或 SSE 的记录，保护在线标签页与派生请求的父 Session。
 回收与新建原子持久化，具体准入与失败边界由 [Host Web v2](../contracts/host-web-v2.md#bounded-session-admission) 拥有。

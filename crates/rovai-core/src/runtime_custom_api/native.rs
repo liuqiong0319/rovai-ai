@@ -40,6 +40,15 @@ impl NativeContext {
         configuration: &RuntimeStartupConfiguration,
         database: &Path,
     ) -> Result<Self> {
+        Self::resolve_with_environment(kind, configuration, database, None)
+    }
+
+    pub(crate) fn resolve_with_environment(
+        kind: AdapterKind,
+        configuration: &RuntimeStartupConfiguration,
+        database: &Path,
+        frozen_environment: Option<&BTreeMap<String, String>>,
+    ) -> Result<Self> {
         #[cfg(not(test))]
         let mut environment: BTreeMap<String, String> = std::env::vars().collect();
         // Library fixtures never inspect a developer's native credentials.
@@ -53,6 +62,9 @@ impl NativeContext {
                 .to_string_lossy()
                 .into_owned(),
         )]);
+        if let Some(frozen) = frozen_environment {
+            environment = frozen.clone();
+        }
         for entry in &configuration.environment {
             environment.insert(entry.name.clone(), entry.value.clone());
         }

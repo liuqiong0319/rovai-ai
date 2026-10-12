@@ -6,11 +6,15 @@ use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
 use tokio::process::Command;
 
-use crate::{agent_profile::AdapterKind, command::canonical_json_digest};
+use crate::{
+    agent_profile::{AdapterKind, DshModelSource},
+    command::canonical_json_digest,
+};
 
 pub const MINIMUM_VERSION: &str = "0.1.5-rc.2";
-pub const BOOTSTRAP_REVISION: &str = "dsh-responses-tool-compat-v4";
+pub const BOOTSTRAP_REVISION: &str = "dsh-native-web-models-v6";
 const BOOTSTRAP_PLUGIN: &str = include_str!("dsh/bootstrap.mjs");
+const MODEL_PLUGIN: &str = include_str!("dsh/models.mjs");
 const MAX_OBSERVED_FILE_CONTENT_BYTES: usize = 2 * 1024 * 1024;
 
 pub fn supported_version(version: Option<&str>) -> bool {
@@ -57,8 +61,12 @@ fn native_home() -> Result<std::path::PathBuf> {
 }
 
 fn configuration_digest(home: &Path, cwd: &Path) -> Result<String> {
+    configuration_digest_for_workdir(home, Some(cwd))
+}
+
+fn configuration_digest_for_workdir(home: &Path, cwd: Option<&Path>) -> Result<String> {
     let mut entries = Vec::new();
-    for path in [
+    let mut paths = vec![
         home.join("settings.yaml"),
         home.join(".credentials.yaml"),
         home.join(".env"),
@@ -66,16 +74,205 @@ fn configuration_digest(home: &Path, cwd: &Path) -> Result<String> {
         home.join("profiles/acp/package.json"),
         home.join("profiles/acp/cordis.yml"),
         home.join("profiles/acp/cordis.patch.yml"),
-        cwd.join(".env"),
-    ] {
+        home.join("profiles/web/package.json"),
+        home.join("profiles/web/cordis.patch.yml"),
+    ];
+    if let Some(cwd) = cwd {
+        paths.push(cwd.join(".env"));
+    }
+    for path in paths {
         let digest = match fs::read(&path) {
-            Ok(bytes) => Some(format!("{:x}", Sha256::digest(bytes))),
+            Ok(bytes) => Some(if path == home.join("profiles/web/cordis.patch.yml") {
+                web_model_digest(&bytes)?
+            } else {
+                format!("{:x}", Sha256::digest(bytes))
+            }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) if path.starts_with(home.join("profiles/web")) => Some("unreadable".to_string()),
             Err(_) => bail!("dsh_native_configuration_unreadable"),
         };
         entries.push((path, digest));
     }
     canonical_json_digest(&json!({"revision": BOOTSTRAP_REVISION, "home": home, "files": entries}))
+}
+
+/// Capability probes always have an empty, isolated working directory. Reuse
+/// the native digest without including that randomly named directory. This is
+/// local observation only; it neither starts DSH nor changes Host reuse rules.
+pub fn model_options_context(executable: &Path) -> Result<String> {
+    // Probe canonicalization adds a Windows verbatim prefix that catalog
+    // commits remove. Both observations must identify the same executable.
+    let executable = crate::runtime_discovery::runtime_visible_path(executable.canonicalize()?);
+    let mut command = Command::new(&executable);
+    crate::runtime_discovery::configure_runtime_command(AdapterKind::DeepseekHarness, &mut command);
+    let mut environment =
+        crate::runtime_discovery::runtime_environment(AdapterKind::DeepseekHarness);
+    for (name, value) in command.as_std().get_envs() {
+        if let Some(value) = value {
+            environment.insert(
+                name.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            );
+        }
+    }
+    let identity = crate::agent_runtime_adapter::observe_executable_file_identity(&executable)?;
+    canonical_json_digest(&json!({
+        "configuration": configuration_digest_for_workdir(&native_home()?, None)?,
+        "executable": executable,
+        "identity": [identity.byte_size.to_string(), identity.modified_at_unix_nanos.to_string(), identity.file_id.unwrap_or_default()],
+        "environment": environment,
+    }))
+}
+
+fn web_model_digest(bytes: &[u8]) -> Result<String> {
+    // Native Loader still parses/evaluates configuration. This projection only
+    // keeps unrelated Web UI edits out of the existing Host reuse fence.
+    let Ok(Value::Array(patches)) = serde_yaml::from_slice::<Value>(bytes) else {
+        return Ok(format!("{:x}", Sha256::digest(bytes)));
+    };
+    let relevant: Vec<_> = patches
+        .into_iter()
+        .filter(|patch| {
+            patch["id"]
+                .as_str()
+                .is_none_or(|id| matches!(id, "llm-pi-ai" | "llm-deepseek"))
+        })
+        .collect();
+    canonical_json_digest(&json!(relevant))
+}
+
+fn model_preparation_patch(root: &Path) -> Result<Value> {
+    fs::create_dir_all(root)?;
+    private_directory(root)?;
+    let plugin = root.join("models.mjs");
+    fs::write(&plugin, MODEL_PLUGIN)?;
+    private_file(&plugin)?;
+    Ok(
+        json!({"insert":[{"id":"rovai-model-configuration","name":plugin,
+        "config":{"resultPath":root.join("models.result.json")}}]}),
+    )
+}
+
+/// The exact same model preparation as execution, without a Run, Bootstrap,
+/// task credentials, permission changes, or Web application startup.
+pub fn configure_probe(command: &mut Command, root: &Path) -> Result<()> {
+    let patch = json!([model_preparation_patch(root)?]);
+    let path = root.join("models.patch.json");
+    fs::write(&path, serde_json::to_vec(&patch)?)?;
+    private_file(&path)?;
+    command.args(["--profile", "acp", "--patch"]).arg(path);
+    Ok(())
+}
+
+pub async fn await_model_preparation(root: &Path) -> Result<Value> {
+    let path = root.join("models.result.json");
+    tokio::time::timeout(std::time::Duration::from_secs(25), async {
+        loop {
+            match fs::read(&path) {
+                Ok(bytes) => {
+                    let result: Value = serde_json::from_slice(&bytes)
+                        .map_err(|_| anyhow::anyhow!("dsh_model_preparation_invalid"))?;
+                    if result["schemaVersion"] != 1
+                        || !matches!(result["status"].as_str(), Some("ready" | "native_only"))
+                    {
+                        bail!("dsh_model_preparation_failed");
+                    }
+                    return Ok(result);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => bail!("dsh_model_preparation_unreadable"),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .context("dsh_model_preparation_timed_out")?
+}
+
+pub fn model_inputs_unchanged(result: &Value) -> bool {
+    result["inputs"].as_array().is_none_or(|inputs| {
+        inputs.iter().all(|input| {
+            let Some(path) = input["path"].as_str() else {
+                return false;
+            };
+            match fs::read(path) {
+                Ok(bytes) => {
+                    input["digest"].as_str()
+                        == Some(format!("{:x}", Sha256::digest(bytes)).as_str())
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    input["digest"].is_null()
+                }
+                Err(_) => input["digest"] == "unreadable",
+            }
+        })
+    })
+}
+
+pub fn annotate_session(session: &mut Value, preparation: &Value) {
+    // Private result contains only identities, hashes and fixed diagnostic codes.
+    session["_meta"]["rovaiDshModels"] = preparation.clone();
+}
+
+pub fn model_provider(model: &str) -> Option<String> {
+    let identity: Vec<String> = serde_json::from_str(model).ok()?;
+    (identity.len() == 2).then(|| identity[0].clone())
+}
+
+pub fn model_source(result: &Value, model: &str) -> DshModelSource {
+    if model_provider(model).is_some_and(|provider| {
+        result["webProviders"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id == &provider))
+    }) {
+        DshModelSource::Web
+    } else {
+        DshModelSource::Native
+    }
+}
+
+pub fn selected_route_available(
+    result: &Value,
+    model: &str,
+    selected: Option<DshModelSource>,
+) -> bool {
+    // Selections predating Web supplementation retain native semantics. New Web
+    // selections carry their source through the existing member/frozen JSON.
+    // A failed supplement says nothing about unrelated native plugin routes.
+    let selected = selected.unwrap_or(DshModelSource::Native);
+    model_source(result, model) == selected
+        && (selected != DshModelSource::Web
+            || model_provider(model).is_some_and(|provider| {
+                !result["rejectedProviders"]
+                    .as_array()
+                    .is_some_and(|ids| ids.iter().any(|id| id == &provider))
+            }))
+}
+
+pub fn preparation_diagnostic(result: &Value) -> Option<&'static str> {
+    let diagnostics = result["diagnostics"].as_array()?;
+    if diagnostics
+        .iter()
+        .any(|row| row["code"] == "native_model_compatibility_unavailable")
+    {
+        return Some("DSH 模型兼容修正暂不可用，已保留原生配置。");
+    }
+    if diagnostics.iter().any(|row| {
+        row["code"].as_str().is_some_and(|code| {
+            code.starts_with("native_model_import") || code == "native_initialization_failed"
+        })
+    }) {
+        Some("DSH 原生配置迁移未完整完成；已保留备份，请检查 DSH 配置。")
+    } else if diagnostics
+        .iter()
+        .any(|row| row["code"] != "native_provider_preferred")
+    {
+        Some("部分 DSH Web 模型配置无法复用，已保留原生 ACP 配置。")
+    } else if !diagnostics.is_empty() {
+        Some("同名 Provider 保留原生 ACP 配置。")
+    } else {
+        None
+    }
 }
 
 pub fn configure_host(
@@ -84,55 +281,6 @@ pub fn configure_host(
     cwd: &Path,
     permissions: &Value,
     mcp_server_names: &[String],
-) -> Result<()> {
-    let tool_compat = responses_tool_compat(&native_home()?.join("settings.yaml"))?;
-    configure_host_with_tool_compat(
-        command,
-        root,
-        cwd,
-        permissions,
-        mcp_server_names,
-        tool_compat,
-    )
-}
-
-/// Only project non-secret defaults into the composition layer. Native user
-/// settings (including model-level overrides) still have the final say. DSH's
-/// pi-ai adapter otherwise omits `strict`, allowing Responses endpoints to
-/// require optional shell arguments such as `justification`.
-fn responses_tool_compat(settings_path: &Path) -> Result<Option<Value>> {
-    let bytes = match fs::read(settings_path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => bail!("dsh_native_configuration_unreadable"),
-    };
-    // Parser errors can contain scalar values from this credential-bearing file.
-    let settings: Value = serde_yaml::from_slice(&bytes)
-        .map_err(|_| anyhow::anyhow!("dsh_native_settings_invalid"))?;
-    let Some(providers) = settings
-        .pointer("/llm-pi-ai/providers")
-        .and_then(Value::as_object)
-    else {
-        return Ok(None);
-    };
-    let defaults: serde_json::Map<String, Value> = providers
-        .iter()
-        .filter(|(_, provider)| {
-            provider["api"] == "openai-responses"
-                && provider.pointer("/compat/supportsStrictMode").is_none()
-        })
-        .map(|(route, _)| (route.clone(), json!({"compat":{"supportsStrictMode":true}})))
-        .collect();
-    Ok((!defaults.is_empty()).then(|| json!({"id":"llm-pi-ai","config":{"providers":defaults}})))
-}
-
-fn configure_host_with_tool_compat(
-    command: &mut Command,
-    root: &Path,
-    cwd: &Path,
-    permissions: &Value,
-    mcp_server_names: &[String],
-    tool_compat: Option<Value>,
 ) -> Result<()> {
     let sandbox = permissions
         .get("sandbox_mode")
@@ -172,9 +320,12 @@ fn configure_host_with_tool_compat(
         {"id":"acp","inject":["acpAppStartup","rovaiDshReady"]},
         {"insert":[{"id":"rovai-bootstrap","name":plugin_path,"config":{"bindingRoot":binding_root,"observationRoot":observation_root,"mcpServerNames":mcp_server_names}}]}
     ]);
-    if let Some(tool_compat) = tool_compat {
-        patch.as_array_mut().unwrap().push(tool_compat);
-    }
+    // Model overrides are applied only in memory after native initialization.
+    // A CLI llm-pi-ai override here can be absorbed into DSH's Profile import.
+    patch
+        .as_array_mut()
+        .unwrap()
+        .push(model_preparation_patch(root)?);
     let patch_path = root.join("rovai.patch.json");
     fs::write(&patch_path, serde_json::to_vec(&patch)?)?;
     private_file(&patch_path)?;
@@ -447,10 +598,11 @@ fn private_file(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn dsh_native_configuration_fences_profile_and_credentials() {
+    #[tokio::test]
+    async fn dsh_native_configuration_fences_profile_and_credentials() {
         let root = std::env::temp_dir().join(format!("rovai-dsh-config-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(root.join("profiles/acp")).unwrap();
+        fs::create_dir_all(root.join("profiles/web")).unwrap();
         let mut previous = configuration_digest(&root, &root).unwrap();
         // The old digest omitted the profile composition: changing its model
         // route could silently reuse a Host with the previous configuration.
@@ -458,6 +610,10 @@ mod tests {
             ("profiles/acp/cordis.yml", "fixture-profile-route"),
             (".credentials.yaml", "fixture-private-key"),
             ("settings.yaml", "fixture-provider-settings"),
+            (
+                "profiles/web/cordis.patch.yml",
+                r#"[{"id":"llm-pi-ai","config":{"providers":{"web":{"api":"openai-responses"}}}}]"#,
+            ),
         ] {
             fs::write(root.join(path), contents).unwrap();
             let next = configuration_digest(&root, &root).unwrap();
@@ -466,9 +622,107 @@ mod tests {
             assert!(!next.contains(contents));
             previous = next;
         }
+        let web = root.join("profiles/web/cordis.patch.yml");
+        fs::write(&web, r#"[{"id":"web-ui","config":{"theme":"dark"}},{"id":"llm-pi-ai","config":{"providers":{"web":{"api":"openai-responses"}}}}]"#).unwrap();
+        assert_eq!(previous, configuration_digest(&root, &root).unwrap());
+        let bytes = fs::read(&web).unwrap();
+        let preparation = json!({"schemaVersion":1,"status":"ready","inputs":[{"path":web,"digest":format!("{:x}",Sha256::digest(&bytes))}]});
+        assert!(model_inputs_unchanged(&preparation));
+        fs::write(
+            root.join("models.result.json"),
+            serde_json::to_vec(&preparation).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &web,
+            String::from_utf8(bytes).unwrap().replace("dark", "light"),
+        )
+        .unwrap();
+        assert_eq!(previous, configuration_digest(&root, &root).unwrap());
+        assert!(
+            !model_inputs_unchanged(&preparation),
+            "publication must discard an obsolete probe"
+        );
+        assert_eq!(
+            await_model_preparation(&root).await.unwrap(),
+            preparation,
+            "a compatible prepared Host reads its result without rechecking raw inputs"
+        );
+        fs::write(&web, "[]").unwrap();
+        assert!(!model_inputs_unchanged(&preparation));
+        assert_ne!(previous, configuration_digest(&root, &root).unwrap());
         fs::remove_file(root.join("settings.yaml")).unwrap();
         fs::create_dir(root.join("settings.yaml")).unwrap();
         assert!(configuration_digest(&root, &root).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dsh_model_options_context_normalizes_paths_and_preserves_invalidation() {
+        use crate::runtime_discovery::{
+            RuntimeSearchEnvironment, runtime_visible_path, with_runtime_configuration,
+        };
+        use crate::runtime_startup::{RuntimeEnvironmentVariable, RuntimeStartupConfiguration};
+
+        let root = std::env::temp_dir().join(format!("rovai-dsh-context-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("dsh.cmd");
+        fs::write(&executable, "fixture-executable").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let canonical = executable.canonicalize().unwrap();
+        let visible = runtime_visible_path(canonical.clone());
+        #[cfg(windows)]
+        assert_ne!(canonical, visible, "exercise both Windows path spellings");
+        let kind = AdapterKind::DeepseekHarness;
+        let configuration = RuntimeStartupConfiguration {
+            environment: vec![RuntimeEnvironmentVariable {
+                name: "DSH_HOME".to_string(),
+                value: root.to_string_lossy().into_owned(),
+            }],
+            ..Default::default()
+        };
+        let search = RuntimeSearchEnvironment::for_test_paths(1, vec![])
+            .with_startup_configuration(kind, configuration.clone());
+        let original = with_runtime_configuration(kind, &search, async {
+            let original = model_options_context(&visible).unwrap();
+            assert_eq!(original, model_options_context(&canonical).unwrap());
+            fs::write(root.join("settings.yaml"), "fixture-model-configuration").unwrap();
+            let configured = model_options_context(&visible).unwrap();
+            assert_ne!(
+                original, configured,
+                "model configuration still invalidates"
+            );
+            assert_eq!(configured, model_options_context(&canonical).unwrap());
+            fs::write(&executable, "changed-fixture-executable-with-new-size").unwrap();
+            let replaced = model_options_context(&visible).unwrap();
+            assert_ne!(
+                configured, replaced,
+                "executable identity still invalidates"
+            );
+            assert_eq!(replaced, model_options_context(&canonical).unwrap());
+            replaced
+        })
+        .await;
+        let mut changed_environment = configuration;
+        changed_environment
+            .environment
+            .push(RuntimeEnvironmentVariable {
+                name: "ROVAI_DSH_CONTEXT_FIXTURE".to_string(),
+                value: "changed".to_string(),
+            });
+        let changed_search = search.with_startup_configuration(kind, changed_environment);
+        with_runtime_configuration(kind, &changed_search, async {
+            assert_ne!(original, model_options_context(&visible).unwrap());
+            assert_eq!(
+                model_options_context(&visible).unwrap(),
+                model_options_context(&canonical).unwrap()
+            );
+        })
+        .await;
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -682,11 +936,41 @@ mod tests {
     }
     #[test]
     fn responses_tool_defaults_preserve_native_overrides_and_private_settings() {
+        // The same native ID is usable as a native choice, never as a failed Web choice.
+        for preparation in [
+            json!({"rejectedProviders":["web"]}),
+            json!({"webUnavailable":true,"webProviders":["known-web"]}),
+        ] {
+            for provider in ["native", "web", "other-plugin", "builtin"] {
+                let id = json!([provider, "same-model"]).to_string();
+                assert!(selected_route_available(
+                    &preparation,
+                    &id,
+                    Some(DshModelSource::Native)
+                ));
+                assert!(selected_route_available(&preparation, &id, None));
+                assert!(!selected_route_available(
+                    &preparation,
+                    &id,
+                    Some(DshModelSource::Web)
+                ));
+            }
+        }
+        let available = json!({"webProviders":["web"]});
+        assert!(selected_route_available(
+            &available,
+            r#"["web","same-model"]"#,
+            Some(DshModelSource::Web)
+        ));
+        assert!(!selected_route_available(
+            &available,
+            r#"["web","same-model"]"#,
+            Some(DshModelSource::Native)
+        ));
         let root =
             std::env::temp_dir().join(format!("rovai-dsh-responses-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("settings.yaml");
-        assert_eq!(responses_tool_compat(&path).unwrap(), None);
         let settings = json!({
             "llm-pi-ai":{"providers":{
                 "gateway":{"api":"openai-responses","baseURL":"https://private.invalid/v1",
@@ -703,21 +987,13 @@ mod tests {
         });
         let original = serde_yaml::to_string(&settings).unwrap();
         fs::write(&path, &original).unwrap();
-        let compat = responses_tool_compat(&path).unwrap();
-        assert_eq!(
-            compat,
-            Some(json!({"id":"llm-pi-ai","config":{"providers":{
-                "gateway":{"compat":{"supportsStrictMode":true}}
-            }}}))
-        );
         let mut command = Command::new("dsh");
-        configure_host_with_tool_compat(
+        configure_host(
             &mut command,
             &root,
             &root,
             &json!({"sandbox_mode":"workspace-write","approval_policy":"ask"}),
             &[],
-            compat,
         )
         .unwrap();
         let patch = fs::read_to_string(root.join("rovai.patch.json")).unwrap();
@@ -725,18 +1001,27 @@ mod tests {
         assert!(!patch.contains("private.invalid"));
         assert!(!patch.contains("\"models\""));
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
-        assert_eq!(
-            serde_json::from_str::<Value>(&patch).unwrap()[5]["id"],
-            "llm-pi-ai"
+        let rows: Value = serde_json::from_str(&patch).unwrap();
+        assert!(
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["id"] != "llm-pi-ai")
         );
-        for settings in [json!({}), json!({"llm-pi-ai":{"providers":{}}})] {
-            fs::write(&path, serde_json::to_vec(&settings).unwrap()).unwrap();
-            assert_eq!(responses_tool_compat(&path).unwrap(), None);
-        }
+        assert_eq!(rows[5]["insert"][0]["id"], "rovai-model-configuration");
+        let mut probe = Command::new("dsh");
+        configure_probe(&mut probe, &root).unwrap();
+        let probe_patch: Value =
+            serde_json::from_slice(&fs::read(root.join("models.patch.json")).unwrap()).unwrap();
+        assert_eq!(probe_patch[0], rows[5]);
+        // Compatibility field precedence is owned by dsh-host.test.mjs, where
+        // the in-process transformation now runs. The command never reads keys.
         fs::write(&path, "credential: [private-test-credential").unwrap();
-        assert_eq!(
-            responses_tool_compat(&path).unwrap_err().to_string(),
-            "dsh_native_settings_invalid"
+        configure_probe(&mut probe, &root).unwrap();
+        assert!(
+            !fs::read_to_string(root.join("models.patch.json"))
+                .unwrap()
+                .contains("private-test")
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -749,13 +1034,12 @@ mod tests {
         for sandbox in ["read-only", "workspace-write", "danger-full-access"] {
             for approval in ["ask", "never"] {
                 let mut command = Command::new("dsh");
-                configure_host_with_tool_compat(
+                configure_host(
                     &mut command,
                     &root,
                     &root,
                     &json!({"sandbox_mode":sandbox,"approval_policy":approval}),
                     &[],
-                    None,
                 )
                 .unwrap();
                 let patch: Value =

@@ -40,6 +40,8 @@ pub enum AdapterKind {
     OpencodeCli,
     CopilotCli,
     ClaudeCodeCli,
+    ClineCli,
+    CommandCodeCli,
     KiroCli,
     QoderCli,
     CodebuddyCli,
@@ -97,12 +99,14 @@ impl MissingSendRecoveryMode {
 }
 
 impl AdapterKind {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 18] = [
         Self::CodexCli,
         Self::Pi,
         Self::OpencodeCli,
         Self::CopilotCli,
         Self::ClaudeCodeCli,
+        Self::ClineCli,
+        Self::CommandCodeCli,
         Self::AntigravityApp,
         Self::KiroCli,
         Self::QoderCli,
@@ -123,6 +127,8 @@ impl AdapterKind {
             Self::OpencodeCli => "opencode-cli",
             Self::CopilotCli => "copilot-cli",
             Self::ClaudeCodeCli => "claude-code-cli",
+            Self::ClineCli => "cline-cli",
+            Self::CommandCodeCli => "command-code-cli",
             Self::KiroCli => "kiro-cli",
             Self::QoderCli => "qoder-cli",
             Self::CodebuddyCli => "codebuddy-cli",
@@ -144,6 +150,8 @@ impl AdapterKind {
             Self::OpencodeCli => "opencode",
             Self::CopilotCli => "copilot",
             Self::ClaudeCodeCli => "claude",
+            Self::ClineCli => "cline",
+            Self::CommandCodeCli => "command-code",
             Self::KiroCli => "kiro-cli",
             Self::QoderCli => "qodercli",
             Self::CodebuddyCli => "codebuddy",
@@ -175,6 +183,8 @@ impl AdapterKind {
             Self::OpencodeCli => &["opencode"],
             Self::CopilotCli => &["copilot"],
             Self::ClaudeCodeCli => &["claude"],
+            Self::ClineCli => &["cline"],
+            Self::CommandCodeCli => &["command-code", "cmdc"],
             Self::KiroCli => &["kiro-cli"],
             Self::QoderCli => &["qodercli"],
             Self::CodebuddyCli => &["codebuddy"],
@@ -191,6 +201,8 @@ impl AdapterKind {
             Self::OpencodeCli => "OpenCode",
             Self::CopilotCli => "GitHub Copilot",
             Self::ClaudeCodeCli => "Claude Code",
+            Self::ClineCli => "Cline",
+            Self::CommandCodeCli => "Command Code",
             Self::KiroCli => "Kiro",
             Self::QoderCli => "Qoder",
             Self::CodebuddyCli => "CodeBuddy",
@@ -210,6 +222,8 @@ impl AdapterKind {
             self,
             Self::OpencodeCli
                 | Self::CopilotCli
+                | Self::CommandCodeCli
+                | Self::ClineCli
                 | Self::KiroCli
                 | Self::QoderCli
                 | Self::CodebuddyCli
@@ -230,6 +244,8 @@ impl AdapterKind {
             Self::OpencodeCli => "ROVAI_OPENCODE_BIN",
             Self::CopilotCli => "ROVAI_COPILOT_BIN",
             Self::ClaudeCodeCli => "ROVAI_CLAUDE_CODE_BIN",
+            Self::ClineCli => "ROVAI_CLINE_BIN",
+            Self::CommandCodeCli => "ROVAI_COMMAND_CODE_BIN",
             Self::KiroCli => "ROVAI_KIRO_BIN",
             Self::QoderCli => "ROVAI_QODER_BIN",
             Self::CodebuddyCli => "ROVAI_CODEBUDDY_BIN",
@@ -255,6 +271,8 @@ impl AdapterKind {
             | Self::Pi
             | Self::OpencodeCli
             | Self::CopilotCli
+            | Self::CommandCodeCli
+            | Self::ClineCli
             | Self::ClaudeCodeCli
             | Self::KiroCli
             | Self::QoderCli
@@ -279,6 +297,8 @@ impl AdapterKind {
             | Self::Pi
             | Self::OpencodeCli
             | Self::CopilotCli
+            | Self::CommandCodeCli
+            | Self::ClineCli
             | Self::ClaudeCodeCli
             | Self::KiroCli
             | Self::QoderCli
@@ -305,6 +325,8 @@ impl FromStr for AdapterKind {
             "opencode-cli" => Ok(Self::OpencodeCli),
             "copilot-cli" => Ok(Self::CopilotCli),
             "claude-code-cli" => Ok(Self::ClaudeCodeCli),
+            "cline-cli" => Ok(Self::ClineCli),
+            "command-code-cli" => Ok(Self::CommandCodeCli),
             "kiro-cli" => Ok(Self::KiroCli),
             "qoder-cli" => Ok(Self::QoderCli),
             "codebuddy-cli" => Ok(Self::CodebuddyCli),
@@ -380,6 +402,13 @@ impl FromStr for InstallationClass {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DshModelSource {
+    Native,
+    Web,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum ModelSelection {
@@ -389,6 +418,8 @@ pub enum ModelSelection {
         model_id: String,
         #[serde(default)]
         options: Value,
+        #[serde(default, rename = "dshSource", skip_serializing_if = "Option::is_none")]
+        dsh_source: Option<DshModelSource>,
     },
 }
 
@@ -423,11 +454,15 @@ pub struct ResolvedModelSelection {
     pub source: String,
     pub model_id: String,
     pub options: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsh_source: Option<DshModelSource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrozenAgentRuntimeConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<crate::member_environment::FrozenEnvironment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_api: Option<crate::runtime_custom_api::CustomApiSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -598,6 +633,14 @@ fn runtime_model_catalog_cache_view_at(
             expires_at: None,
         };
     }
+    catalog_observation_cache_view(catalog_succeeded_at, retained_lkg, now)
+}
+
+fn catalog_observation_cache_view(
+    catalog_succeeded_at: Option<&str>,
+    needs_revalidation: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> RuntimeModelCatalogCacheView {
     let observed_at = catalog_succeeded_at.map(str::to_owned);
     let Some(observed_at_value) = observed_at.as_deref() else {
         return RuntimeModelCatalogCacheView {
@@ -623,7 +666,7 @@ fn runtime_model_catalog_cache_view_at(
         observed_at_time + chrono::Duration::seconds(MODEL_CATALOG_MAX_SERVICE_AGE_SECONDS);
     let status = if now >= expires_at {
         RuntimeModelCatalogCacheStatus::Expired
-    } else if retained_lkg || now >= revalidate_after {
+    } else if needs_revalidation || now >= revalidate_after {
         RuntimeModelCatalogCacheStatus::Stale
     } else {
         RuntimeModelCatalogCacheStatus::Fresh
@@ -704,9 +747,13 @@ impl AdapterInstallationView {
         self.model_catalog.is_serviceable()
             || (self.model_catalog.status == RuntimeModelCatalogCacheStatus::Expired
                 && self.snapshot.as_ref().is_some_and(|snapshot| {
-                    snapshot.probe_status == "ready"
-                        && snapshot.stale_at.is_none()
-                        && model_catalog_has_native_evidence(self.adapter_kind, &snapshot.models)
+                    self.adapter_kind == AdapterKind::Pi
+                        || (snapshot.probe_status == "ready"
+                            && snapshot.stale_at.is_none()
+                            && model_catalog_has_native_evidence(
+                                self.adapter_kind,
+                                &snapshot.models,
+                            ))
                 }))
     }
 }
@@ -855,6 +902,8 @@ impl DomainCommand for SetAgentProfileAvatarCommand {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetMemberRuntimeConfigurationCommand {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_update: Option<crate::member_environment::EnvironmentUpdateReceipt>,
     pub agent_id: String,
     pub expected_version: i64,
     pub adapter_kind: AdapterKind,
@@ -1028,6 +1077,12 @@ pub struct DiscoveredRuntimeEntry {
 pub struct VerifiedDiscoveredRuntimeEntry {
     entry: DiscoveredRuntimeEntry,
     identity: ExecutableFileIdentity,
+}
+
+impl VerifiedDiscoveredRuntimeEntry {
+    pub fn executable_file_identity(&self) -> &ExecutableFileIdentity {
+        &self.identity
+    }
 }
 
 impl DiscoveredRuntimeEntry {
@@ -1297,7 +1352,11 @@ impl AgentProfileService {
                        attempt.diagnostic_code, attempt.candidate_path,
                        attempt.executable_fingerprint, attempt.attempted_at,
                        attempt.retry_after, attempt.public_runtime_failure_json,
-                       COALESCE(snapshot.model_catalog_succeeded_at, snapshot.last_successful_probe_at)
+                       COALESCE(snapshot.model_catalog_succeeded_at, snapshot.last_successful_probe_at),
+                       (SELECT executable_fingerprint FROM runtime_executable_identity
+                        WHERE installation_id = installation.id
+                          AND executable_path = installation.executable_path),
+                       (SELECT generation FROM runtime_search_environment_state WHERE singleton = 1)
                 FROM adapter_installation AS installation
                 LEFT JOIN adapter_capability_snapshot AS snapshot
                   ON snapshot.installation_id = installation.id
@@ -1569,6 +1628,7 @@ impl AgentProfileService {
         let model = match frozen.model.source.as_str() {
             "runtime_default" => ModelSelection::RuntimeDefault,
             "explicit" => ModelSelection::Explicit {
+                dsh_source: frozen.model.dsh_source,
                 model_id: frozen.model.model_id.clone(),
                 options: model_options,
             },
@@ -1588,6 +1648,7 @@ impl AgentProfileService {
             Err(blocker) => return Ok(Err(blocker)),
         };
         // Re-probing may change executable evidence, never the admitted Run's Camp intent.
+        rebound.environment = frozen.environment.clone();
         rebound.camp_fast = frozen.camp_fast.clone();
         if frozen.adapter_kind == AdapterKind::CodexCli
             && frozen.camp_fast.is_some()
@@ -1873,6 +1934,7 @@ impl AgentProfileService {
             return Ok(false);
         };
         let transaction = database.connection_mut().transaction()?;
+        let models = merge_persisted_dsh_options(&transaction, &expected.id, models)?;
         let updated = transaction.execute(
             "UPDATE adapter_capability_snapshot SET model_catalog_json = ?2, model_catalog_succeeded_at = ?3
              WHERE installation_id = ?1 AND probe_status = 'ready'
@@ -1884,10 +1946,71 @@ impl AgentProfileService {
                    AND installation.executable_path = ?8 AND installation.enabled = 1
                    AND installation.path_state = 'valid' AND installation.auth_scope = ?9
                    AND installation.adapter_kind = ?10)",
-            params![expected.id, serde_json::to_string(models)?, succeeded_at,
+            params![expected.id, serde_json::to_string(&models)?, succeeded_at,
                 snapshot.executable_fingerprint, snapshot.permission_schema_digest,
                 snapshot.last_successful_probe_at, expected.generation, expected.executable_path,
                 expected.auth_scope, expected.adapter_kind.as_str()],
+        )? != 0;
+        transaction.commit()?;
+        Ok(updated)
+    }
+
+    /// Pi catalogs carry their own identity in the existing sentinel's metadata.
+    /// The row may exist solely as catalog storage; no health evidence is invented
+    /// and an existing health failure or invalidation is never cleared here.
+    pub fn commit_pi_model_catalog(
+        &self,
+        database: &mut Database,
+        expected: &AdapterInstallationView,
+        fingerprint: &str,
+        search_generation: u64,
+        models: &[ModelDescriptor],
+        observed_at: &str,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            expected.adapter_kind == AdapterKind::Pi,
+            "expected Pi installation"
+        );
+        let search_generation = i64::try_from(search_generation)
+            .context("Runtime Search Environment generation overflow")?;
+        let mut models = models.to_vec();
+        let sentinel = models
+            .iter_mut()
+            .find(|model| model.id == PI_RUNTIME_DEFAULT_MODEL_ID)
+            .context("Pi catalog has no native default entry")?;
+        sentinel.runtime_metadata = Some(json!({"piCatalogIdentity": {
+            "installationGeneration": expected.generation,
+            "executableFingerprint": fingerprint,
+            "searchGeneration": search_generation,
+        }}));
+        let transaction = database.connection_mut().transaction()?;
+        let updated = transaction.execute(
+            "INSERT INTO adapter_capability_snapshot(
+                installation_id, authentication_status, probe_status, last_attempted_at,
+                model_catalog_json, model_catalog_succeeded_at)
+             SELECT installation.id, 'unknown', 'installed_unverified', ?2, ?3, ?2
+             FROM adapter_installation installation
+             JOIN runtime_executable_identity identity ON identity.installation_id = installation.id
+             WHERE installation.id = ?1 AND installation.adapter_kind = 'pi'
+               AND installation.generation = ?4 AND installation.executable_path = ?5
+               AND installation.enabled = 1 AND installation.path_state = 'valid'
+               AND installation.auth_scope = ?6
+               AND identity.executable_path = ?5 AND identity.executable_fingerprint = ?7
+               AND EXISTS(SELECT 1 FROM runtime_search_environment_state
+                          WHERE singleton = 1 AND generation = ?8)
+             ON CONFLICT(installation_id) DO UPDATE SET
+                model_catalog_json = excluded.model_catalog_json,
+                model_catalog_succeeded_at = excluded.model_catalog_succeeded_at",
+            params![
+                expected.id,
+                observed_at,
+                serde_json::to_string(&models)?,
+                expected.generation,
+                expected.executable_path,
+                expected.auth_scope,
+                fingerprint,
+                search_generation
+            ],
         )? != 0;
         transaction.commit()?;
         Ok(updated)
@@ -2739,6 +2862,19 @@ impl AgentProfileService {
         database: &mut Database,
         envelope: &CommandEnvelope<SetMemberRuntimeConfigurationCommand>,
     ) -> Result<CommandExecution> {
+        self.set_runtime_with_environment(database, envelope, None)
+    }
+
+    pub fn set_runtime_with_environment(
+        &self,
+        database: &mut Database,
+        envelope: &CommandEnvelope<SetMemberRuntimeConfigurationCommand>,
+        environment: Option<&crate::member_environment::PreparedEnvironment>,
+    ) -> Result<CommandExecution> {
+        anyhow::ensure!(
+            envelope.payload.environment_update.is_some() == environment.is_some(),
+            "Private environment update is unavailable"
+        );
         self.gateway.execute(database, envelope, |transaction| {
             let Some((version, presence)) =
                 profile_version_and_presence(transaction, &envelope.payload.agent_id)?
@@ -2774,16 +2910,45 @@ impl AgentProfileService {
                     }),
                 ));
             }
-            let binding = ResolvedRuntimeBinding {
+            let mut binding = ResolvedRuntimeBinding {
                 adapter_kind: envelope.payload.adapter_kind,
                 installation_id: ready.installation_id.clone(),
                 model: envelope.payload.model.clone(),
                 permissions: envelope.payload.permissions.clone(),
             };
+            if binding.adapter_kind == AdapterKind::DeepseekHarness {
+                if let ModelSelection::Explicit { model_id, dsh_source, .. } = &mut binding.model {
+                    if dsh_source.is_none() {
+                        let previous: Option<String> = transaction.query_row(
+                            "SELECT default_model_selection_json FROM agent_profile WHERE id = ?1 AND selected_runtime_adapter_kind = 'deepseek-harness'",
+                            [&envelope.payload.agent_id], |row| row.get(0),
+                        ).optional()?.flatten();
+                        let catalog: Option<String> = transaction.query_row(
+                            "SELECT model_catalog_json FROM adapter_capability_snapshot WHERE installation_id = ?1",
+                            [&ready.installation_id], |row| row.get(0),
+                        ).optional()?;
+                        *dsh_source = previous.and_then(|value| serde_json::from_str::<ModelSelection>(&value).ok())
+                            .and_then(|selection| match selection {
+                                ModelSelection::Explicit { model_id: previous_id, dsh_source, .. } if previous_id == *model_id => Some(dsh_source.unwrap_or(DshModelSource::Native)),
+                                _ => None,
+                            }).or_else(|| {
+                                serde_json::from_str::<Vec<ModelDescriptor>>(catalog.as_deref()?).ok()?
+                                    .into_iter().find(|model| model.id == *model_id)?
+                                    .runtime_metadata?.get("dshSource")
+                                    .and_then(|value| serde_json::from_value(value.clone()).ok())
+                            });
+                    }
+                }
+            } else if let ModelSelection::Explicit { dsh_source, .. } = &mut binding.model {
+                *dsh_source = None;
+            }
             // Saving configuration records exact user intent. Dynamic catalog validation
             // belongs to the real Host, including when an old diagnostic failed.
-            if let ModelSelection::Explicit { model_id, options } = &binding.model
-                && (model_id.trim().is_empty() || !options.is_object())
+            if let ModelSelection::Explicit { model_id, options, .. } = &binding.model
+                && (model_id.trim().is_empty() || !options.is_object()
+                    || (binding.adapter_kind == AdapterKind::Pi && options.as_object().is_some_and(|options| {
+                        options.iter().any(|(key, value)| key != "thinking_level" || !value.is_string())
+                    })))
             {
                 return Ok(CommandHandlerResult::rejected(
                     "runtime_model_options_invalid",
@@ -2801,6 +2966,13 @@ impl AgentProfileService {
                 &validation_binding,
             )? {
                 return Ok(CommandHandlerResult::rejected(issue.code, issue.payload));
+            }
+            if let Some(environment) = environment {
+                environment.commit(transaction)?;
+            } else {
+                crate::member_environment::validate_saved_model(
+                    transaction, &envelope.payload.agent_id, binding.adapter_kind, &binding.model,
+                )?;
             }
             let now = chrono::Utc::now().to_rfc3339();
             transaction.execute(
@@ -3792,12 +3964,58 @@ fn installation_from_row(row: &Row<'_>) -> rusqlite::Result<AdapterInstallationV
         None
     };
     let catalog_succeeded_at = row.get::<_, Option<String>>(39)?;
-    let model_catalog = runtime_model_catalog_cache_view_at(
+    let mut model_catalog = runtime_model_catalog_cache_view_at(
         adapter_kind,
         snapshot.as_ref(),
         catalog_succeeded_at.as_deref(),
         chrono::Utc::now(),
     );
+    if adapter_kind == AdapterKind::Pi {
+        let identity = snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot
+                    .models
+                    .iter()
+                    .find(|model| model.id == PI_RUNTIME_DEFAULT_MODEL_ID)
+            })
+            .and_then(|model| model.runtime_metadata.as_ref())
+            .and_then(|metadata| metadata.get("piCatalogIdentity"));
+        if let Some(identity) = identity {
+            let fingerprint: Option<String> = row.get(40)?;
+            let current = row.get::<_, bool>(7)?
+                && row.get::<_, String>(9)? == "valid"
+                && identity["installationGeneration"].as_i64() == Some(row.get(8)?)
+                && identity["searchGeneration"].as_i64() == Some(row.get(41)?)
+                && fingerprint.is_some()
+                && identity["executableFingerprint"].as_str() == fingerprint.as_deref();
+            model_catalog = catalog_observation_cache_view(
+                catalog_succeeded_at.as_deref(),
+                snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot.models.iter().any(|model| {
+                        model.id != PI_RUNTIME_DEFAULT_MODEL_ID
+                            && model.runtime_metadata.as_ref().is_none_or(|metadata| {
+                                metadata["piThinkingSchemaVersion"] != 1
+                                    || !matches!(
+                                        metadata["piThinkingState"].as_str(),
+                                        Some("known" | "unknown")
+                                    )
+                            })
+                    })
+                }),
+                chrono::Utc::now(),
+            );
+            if !current {
+                model_catalog.status = RuntimeModelCatalogCacheStatus::Invalidated;
+                model_catalog.revalidate_after = None;
+                model_catalog.expires_at = None;
+            }
+        } else if model_catalog.status == RuntimeModelCatalogCacheStatus::Fresh {
+            // Legacy/full-check observations have no independent ownership. Keep
+            // their existing visibility but request one catalog-only observation.
+            model_catalog.status = RuntimeModelCatalogCacheStatus::Stale;
+        }
+    }
     Ok(AdapterInstallationView {
         id: row.get(0)?,
         adapter_kind,
@@ -3876,6 +4094,7 @@ fn upsert_successful_capability_snapshot(
     if snapshot.probe_status != "ready" {
         anyhow::bail!("only a successful probe can replace the capability snapshot");
     }
+    let models = merge_persisted_dsh_options(transaction, installation_id, &snapshot.models)?;
     transaction.execute(
         r#"
         INSERT INTO adapter_capability_snapshot(
@@ -3918,7 +4137,7 @@ fn upsert_successful_capability_snapshot(
             snapshot.permission_schema_digest,
             serde_json::to_string(&snapshot.capabilities)?,
             serde_json::to_string(&snapshot.protocols)?,
-            serde_json::to_string(&snapshot.models)?,
+            serde_json::to_string(&models)?,
             serde_json::to_string(&snapshot.permission_options)?,
             snapshot.observed_at,
             snapshot.last_attempted_at,
@@ -3930,6 +4149,67 @@ fn upsert_successful_capability_snapshot(
         params![installation_id, snapshot.last_attempted_at],
     )?;
     Ok(())
+}
+
+/// One transaction-owned merge for full checks and targeted catalog reads.
+/// Never resurrect removed models or carry capabilities across routes/configs.
+fn merge_persisted_dsh_options(
+    transaction: &Transaction<'_>,
+    installation_id: &str,
+    incoming: &[ModelDescriptor],
+) -> Result<Vec<ModelDescriptor>> {
+    let mut models = incoming.to_vec();
+    if !models.iter().any(|model| {
+        model
+            .runtime_metadata
+            .as_ref()
+            .is_some_and(|meta| meta["dshOptionsContext"].is_string())
+    }) {
+        return Ok(models);
+    }
+    let previous: Option<String> = transaction
+        .query_row(
+            "SELECT snapshot.model_catalog_json FROM adapter_capability_snapshot snapshot
+             JOIN adapter_installation installation ON installation.id = snapshot.installation_id
+             WHERE installation.id = ?1 AND installation.adapter_kind = 'deepseek-harness'",
+            [installation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let previous: Vec<ModelDescriptor> = previous
+        .map(|json| serde_json::from_str(&json))
+        .transpose()?
+        .unwrap_or_default();
+    for model in &mut models {
+        let Some(meta) = model.runtime_metadata.as_mut() else {
+            continue;
+        };
+        let Some(old) = previous.iter().find(|old| old.id == model.id) else {
+            continue;
+        };
+        let Some(old_meta) = old.runtime_metadata.as_ref() else {
+            continue;
+        };
+        if !meta["dshOptionsContext"].is_string()
+            || meta["dshOptionsContext"] != old_meta["dshOptionsContext"]
+            || meta["dshSource"] != old_meta["dshSource"]
+            || old_meta["dshOptionsResolved"] != true
+        {
+            continue;
+        }
+        let old_at = old_meta["dshOptionsObservedAt"]
+            .as_str()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
+        let new_at = meta["dshOptionsObservedAt"]
+            .as_str()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
+        if old_at.is_some() && (meta["dshOptionsResolved"] != true || old_at > new_at) {
+            model.options = old.options.clone();
+            meta["dshOptionsResolved"] = json!(true);
+            meta["dshOptionsObservedAt"] = old_meta["dshOptionsObservedAt"].clone();
+        }
+    }
+    Ok(models)
 }
 
 fn upsert_static_capability_snapshot(
@@ -4033,7 +4313,9 @@ fn provisional_runtime_protocol(adapter_kind: AdapterKind) -> &'static str {
         | AdapterKind::CursorAgent
         | AdapterKind::KimiCodeCli
         | AdapterKind::GrokBuild
-        | AdapterKind::DeepseekHarness => "acp-v1",
+        | AdapterKind::DeepseekHarness
+        | AdapterKind::CommandCodeCli => "acp-v1",
+        AdapterKind::ClineCli => "acp-v1",
         AdapterKind::ZcodeApp => crate::zcode::PROTOCOL,
     }
 }
@@ -4326,13 +4608,35 @@ pub fn resolve_frozen_runtime(
             }),
         )));
     }
-    let mut result = resolve_frozen_runtime_binding(transaction, &binding)?;
+    let member_environment = crate::member_environment::session_has_values(
+        transaction,
+        conversation_id,
+        agent_id,
+        binding.adapter_kind,
+    )?;
+    let mut result = if member_environment {
+        resolve_frozen_runtime_binding_with_snapshot(transaction, &binding, Some(None))?
+    } else {
+        let environment = crate::member_environment::session_values(
+            transaction,
+            conversation_id,
+            binding.adapter_kind,
+        )?;
+        let snapshot = crate::runtime_startup::snapshot_from_connection_with_environment(
+            transaction,
+            binding.adapter_kind,
+            environment.as_ref(),
+        )?;
+        resolve_frozen_runtime_binding_with_snapshot(transaction, &binding, Some(snapshot))?
+    };
     if let Ok(runtime) = &mut result {
+        crate::member_environment::freeze(transaction, conversation_id, agent_id, runtime)?;
         crate::camp_fast::freeze(transaction, conversation_id, agent_id, runtime)?;
     }
     Ok(result)
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_frozen_runtime_binding(
     transaction: &Connection,
     binding: &ResolvedRuntimeBinding,
@@ -4422,7 +4726,9 @@ fn resolve_frozen_runtime_binding_with_snapshot(
     let permission_descriptors = registry.permission_options(adapter_kind);
     let mut validation_binding = binding.clone();
     validation_binding.model = ModelSelection::RuntimeDefault;
-    if let ModelSelection::Explicit { model_id, options } = &binding.model
+    if let ModelSelection::Explicit {
+        model_id, options, ..
+    } = &binding.model
         && (model_id.trim().is_empty() || !options.is_object())
     {
         return Ok(Err(runtime_blocker(
@@ -4447,8 +4753,8 @@ fn resolve_frozen_runtime_binding_with_snapshot(
         Err(blocker) => return Ok(Err(blocker)),
     };
     let capabilities = Vec::new();
-    // Declared transport selects the Adapter implementation; it is not observed capability evidence.
-    let protocols = vec![provisional_runtime_protocol(adapter_kind).to_string()];
+    let protocol = provisional_runtime_protocol(adapter_kind);
+    let protocols = vec![protocol.to_owned()];
     let native_session_compatibility_key = None;
     let projection = match AgentRuntimeAdapterRegistry::default().resolve_runtime(
         adapter_kind,
@@ -4476,6 +4782,7 @@ fn resolve_frozen_runtime_binding_with_snapshot(
         }
     };
     let mut frozen = FrozenAgentRuntimeConfig {
+        environment: None,
         custom_api,
         camp_fast: None,
         adapter_kind,
@@ -4513,15 +4820,26 @@ fn resolve_model_selection(
     models: &[ModelDescriptor],
     selection: &ModelSelection,
 ) -> Result<std::result::Result<ResolvedModelSelection, RuntimeConfigurationBlocker>> {
+    let dsh_source = match selection {
+        ModelSelection::Explicit { dsh_source, .. }
+            if adapter_kind == AdapterKind::DeepseekHarness =>
+        {
+            *dsh_source
+        }
+        _ => None,
+    };
     let (source, model, configured_options) = match selection {
         ModelSelection::RuntimeDefault => {
             return Ok(Ok(ResolvedModelSelection {
+                dsh_source,
                 source: "runtime_default".to_string(),
                 model_id: runtime_default_model_id(adapter_kind),
                 options: json!({}),
             }));
         }
-        ModelSelection::Explicit { model_id, options } => {
+        ModelSelection::Explicit {
+            model_id, options, ..
+        } => {
             if model_id.trim().is_empty() {
                 return Ok(Err(runtime_blocker(
                     "runtime_model_unavailable",
@@ -4534,6 +4852,16 @@ fn resolve_model_selection(
                     json!({ "modelId": model_id }),
                 )));
             };
+            if adapter_kind == AdapterKind::DeepseekHarness {
+                // Preserve explicit intent, including a now unsupported value;
+                // the selected live model validates it before any prompt.
+                return Ok(Ok(ResolvedModelSelection {
+                    dsh_source,
+                    source: "explicit".to_string(),
+                    model_id: model_id.clone(),
+                    options: Value::Object(configured_options.clone()),
+                }));
+            }
             let model = models
                 .iter()
                 .find(|model| model.id == *model_id && !model.hidden && !model.deprecated);
@@ -4542,6 +4870,7 @@ fn resolve_model_selection(
                 // previously validated explicit selection so the real Runtime Session can make
                 // the final decision without silently falling back.
                 return Ok(Ok(ResolvedModelSelection {
+                    dsh_source,
                     source: "explicit".to_string(),
                     model_id: model_id.clone(),
                     options: Value::Object(configured_options.clone()),
@@ -4564,6 +4893,7 @@ fn resolve_model_selection(
         }
     }
     Ok(Ok(ResolvedModelSelection {
+        dsh_source,
         source: source.to_string(),
         model_id: model.id.clone(),
         options: Value::Object(options),
@@ -4981,7 +5311,10 @@ fn runtime_configuration_issue(
     let issue = |code, payload| Some(RuntimeConfigurationIssue { code, payload });
     let models: Vec<ModelDescriptor> =
         serde_json::from_str(models_json).context("invalid Adapter model catalog")?;
-    if let ModelSelection::Explicit { model_id, options } = &configuration.model {
+    if let ModelSelection::Explicit {
+        model_id, options, ..
+    } = &configuration.model
+    {
         if model_id.trim().is_empty() {
             return Ok(issue(
                 "runtime_model_unavailable",
@@ -5112,6 +5445,7 @@ fn model_option_validation_rejects_preserved_effort_after_catalog_refresh() {
         adapter_kind: AdapterKind::CodexCli,
         installation_id: "test-codex".to_string(),
         model: ModelSelection::Explicit {
+            dsh_source: None,
             model_id: "gpt-next".to_string(),
             options: json!({"reasoning_effort": "high"}),
         },
@@ -5128,6 +5462,37 @@ fn model_option_validation_rejects_preserved_effort_after_catalog_refresh() {
             .expect("the refreshed model does not support the preserved value");
     assert_eq!(issue.code, "runtime_model_option_invalid");
     assert_eq!(issue.payload["value"], "high");
+    let default = ModelSelection::Explicit {
+        model_id: "gpt-next".into(),
+        options: json!({}),
+        dsh_source: Some(DshModelSource::Web),
+    };
+    assert_eq!(
+        resolve_model_selection(AdapterKind::CodexCli, &models, &default)
+            .unwrap()
+            .unwrap()
+            .options,
+        json!({"reasoning_effort":"low"})
+    );
+    let native_default = resolve_model_selection(AdapterKind::DeepseekHarness, &models, &default)
+        .unwrap()
+        .unwrap();
+    assert_eq!(native_default.options, json!({}));
+    assert_eq!(native_default.dsh_source, Some(DshModelSource::Web));
+    let unsupported = ModelSelection::Explicit {
+        model_id: "gpt-next".into(),
+        options: json!({"reasoning_effort":"max"}),
+        dsh_source: Some(DshModelSource::Web),
+    };
+    for catalog in [models.as_slice(), &[]] {
+        assert_eq!(
+            resolve_model_selection(AdapterKind::DeepseekHarness, catalog, &unsupported)
+                .unwrap()
+                .unwrap()
+                .options,
+            json!({"reasoning_effort":"max"})
+        );
+    }
 }
 
 fn member_runtime_defaults(adapter_kind: AdapterKind) -> MemberRuntimeConfiguration {
@@ -5483,6 +5848,8 @@ mod slow_tests {
             vec![
                 AdapterKind::OpencodeCli,
                 AdapterKind::CopilotCli,
+                AdapterKind::CommandCodeCli,
+                AdapterKind::ClineCli,
                 AdapterKind::KiroCli,
                 AdapterKind::QoderCli,
                 AdapterKind::CodebuddyCli,
@@ -5797,6 +6164,143 @@ mod slow_tests {
                 },
             )
             .unwrap()
+    }
+
+    #[test]
+    fn dsh_catalog_updates_accumulate_capabilities_without_reviving_removed_routes() {
+        // Owns the persisted merge across full checks and interleaved target reads;
+        // parser tests cannot detect a stale whole-catalog SQL writeback.
+        let (mut database, directory) = database();
+        let service = AgentProfileService::default();
+        let executable = test_executable_path(&directory, "dsh-cache");
+        let mut snapshot = ready_codex_snapshot();
+        snapshot.reported_version = Some("0.2.1-alpha.1".into());
+        snapshot.permission_options =
+            AgentRuntimeAdapterRegistry::default().permission_options(AdapterKind::DeepseekHarness);
+        snapshot.capabilities = [
+            "acp.initialize",
+            "session.new",
+            "session.resume",
+            "dsh.model_catalog",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let mut a = snapshot.models[0].clone();
+        a.id = "[\"relay\",\"a\"]".into();
+        a.runtime_metadata = Some(json!({"dshSource":"web", "dshOptionsContext":"config-1",
+            "dshOptionsResolved":true, "dshOptionsObservedAt":"2026-10-09T10:00:00Z"}));
+        let mut b = a.clone();
+        b.id = "[\"relay\",\"b\"]".into();
+        b.is_default = false;
+        b.runtime_metadata.as_mut().unwrap()["dshOptionsResolved"] = json!(false);
+        b.runtime_metadata.as_mut().unwrap()["dshOptionsObservedAt"] = Value::Null;
+        snapshot.models = vec![a.clone(), b.clone()];
+        let verified = |snapshot| VerifiedManagedInstallation {
+            adapter_kind: AdapterKind::DeepseekHarness,
+            executable_path: executable.to_string_lossy().into_owned(),
+            command_name: "dsh".into(),
+            source: InstallationSource::Manual,
+            auth_scope: "default".into(),
+            snapshot,
+            entrypoint_locator_identity: None,
+        };
+        service
+            .commit_verified_managed_installation(&mut database, verified(snapshot.clone()))
+            .unwrap();
+        let read = |db: &Database| {
+            service
+                .managed_installation(db, AdapterKind::DeepseekHarness, "default")
+                .unwrap()
+                .unwrap()
+        };
+        let original = read(&database);
+        let mut unobserved_a = a.clone();
+        unobserved_a.runtime_metadata.as_mut().unwrap()["dshOptionsResolved"] = json!(false);
+        unobserved_a.runtime_metadata.as_mut().unwrap()["dshOptionsObservedAt"] = Value::Null;
+        b.runtime_metadata.as_mut().unwrap()["dshOptionsResolved"] = json!(true);
+        b.runtime_metadata.as_mut().unwrap()["dshOptionsObservedAt"] =
+            json!("2026-10-09T10:00:10Z");
+        assert!(
+            service
+                .commit_runtime_model_catalog(
+                    &mut database,
+                    &original,
+                    &[unobserved_a.clone(), b.clone()],
+                    "2026-10-09T10:00:10Z"
+                )
+                .unwrap()
+        );
+        let models = read(&database).snapshot.unwrap().models;
+        assert_eq!(
+            models[0].runtime_metadata, a.runtime_metadata,
+            "B must not reset A's success time"
+        );
+        assert_eq!(
+            models[1].runtime_metadata, b.runtime_metadata,
+            "confirmed empty is a cached result"
+        );
+        // An older A response carrying an unobserved B must retain the newer B.
+        let mut older_a = a.clone();
+        older_a.runtime_metadata.as_mut().unwrap()["dshOptionsObservedAt"] =
+            json!("2026-10-09T09:59:00Z");
+        assert!(
+            service
+                .commit_runtime_model_catalog(
+                    &mut database,
+                    &original,
+                    &[older_a, snapshot.models[1].clone()],
+                    "2026-10-09T10:00:11Z"
+                )
+                .unwrap()
+        );
+        assert_eq!(read(&database).snapshot.unwrap().models, models);
+        snapshot.models = vec![unobserved_a.clone(), snapshot.models[1].clone()];
+        service
+            .commit_verified_managed_installation(&mut database, verified(snapshot.clone()))
+            .unwrap();
+        assert_eq!(
+            read(&database).snapshot.unwrap().models,
+            models,
+            "ordinary refresh retains matching capabilities"
+        );
+        let expected = read(&database);
+        let mut changed_route = unobserved_a.clone();
+        changed_route.runtime_metadata.as_mut().unwrap()["dshSource"] = json!("native");
+        assert!(
+            service
+                .commit_runtime_model_catalog(
+                    &mut database,
+                    &expected,
+                    &[changed_route.clone()],
+                    "2026-10-09T10:00:12Z"
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            read(&database).snapshot.unwrap().models,
+            vec![changed_route],
+            "removed B must not be resurrected"
+        );
+        let mut changed_config = unobserved_a;
+        changed_config.runtime_metadata.as_mut().unwrap()["dshOptionsContext"] = json!("config-2");
+        let expected = read(&database);
+        assert!(
+            service
+                .commit_runtime_model_catalog(
+                    &mut database,
+                    &expected,
+                    &[changed_config.clone()],
+                    "2026-10-09T10:00:13Z"
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            read(&database).snapshot.unwrap().models,
+            vec![changed_config]
+        );
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -6130,6 +6634,7 @@ mod slow_tests {
                     &user_command(
                         "expired-catalog-runtime-default",
                         SetMemberRuntimeConfigurationCommand {
+                            environment_update: None,
                             agent_id: profile.agent_id.clone(),
                             expected_version: profile.version,
                             adapter_kind: kind,
@@ -6154,10 +6659,12 @@ mod slow_tests {
                     &user_command(
                         "expired-catalog-explicit-model",
                         SetMemberRuntimeConfigurationCommand {
+                            environment_update: None,
                             agent_id: configured.agent_id,
                             expected_version: configured.version,
                             adapter_kind: kind,
                             model: ModelSelection::Explicit {
+                                dsh_source: None,
                                 model_id: model_id.to_string(),
                                 options: json!({}),
                             },
@@ -6416,6 +6923,7 @@ mod slow_tests {
                 &user_command(
                     "set-runtime",
                     SetMemberRuntimeConfigurationCommand {
+                        environment_update: None,
                         agent_id: profile_id.clone(),
                         expected_version: profile.version,
                         adapter_kind: AdapterKind::CodexCli,
@@ -6563,7 +7071,7 @@ mod slow_tests {
             resolve_frozen_runtime_binding_with_snapshot(
                 &transaction,
                 &runtime_binding,
-                Some(custom.custom_api.clone())
+                Some(custom.custom_api.clone()),
             )
             .unwrap()
             .unwrap()
@@ -6574,7 +7082,7 @@ mod slow_tests {
             resolve_frozen_runtime_binding_with_snapshot(
                 &transaction,
                 &runtime_binding,
-                Some(frozen.custom_api.clone())
+                Some(frozen.custom_api.clone()),
             )
             .unwrap()
             .unwrap()
@@ -6851,6 +7359,7 @@ mod slow_tests {
                 &user_command(
                     "set-mismatched-runtime",
                     SetMemberRuntimeConfigurationCommand {
+                        environment_update: None,
                         agent_id: profile.agent_id,
                         expected_version: profile.version,
                         adapter_kind: AdapterKind::CopilotCli,
@@ -6904,10 +7413,12 @@ mod slow_tests {
                 &user_command(
                     "explicit-runtime-config",
                     SetMemberRuntimeConfigurationCommand {
+                        environment_update: None,
                         agent_id: profile.agent_id.clone(),
                         expected_version: profile.version,
                         adapter_kind: AdapterKind::CodexCli,
                         model: ModelSelection::Explicit {
+                            dsh_source: None,
                             model_id: "gpt-test".to_string(),
                             options: json!({}),
                         },
@@ -6932,6 +7443,7 @@ mod slow_tests {
         assert_eq!(
             configuration.model,
             ModelSelection::Explicit {
+                dsh_source: None,
                 model_id: "gpt-test".to_string(),
                 options: json!({}),
             }
@@ -6950,6 +7462,7 @@ mod slow_tests {
                 &user_command(
                     "invalid-runtime-config",
                     SetMemberRuntimeConfigurationCommand {
+                        environment_update: None,
                         agent_id: profile.agent_id.clone(),
                         expected_version: configured.version,
                         adapter_kind: AdapterKind::CodexCli,
@@ -7067,6 +7580,7 @@ mod slow_tests {
             };
             let model = if changed_options {
                 ModelSelection::Explicit {
+                    dsh_source: None,
                     model_id: "gpt-test".into(),
                     options: json!({"reasoning_effort":"high"}),
                 }
@@ -7079,6 +7593,7 @@ mod slow_tests {
                     &user_command(
                         &format!("retain-model-{index}"),
                         SetMemberRuntimeConfigurationCommand {
+                            environment_update: None,
                             agent_id: profile.agent_id.clone(),
                             expected_version: if stale_version { version - 1 } else { version },
                             adapter_kind: AdapterKind::CodexCli,
@@ -7123,6 +7638,7 @@ mod slow_tests {
                 &user_command(
                     "select-unresolved-codex",
                     SetMemberRuntimeConfigurationCommand {
+                        environment_update: None,
                         agent_id: profile.agent_id.clone(),
                         expected_version: profile.version,
                         adapter_kind: AdapterKind::CodexCli,
@@ -7327,8 +7843,13 @@ mod slow_tests {
             let defaults = installation.member_runtime_defaults.unwrap();
             let profile = service.get_profile(&database, "agent_1").unwrap().unwrap();
             let selected = ModelSelection::Explicit {
+                dsh_source: None,
                 model_id: "saved-model".to_string(),
-                options: json!({"native-option":"saved-value"}),
+                options: if kind == AdapterKind::Pi {
+                    json!({"thinking_level":"future-native-level"})
+                } else {
+                    json!({"native-option":"saved-value"})
+                },
             };
             let configured = service
                 .set_runtime(
@@ -7336,6 +7857,7 @@ mod slow_tests {
                     &user_command(
                         "configure-detected",
                         SetMemberRuntimeConfigurationCommand {
+                            environment_update: None,
                             agent_id: profile.agent_id.clone(),
                             expected_version: profile.version,
                             adapter_kind: kind,
@@ -7346,6 +7868,111 @@ mod slow_tests {
                 )
                 .unwrap();
             assert_eq!(configured.result.status, CommandResultStatus::Applied);
+            if kind == AdapterKind::Pi {
+                // Schema validation is local even without any health/catalog
+                // evidence; unknown string enums survive save and freeze below.
+                for options in [
+                    json!({"thinking_level":7}),
+                    json!({"reasoning_effort":"high"}),
+                    json!([]),
+                ] {
+                    let profile = service.get_profile(&database, "agent_1").unwrap().unwrap();
+                    let result = service
+                        .set_runtime(
+                            &mut database,
+                            &user_command(
+                                &uuid::Uuid::new_v4().to_string(),
+                                SetMemberRuntimeConfigurationCommand {
+                                    environment_update: None,
+                                    agent_id: profile.agent_id,
+                                    expected_version: profile.version,
+                                    adapter_kind: kind,
+                                    model: ModelSelection::Explicit {
+                                        model_id: "saved-model".into(),
+                                        dsh_source: None,
+                                        options,
+                                    },
+                                    permissions: defaults.permissions.clone(),
+                                },
+                            ),
+                        )
+                        .unwrap();
+                    assert_eq!(result.result.code, "runtime_model_options_invalid");
+                }
+                assert_eq!(
+                    service
+                        .get_profile(&database, "agent_1")
+                        .unwrap()
+                        .unwrap()
+                        .runtime_configuration
+                        .unwrap()
+                        .model,
+                    selected
+                );
+            }
+            if kind == AdapterKind::DeepseekHarness {
+                // Reuse the existing no-health database fixture: provenance is
+                // saved intent, independent of a current successful catalog.
+                for (provided, expected) in [
+                    (None, DshModelSource::Native),
+                    (Some(DshModelSource::Web), DshModelSource::Web),
+                    (Some(DshModelSource::Native), DshModelSource::Native),
+                ] {
+                    for source in [provided, None] {
+                        let profile = service.get_profile(&database, "agent_1").unwrap().unwrap();
+                        let mut choice = selected.clone();
+                        if let ModelSelection::Explicit { dsh_source, .. } = &mut choice {
+                            *dsh_source = source;
+                        }
+                        let saved = service
+                            .set_runtime(
+                                &mut database,
+                                &user_command(
+                                    &uuid::Uuid::new_v4().to_string(),
+                                    SetMemberRuntimeConfigurationCommand {
+                                        environment_update: None,
+                                        agent_id: profile.agent_id,
+                                        expected_version: profile.version,
+                                        adapter_kind: kind,
+                                        model: choice,
+                                        permissions: defaults.permissions.clone(),
+                                    },
+                                ),
+                            )
+                            .unwrap();
+                        assert_eq!(saved.result.status, CommandResultStatus::Applied);
+                    }
+                    let saved = service
+                        .get_profile(&database, "agent_1")
+                        .unwrap()
+                        .unwrap()
+                        .runtime_configuration
+                        .unwrap()
+                        .model;
+                    let frozen = resolve_frozen_runtime_binding(
+                        database.connection(),
+                        &ResolvedRuntimeBinding {
+                            adapter_kind: kind,
+                            installation_id: installation_id.clone(),
+                            model: saved,
+                            permissions: defaults.permissions.clone(),
+                        },
+                    )
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(frozen.model.dsh_source, Some(expected));
+                    assert_eq!(
+                        service
+                            .resolve_rebound_runtime(&database, &frozen)
+                            .unwrap()
+                            .unwrap()
+                            .model
+                            .dsh_source,
+                        Some(expected),
+                        "rebound must retain selection provenance"
+                    );
+                }
+            }
             if kind == AdapterKind::ClaudeCodeCli {
                 service
                     .record_managed_probe_failure(
@@ -7376,6 +8003,7 @@ mod slow_tests {
                         &user_command(
                             "save-after-catalog-failure",
                             SetMemberRuntimeConfigurationCommand {
+                                environment_update: None,
                                 agent_id: profile.agent_id.clone(),
                                 expected_version: after_failure.version,
                                 adapter_kind: kind,
@@ -7400,7 +8028,14 @@ mod slow_tests {
             assert!(frozen.reported_version.is_none());
             assert!(frozen.capabilities.is_empty());
             assert_eq!(frozen.model.model_id, "saved-model");
-            assert_eq!(frozen.model.options, json!({"native-option":"saved-value"}));
+            assert_eq!(
+                frozen.model.options,
+                if kind == AdapterKind::Pi {
+                    json!({"thinking_level":"future-native-level"})
+                } else {
+                    json!({"native-option":"saved-value"})
+                }
+            );
             assert!(
                 service
                     .runtime_dispatch_blocker(&database, &frozen)
@@ -7559,6 +8194,7 @@ mod slow_tests {
                 &user_command(
                     "select-managed-codex",
                     SetMemberRuntimeConfigurationCommand {
+                        environment_update: None,
                         agent_id: profile.agent_id,
                         expected_version: profile.version,
                         adapter_kind: AdapterKind::CodexCli,
@@ -7819,6 +8455,7 @@ mod slow_tests {
                 &user_command(
                     "configure-light-qwen",
                     SetMemberRuntimeConfigurationCommand {
+                        environment_update: None,
                         agent_id: profile.agent_id.clone(),
                         expected_version: profile.version,
                         adapter_kind: AdapterKind::QwenCode,

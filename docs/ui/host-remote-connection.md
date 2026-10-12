@@ -3,7 +3,7 @@ document_type: ui-interaction-draft
 authority: host-remote-connection-settings-review
 status: implemented
 target_version: v1.59
-last_updated: 2026-09-18
+last_updated: 2026-10-11
 ---
 
 # 设置 · 远程连接交互稿
@@ -68,8 +68,13 @@ Desktop 和 Web 的“能力”组在“智能体”之后、“渠道”之前�
 提交当前目录前必须先成功读取；项目校验与 Camp 创建继续走同一 Core。失败保留输入并明确反馈。
 
 令牌由 Rust Host 在首次本机读取或开启时生成，同一 Host 进程内关闭、再次开启沿用同一令牌。
-关闭仍撤销全部浏览器会话；重新开启后需重新登录。令牌不承诺跨 Host 进程重启持久化。
+关闭仍撤销全部浏览器会话；重新开启后需重新登录。正常 Host 退出与重启保留令牌及未过期会话。
 底层独立令牌轮换接口保留，设置页不提供该按钮。提交中阻止重复操作；未知响应只重读状态与当前令牌，不自动重试变更。
+
+Windows 正常继承权限不阻止读取或保存凭据，不增加修复窗口、权限警告或管理员启动要求。
+真正读取、保存、内容或路径错误在现有错误位置说明原因；Desktop 不显示 Electron 远程调用前缀，
+Web 登录/注销消费 Host 的脱敏保存错误，不把磁盘错误说成 Token 无效或网络故障。
+具体行为见 [Host Web v4](../contracts/host-web-v4.md#windows-web-凭据可用性)。
 
 Web 的同一菜单显示当前 Host 地址及连接状态，可退出本页登录。认证过期使用实际入口的登录覆盖层；
 同页重新登录保留编辑身份、Composer 与原命令核对。Web 不需要本机管理密钥读取能力来访问业务页面。

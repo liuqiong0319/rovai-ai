@@ -8,7 +8,12 @@ import type { ThreadReadInvalidation, ChannelKind, ChannelSettingsSnapshot, File
 const HOST_WEB_PROTOCOL_VERSION = 4
 
 class HttpRequestError extends Error {
-  constructor(readonly status: number, readonly code: string) { super(`请求未完成（${code}）。`) }
+  constructor(readonly status: number, readonly code: string, message?: string) { super(message || `请求未完成（${code}）。`) }
+}
+
+function sessionStorageMessage(body: { error?: { code?: string; message?: string } }): string | undefined {
+  return body?.error?.code === 'session_storage_unavailable' && typeof body.error.message === 'string'
+    ? body.error.message : undefined
 }
 
 class CoreRequestError extends Error {
@@ -66,6 +71,13 @@ export const WEB_OPERATIONS = [
   'mcp.import.scan',
   'mcp.import.commit',
   'runtime.startup.get',
+  'member.runtimeEnvironment.get',
+  'conversations.memberSession.get',
+  'conversations.restartNativeSession',
+  'runtime.environmentLegacy.list',
+  'runtime.environmentLegacy.get',
+  'runtime.environmentLegacy.acknowledge',
+
   'runtime.startup.save',
   'runtime.startup.inspect',
   'runtime.startup.check',
@@ -426,7 +438,10 @@ export class ConsoleClient {
       body: JSON.stringify({ protocolVersion: HOST_WEB_PROTOCOL_VERSION, ...credential, ...(this.#editor ? { editor: this.#editor } : {}) }), credentials: 'omit', redirect: 'error', cache: 'no-store',
       signal: this.#lifetime.signal
     })
-    if (!response.ok) throw new Error(response.status === 409 ? 'Web 与 Host 协议不兼容，请使用同一版本。' : response.status === 429 ? '登录暂受限，请稍后再试。' : response.status >= 500 ? '服务暂不可用，请稍后重试。' : path === 'login-ticket' ? '扫码登录未完成，二维码可能已过期或已使用。请在运行服务的 Desktop 重新生成，或使用登录 Token 登录。' : 'Token 无效，请检查后重试。')
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}))
+      throw new Error(sessionStorageMessage(body) || (response.status === 409 ? 'Web 与 Host 协议不兼容，请使用同一版本。' : response.status === 429 ? '登录暂受限，请稍后再试。' : response.status >= 500 ? '服务暂不可用，请稍后重试。' : path === 'login-ticket' ? '扫码登录未完成，二维码可能已过期或已使用。请在运行服务的 Desktop 重新生成，或使用登录 Token 登录。' : 'Token 无效，请检查后重试。'))
+    }
     const session = await response.json() as SessionResponse
     if (generation !== this.#generation) throw new SessionRequired()
     try {
@@ -504,7 +519,12 @@ export class ConsoleClient {
   async logout(): Promise<void> {
     const generation = this.#generation
     try { await this.#authorized('logout', { method: 'POST' }) }
-    catch (error) { if (generation !== this.#generation && !(error instanceof SessionRequired)) throw error; if (!(error instanceof SessionRequired)) throw new Error('退出未完成，请检查网络后重试。'); return }
+    catch (error) {
+      if (error instanceof HttpRequestError && error.code === 'session_storage_unavailable') throw error
+      if (generation !== this.#generation && !(error instanceof SessionRequired)) throw error
+      if (!(error instanceof SessionRequired)) throw new Error('退出未完成，请检查网络后重试。')
+      return
+    }
     if (generation === this.#generation) await this.#forgetAuthentication()
   }
 
@@ -773,8 +793,8 @@ export class ConsoleClient {
     if (generation !== this.#generation) throw new DOMException('Connection replaced', 'AbortError')
     if (response.status === 401) { await this.#forgetAuthentication(); throw new SessionRequired() }
     if (!response.ok) {
-      const error = await response.json().catch(() => ({})) as { error?: { code?: string } }
-      throw new HttpRequestError(response.status, error.error?.code ?? 'connection_unavailable')
+      const error = await response.json().catch(() => ({})) as { error?: { code?: string; message?: string } }
+      throw new HttpRequestError(response.status, error.error?.code ?? 'connection_unavailable', sessionStorageMessage(error))
     }
     return response
   }

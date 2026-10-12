@@ -370,6 +370,7 @@ pub struct AgentRunView {
     pub input_message_ids: Vec<String>,
     pub anchor_message_id: Option<String>,
     pub input_summary: Option<String>,
+    pub has_accepted_continuation: bool,
     pub conversation_id: String,
     pub agent_id: String,
     pub task_id: Option<String>,
@@ -895,6 +896,8 @@ pub struct ThreadMessageFindSnapshot {
 pub struct MessageDeliveryView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continuation_request: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub input_message_ids: Vec<String>,
     pub id: String,
     pub message_id: String,
     #[serde(rename = "threadTurnId", alias = "campTurnId")]
@@ -1898,10 +1901,11 @@ fn load_camp_open_counts(transaction: &Transaction<'_>, camp_id: &str) -> Result
                WHERE camp_id = ?1 AND tombstoned_at IS NULL),
               (SELECT COUNT(*)
                FROM camp_message_delivery AS current_delivery
-               JOIN camp_message AS message
+               LEFT JOIN camp_message AS message
                  ON message.id = current_delivery.message_id
                WHERE current_delivery.camp_id = ?1
-                 AND message.tombstoned_at IS NULL)
+                 AND ((current_delivery.source_kind = 'message' AND message.tombstoned_at IS NULL)
+                   OR current_delivery.source_kind = 'continuation'))
               +
               (SELECT COUNT(*)
                FROM message_delivery AS legacy_delivery
@@ -2764,7 +2768,7 @@ fn load_message_deliveries(
         r#"
         WITH projected_delivery AS (
           SELECT current_delivery.id,
-                 current_delivery.message_id,
+                 message.id AS message_id,
                  message.camp_turn_id,
                  source_run.task_id,
                  current_delivery.recipient_agent_id,
@@ -2807,14 +2811,22 @@ fn load_message_deliveries(
                  current_delivery.recipient_membership_version_at_admission,
                  message.source_agent_run_id,
                  current_delivery.queue_sequence,
-                 CASE WHEN EXISTS(SELECT 1 FROM camp_run_continuation WHERE delivery_id=current_delivery.id) THEN 1 END AS continuation_request
+                 CASE WHEN continuation.delivery_id IS NOT NULL THEN 1 END AS continuation_request,
+                 (SELECT json_group_array(message_id) FROM (
+                   SELECT message_id FROM agent_run_input
+                   WHERE agent_run_id = continuation.source_agent_run_id ORDER BY ordinal
+                 )) AS input_message_ids
           FROM camp_message_delivery AS current_delivery
+          LEFT JOIN camp_run_continuation AS continuation ON continuation.delivery_id = current_delivery.id
           JOIN camp_message AS message
-            ON message.id = current_delivery.message_id
+            ON message.id = COALESCE(current_delivery.message_id, (
+              SELECT message_id FROM agent_run_input
+              WHERE agent_run_id = continuation.source_agent_run_id ORDER BY ordinal LIMIT 1
+            ))
           LEFT JOIN agent_run AS source_run
             ON source_run.id = message.source_agent_run_id
           WHERE current_delivery.camp_id = ?1
-            AND message.tombstoned_at IS NULL
+            AND (message.tombstoned_at IS NULL OR continuation.delivery_id IS NOT NULL)
 
           UNION ALL
 
@@ -2849,7 +2861,8 @@ fn load_message_deliveries(
                  legacy_delivery.recipient_membership_version_at_admission,
                  legacy_delivery.source_agent_run_id,
                  legacy_delivery.queue_sequence,
-                 NULL AS continuation_request
+                 NULL AS continuation_request,
+                 '[]' AS input_message_ids
           FROM message_delivery AS legacy_delivery
           WHERE legacy_delivery.camp_id = ?1
             AND legacy_delivery.delivery_kind IN ('public_a2a', 'gather_completion')
@@ -2870,7 +2883,7 @@ fn load_message_deliveries(
                recipient_canonical_position, edge_kind,
                target_parent_agent_run_id, return_to_agent_run_id,
                target_conversation_id,
-               recipient_membership_version_at_admission, source_agent_run_id, continuation_request
+               recipient_membership_version_at_admission, source_agent_run_id, continuation_request, input_message_ids
         FROM projected_delivery
         ORDER BY
           CASE
@@ -2942,6 +2955,15 @@ fn load_message_deliveries(
             };
             Ok(MessageDeliveryView {
                 continuation_request: row.get(30)?,
+                input_message_ids: serde_json::from_str(&row.get::<_, String>(31)?).map_err(
+                    |error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            31,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    },
+                )?,
                 id: row.get(0)?,
                 message_id: row.get(1)?,
                 camp_turn_id: row.get(2)?,
@@ -2988,6 +3010,7 @@ fn load_agent_runs(
                  WHEN agent_run.status = 'failed'
                   AND COALESCE(agent_run.last_error_code, '') = 'accepted_input_outcome_unknown'
                   AND agent_run.cancel_requested_at IS NOT NULL
+                  AND COALESCE(agent_run.cancel_reason_code, '') <> 'accepted_input_outcome_unknown'
                   AND agent_run.terminal_resolution_source IS NULL
                  THEN 'cancelled'
                  ELSE agent_run.status
@@ -3110,11 +3133,18 @@ fn load_agent_runs(
                  agent_run.trigger_camp_message_id,
                  CASE WHEN camp_turn.trigger_type = 'camp_message'
                       THEN camp_turn.trigger_id END
-               )
+               ),
+               continued.source_agent_run_id IS NOT NULL
         FROM agent_run
         LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
         JOIN camp ON camp.id = COALESCE(agent_run.camp_id, camp_turn.camp_id)
         JOIN conversation ON conversation.id = agent_run.conversation_id
+        LEFT JOIN (
+            SELECT DISTINCT continuation.source_agent_run_id
+            FROM camp_message_delivery AS delivery
+            JOIN camp_run_continuation AS continuation ON continuation.delivery_id = delivery.id
+            WHERE delivery.camp_id = ?1
+        ) AS continued ON continued.source_agent_run_id = agent_run.id
         WHERE camp.id = ?1
           AND agent_run.invocation_kind <> 'single_chat'
         ORDER BY
@@ -3179,6 +3209,7 @@ fn load_agent_runs(
                 row.get::<_, String>(38)?,
                 row.get::<_, Option<String>>(39)?,
                 row.get::<_, Option<String>>(40)?,
+                row.get::<_, bool>(41)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3231,6 +3262,7 @@ fn load_agent_runs(
                 input_message_ids_json,
                 anchor_message_id,
                 summary_message_id,
+                has_accepted_continuation,
             )| {
                 Ok(AgentRunView {
                     id,
@@ -3240,6 +3272,7 @@ fn load_agent_runs(
                     anchor_message_id,
                     input_summary: summary_message_id
                         .and_then(|id| summaries.get(&id).cloned().flatten()),
+                    has_accepted_continuation,
                     conversation_id,
                     agent_id,
                     task_id,
@@ -4332,7 +4365,8 @@ mod tests {
                 source_agent_run_id TEXT
             );
             CREATE TABLE agent_run (id TEXT, task_id TEXT);
-            CREATE TABLE camp_run_continuation (delivery_id TEXT);
+            CREATE TABLE camp_run_continuation (delivery_id TEXT, source_agent_run_id TEXT);
+            CREATE TABLE agent_run_input (agent_run_id TEXT, message_id TEXT, ordinal INTEGER);
             CREATE TABLE camp_message_delivery (
                 id TEXT PRIMARY KEY, camp_id TEXT, message_id TEXT,
                 recipient_agent_id TEXT,

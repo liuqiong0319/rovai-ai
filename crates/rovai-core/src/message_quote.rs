@@ -8,7 +8,7 @@ use crate::{
     command::canonical_json_digest,
 };
 use anyhow::{Context, Result, ensure};
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use comrak::{Arena, Options, arena_tree::NodeEdge, nodes::NodeValue, parse_document};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub const MAX_QUOTE_SCALARS: usize = 12_000;
+pub const QUOTE_PROJECTION_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -525,7 +526,7 @@ pub fn capture_quote(
         message_id: selection.message_id.clone(),
     };
     let source_content_digest = canonical_json_digest(
-        &json!({"source":source,"body":body,"revision":revision,"projectionVersion":1}),
+        &json!({"source":source,"body":body,"revision":revision,"projectionVersion":QUOTE_PROJECTION_VERSION}),
     )?;
     let mut quote = MessageQuoteSnapshot {
         version: 1,
@@ -537,7 +538,7 @@ pub fn capture_quote(
         captured_at: chrono::Utc::now().to_rfc3339(),
         source_content_digest,
         locator: Some(MessageQuoteLocator {
-            projection_version: 1,
+            projection_version: QUOTE_PROJECTION_VERSION,
             start_scalar: selection.start_scalar,
             end_scalar: selection.end_scalar,
             projection_digest: format!("{:x}", Sha256::digest(projection.as_bytes())),
@@ -636,16 +637,9 @@ pub fn project_structured_quote_text(
             .chars()
             .take_while(|c| c.is_whitespace())
             .any(|c| matches!(c, '\r' | '\n'))
-            && matches!(
-                Parser::new_ext(
-                    &tail,
-                    Options::ENABLE_TABLES
-                        | Options::ENABLE_STRIKETHROUGH
-                        | Options::ENABLE_TASKLISTS
-                )
-                .next(),
-                Some(Event::Start(Tag::Paragraph))
-            );
+            && parse_document(&Arena::new(), &tail, &quote_markdown_options())
+                .first_child()
+                .is_some_and(|node| matches!(node.data().value, NodeValue::Paragraph));
         return Ok(format!(
             "{prefix}{}{text}",
             if inline { " " } else { "\n\n" },
@@ -655,88 +649,114 @@ pub fn project_structured_quote_text(
     Ok(project_quote_text(&render(content, &mut member_name)?))
 }
 
-/// MessageQuoteTextProjection v1. Pair with Renderer DOM projection and shared fixtures.
+fn quote_markdown_options() -> Options<'static> {
+    let mut options = Options::default();
+    options.extension.table = true;
+    options.extension.strikethrough = true;
+    options.extension.tasklist = true;
+    options.extension.autolink = true;
+    options.extension.cjk_friendly_emphasis = true;
+    options
+}
+
+/// MessageQuoteTextProjection v2. Pair with Renderer DOM projection and shared fixtures.
 /// Structural separators are deferred; selected whitespace inside actual text/code is untouched.
 pub fn project_quote_text(body: &str) -> String {
+    fn append(output: &mut String, boundary: &mut usize, text: &str) {
+        if !output.is_empty() {
+            let trailing = output.chars().rev().take_while(|c| *c == '\n').count();
+            output.extend(std::iter::repeat_n('\n', boundary.saturating_sub(trailing)));
+        }
+        *boundary = 0;
+        output.push_str(text);
+    }
+
     let body = body.replace("\r\n", "\n");
-    let options =
-        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let arena = Arena::new();
+    let root = parse_document(&arena, &body, &quote_markdown_options());
+    let lines: Vec<_> = body.lines().collect();
     let mut output = String::new();
     let mut boundary = 0usize;
     let mut image_depth = 0usize;
     let mut cell = false;
-    let mut code_block_start = None;
-    for event in Parser::new_ext(&body, options) {
-        match event {
-            Event::Start(Tag::Image { .. }) => {
+    for edge in root.traverse() {
+        let (node, entering) = match edge {
+            NodeEdge::Start(node) => (node, true),
+            NodeEdge::End(node) => (node, false),
+        };
+        let data = node.data();
+        match (&data.value, entering) {
+            (NodeValue::Image(_), true) => {
                 image_depth += 1;
                 continue;
             }
-            Event::End(TagEnd::Image) => {
+            (NodeValue::Image(_), false) => {
                 image_depth -= 1;
                 continue;
             }
             _ if image_depth > 0 => continue,
-            Event::Start(Tag::TableCell) => {
+            (NodeValue::TableCell, true) => {
                 if cell {
                     output.push('\t');
                 }
                 cell = true;
             }
-            Event::End(TagEnd::TableRow | TagEnd::TableHead) => {
+            (NodeValue::TableRow(_), false) => {
                 boundary = boundary.max(1);
                 cell = false;
             }
-            Event::Start(Tag::CodeBlock(_)) => {
-                code_block_start = Some(output.len());
+            (NodeValue::CodeBlock(code), true) => {
                 if !output.is_empty() {
                     boundary = boundary.max(2);
                 }
+                if !code.literal.is_empty() {
+                    append(&mut output, &mut boundary, &code.literal);
+                    if !output.ends_with('\n') {
+                        output.push('\n');
+                    }
+                }
+                boundary = boundary.max(2);
             }
-            Event::End(TagEnd::CodeBlock) => {
-                // SafeMarkdown's code element ends nonempty code with a newline,
-                // including indented code whose source ends without one.
-                if code_block_start
-                    .take()
-                    .is_some_and(|start| output.len() > start)
-                    && !output.ends_with('\n')
+            (NodeValue::Paragraph, true)
+                if node.previous_sibling().is_none()
+                    && node.parent().is_some_and(|parent| {
+                        matches!(parent.data().value, NodeValue::TaskItem(_))
+                    }) =>
+            {
+                if !output.is_empty() {
+                    boundary = boundary.max(2);
+                }
+                // The disabled checkbox is excluded from DOM selection, but
+                // remark's following space is part of the visible paragraph.
+                append(&mut output, &mut boundary, " ");
+            }
+            (
+                NodeValue::Paragraph
+                | NodeValue::Heading(_)
+                | NodeValue::BlockQuote
+                | NodeValue::List(_)
+                | NodeValue::Item(_)
+                | NodeValue::TaskItem(_)
+                | NodeValue::Table(_)
+                | NodeValue::ThematicBreak,
+                _,
+            ) if !output.is_empty() => {
+                boundary = boundary.max(2);
+            }
+            (NodeValue::Text(text), true) => append(&mut output, &mut boundary, text),
+            (NodeValue::Code(code), true) => append(&mut output, &mut boundary, &code.literal),
+            (NodeValue::Strikethrough, _) => {
+                // Comrak also accepts single tildes. SafeMarkdown deliberately
+                // keeps them literal; use parser positions, never rewrite source.
+                if lines
+                    .get(data.sourcepos.start.line.saturating_sub(1))
+                    .and_then(|line| line.get(data.sourcepos.start.column.saturating_sub(1)..))
+                    .is_some_and(|source| source.starts_with('~') && !source.starts_with("~~"))
                 {
-                    output.push('\n');
-                }
-                boundary = boundary.max(2);
-            }
-            Event::Start(
-                Tag::Paragraph
-                | Tag::Heading { .. }
-                | Tag::BlockQuote(_)
-                | Tag::List(_)
-                | Tag::Item
-                | Tag::Table(_),
-            ) => {
-                if !output.is_empty() {
-                    boundary = boundary.max(2);
+                    append(&mut output, &mut boundary, "~");
                 }
             }
-            Event::End(
-                TagEnd::Paragraph
-                | TagEnd::Heading(_)
-                | TagEnd::BlockQuote(_)
-                | TagEnd::List(_)
-                | TagEnd::Item
-                | TagEnd::Table,
-            )
-            | Event::Rule => {
-                boundary = boundary.max(2);
-            }
-            Event::Text(text) | Event::Code(text) => {
-                if !output.is_empty() {
-                    let trailing = output.chars().rev().take_while(|c| *c == '\n').count();
-                    output.extend(std::iter::repeat_n('\n', boundary.saturating_sub(trailing)));
-                }
-                boundary = 0;
-                output.push_str(&text);
-            }
-            Event::SoftBreak | Event::HardBreak => output.push('\n'),
+            (NodeValue::SoftBreak | NodeValue::LineBreak, true) => output.push('\n'),
             // Matches SafeMarkdown skipHtml and omitted images/checkbox UI.
             _ => {}
         }
@@ -997,7 +1017,7 @@ mod tests {
     #[test]
     fn readable_projection_preserves_selected_text_without_markdown_wrappers() {
         let cases: Vec<Value> = serde_json::from_str(include_str!(
-            "../../../packages/contracts/fixtures/message-quote-projection-v1.json"
+            "../../../packages/contracts/fixtures/message-quote-projection-v2.json"
         ))
         .unwrap();
         for case in cases {
@@ -1050,6 +1070,7 @@ mod tests {
         let quote = capture_quote(&transaction, "camp_a", None, &selection).unwrap();
         assert_eq!(quote.text, text);
         let locator = quote.locator.as_ref().unwrap();
+        assert_eq!(locator.projection_version, QUOTE_PROJECTION_VERSION);
         assert_eq!(locator.start_scalar, selection.start_scalar);
         assert_eq!(locator.end_scalar, selection.end_scalar);
         assert_eq!(
@@ -1073,15 +1094,27 @@ mod tests {
                 .to_string()
                 .contains("source_changed")
         );
-        let saved = serde_json::to_string(&vec![quote.clone()]).unwrap();
-        // The same capture seam also owns structured prefixes and presentation-only local names.
+        // Old captures are frozen values, even when their visible Markdown
+        // projection changes. Loading/sending never reparses the source.
+        let mut legacy_quote = quote.clone();
+        legacy_quote.quote_id = "legacy-cjk-quote".into();
+        legacy_quote.text = "**有冲突。**我上一条建议".into();
+        legacy_quote.locator = Some(MessageQuoteLocator {
+            projection_version: 1,
+            start_scalar: 0,
+            end_scalar: legacy_quote.text.chars().count(),
+            projection_digest: format!("{:x}", Sha256::digest(legacy_quote.text.as_bytes())),
+        });
+        legacy_quote.snapshot_digest = legacy_quote.digest().unwrap();
+        let saved = serde_json::to_string(&vec![quote.clone(), legacy_quote.clone()]).unwrap();
+        // The same capture seam owns plain/structured CJK sources and local display names.
         let projection_cases: Vec<Value> = serde_json::from_str(include_str!(
-            "../../../packages/contracts/fixtures/message-quote-projection-v1.json"
+            "../../../packages/contracts/fixtures/message-quote-projection-v2.json"
         ))
         .unwrap();
         for case in projection_cases
             .iter()
-            .filter(|case| case.get("content").is_some())
+            .filter(|case| case["authorType"].as_str() != Some("user"))
         {
             transaction
                 .execute("UPDATE agent_profile SET display_name='芝士*'", [])
@@ -1089,11 +1122,19 @@ mod tests {
             transaction
                 .execute(
                     "UPDATE camp_message SET structured_content_json=?1",
-                    [case["content"].to_string()],
+                    [case
+                        .get("content")
+                        .cloned()
+                        .unwrap_or_else(|| json!([{"kind":"text","text":case["source"]}]))
+                        .to_string()],
                 )
                 .unwrap();
-            let content: StructuredThreadMessageContent =
-                serde_json::from_value(case["content"].clone()).unwrap();
+            let content: StructuredThreadMessageContent = serde_json::from_value(
+                case.get("content")
+                    .cloned()
+                    .unwrap_or_else(|| json!([{"kind":"text","text":case["source"]}])),
+            )
+            .unwrap();
             let text = case["text"].as_str().unwrap();
             let captured = capture_quote(
                 &transaction,
@@ -1120,7 +1161,12 @@ mod tests {
             .unwrap();
         transaction.execute("DELETE FROM camp_message", []).unwrap();
         let frozen = parse_quotes(&saved).unwrap();
-        assert_eq!(frozen, vec![quote.clone()]);
+        assert_eq!(frozen, vec![quote.clone(), legacy_quote.clone()]);
+        assert_eq!(
+            legacy_quote.model_projection()["text"],
+            "**有冲突。**我上一条建议"
+        );
+        assert_eq!(serde_json::to_string(&frozen).unwrap(), saved);
         let model = quote.model_projection();
         assert_eq!(model["source"]["author"]["displayName"], "芝士");
         assert!(model["source"].get("threadId").is_none());

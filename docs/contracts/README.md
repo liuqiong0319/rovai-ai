@@ -1,21 +1,22 @@
 ---
 document_type: contracts-index
 authority: protocol-contract-routing
-last_updated: 2026-10-08
+last_updated: 2026-10-10
 ---
 
 # 长期接口合同
 
 User 的主称呼、结构化提及及冻结恢复见 [User Naming v1](user-naming-v1.md)。
 
-公开命名与历史合同的关系见 [Thread Naming v1](thread-naming-v1.md)；当前模型与 CLI 版本见 [ContextManifest v33](context-manifest-evidence-v33.md)、[Built-in Tool Transport v36](builtin-tool-transport-v36.md)。
+公开命名与历史合同的关系见 [Thread Naming v1](thread-naming-v1.md)；当前模型与 CLI 版本见 [ContextManifest v33](context-manifest-evidence-v33.md)、[Built-in Tool Transport v37](builtin-tool-transport-v37.md)。
 
 本目录保存跨版本、字段级且可由测试直接验证的接口合同。[Version Decisions](../decisions/README.md)解释为什么选择某个边界，
 Architecture 解释组件如何组成，Version 概览记录交付范围；它们都不复制本目录的完整 wire shape。
 
 ## 用户主动继续
 
-- [AgentRun Continuation v2（当前）](agent-run-continuation-v2.md)：新用户授权、自动会话选择与投递前有界降级，独立 Run 与现有队列。
+- [AgentRun Continuation v3（当前）](agent-run-continuation-v3.md)：续做新请求只入内部队列，不新增消息或公开序号；既有记录、原输入及锚点保留。
+- [AgentRun Continuation v2（历史）](agent-run-continuation-v2.md)：新用户授权、自动会话选择与投递前有界降级，独立 Run 与现有队列。
 - [AgentRun Continuation v1（历史）](agent-run-continuation-v1.md)：独立续做与显式新会话确认；确认规则由 v2 替代。
 
 ## Navigation
@@ -111,7 +112,12 @@ Architecture 解释组件如何组成，Version 概览记录交付范围；它�
 | [Camp Open Projection v10（历史）](camp-open-projection-v10.md) | main Snapshot 34/Open 6；Open 不读取 event_log，移除 timeline/coverage.timeline，保留 high-water 与业务卡片 |
 | [Camp Open Projection v10（渠道分支历史）](camp-open-projection-channel-v10.md) | v9 保留；Camp/Navigation 增加可选 channelSource，原始 title 不变；合并时保留原文以区分同号合同 |
 | [Camp Open Projection v9（历史）](camp-open-projection-v9.md) | v8 保留；Snapshot 34/Open 5 增加可选 member.fast，仅查询安全缓存 |
-| [Runtime Launch and Verification v53（当前）](runtime-launch-and-verification-v53.md) | 继承 v52；用户续做复用原生恢复路径，Codex 投递前允许一次新 Thread 降级 |
+| [Runtime Launch and Verification v58（当前）](runtime-launch-and-verification-v58.md) | 配置透传、队员会话创建时固定、显式重置及 Camp/队员/会话进程归属 |
+| [Runtime Launch and Verification v57（历史）](runtime-launch-and-verification-v57.md) | 队员私有 JSON 环境、冻结计划和兼容复用；Agents 旧环境停用与人工迁移 |
+| [Runtime Launch and Verification v56（历史）](runtime-launch-and-verification-v56.md) | Kimi 使用官方 Provider 配置，退役 Rovai 私有 env、注入及复用摘要；继承 Pi 目录与思考强度合同 |
+| [Runtime Launch and Verification v55（历史）](runtime-launch-and-verification-v55.md) | Pi 目录观察独立于健康、同模型续接避免重复选模、thinking_level 非破坏性保存与严格执行核验 |
+| [Runtime Launch and Verification v54（历史）](runtime-launch-and-verification-v54.md) | Cline 唯一官方 ACP；原生认证、共享 Fleet 与能力控制恢复，完整退役 Hub，保留历史数据及 compact 缺口 |
+| [Runtime Launch and Verification v53](runtime-launch-and-verification-v53.md) | 继承 v52；用户续做复用原生恢复路径，Codex 投递前允许一次新 Thread 降级 |
 | [Runtime Launch and Verification v52（历史）](runtime-launch-and-verification-v52.md) | 继承 v51；移除 Claude/Codex 原生连接编辑，保留本地启动设置、原生执行、只读兼容与脱敏 |
 | [Runtime Launch and Verification v51](runtime-launch-and-verification-v51.md) | 继承 v50；保存只做本地提交，不触发发现、检查、目录或 Host 工作；保存回执不含完整 Key，界面按回执结束保存 |
 | [Runtime Launch and Verification v50（历史）](runtime-launch-and-verification-v50.md) | 继承 v49；Owner 设置回显可读的原生静态 API Key，默认隐藏，查看不写入，不增加持久副本 |
@@ -243,7 +249,8 @@ Architecture 解释组件如何组成，Version 概览记录交付范围；它�
 | [Camp Permanent Deletion v3（历史）](camp-permanent-deletion-v3.md) | 原删除权限/journal 不变；先定向业务终态，再有界 Runtime 清理和物理删除 |
 | [Camp Permanent Deletion v2（历史）](camp-permanent-deletion-v2.md) | v1 删除合同不变；增加 Camp Published Attachment View journal cleanup，并规定先 fence Runtime、再取得 View write gate |
 | [Camp Permanent Deletion v1（历史）](camp-permanent-deletion-v1.md) | `camps.delete` force 字段、兼容 blocker、单事务物理删除、Runtime cleanup 与 Renderer 确认边界；不含 Published View cleanup |
-| [Runtime File Change Observation v6（当前）](runtime-file-change-observation-v6.md) | exact-epoch 文件事实水位、stale/no_changes 重算、稳定文件 ID 与原子 projection 发布 |
+| [Runtime File Change Observation v7（当前）](runtime-file-change-observation-v7.md) | 已成功的原生补丁片段、来源标签、按序统计与共享 Command/Files Changed 投影 |
+| [Runtime File Change Observation v6（历史）](runtime-file-change-observation-v6.md) | exact-epoch 文件事实水位、stale/no_changes 重算、稳定文件 ID 与原子 projection 发布 |
 | [Runtime File Change Observation v5（历史）](runtime-file-change-observation-v5.md) | 官方 ZCode Runtime 与原生证据边界；继承上一版合同 |
 | [Runtime File Change Observation v4（历史）](runtime-file-change-observation-v4.md) | v3 typed read/write 与文件汇总不变；准入 Pi 成功 edit 的 path-bound 原生 patch，activity-v4 隔离新映射且不回写历史 |
 | [Runtime File Change Observation v3（历史）](runtime-file-change-observation-v3.md) | v2 文件变化与临时区排除不变；schema 2 增加 typed read/write，activity-v3 准入可靠单文件阅读且排除 Files Changed |
@@ -352,7 +359,8 @@ Architecture 解释组件如何组成，Version 概览记录交付范围；它�
 | [Memory Capture v3（当前）](memory-capture-v3.md) | v2 边界加 complete exact-Scope View、copyable Revision target、active body aggregate quota、64 KiB production projection limit 与 Memory-domain clean break |
 | [Memory Capture v2 (historical)](memory-capture-v2.md) | v1 捕获/Review/Forget 边界加 flat Agent-relative Scope identity、revise target assertion、durable domain rejection 与 Supersession 原子顺序 |
 | [Memory Capture v1 (historical)](memory-capture-v1.md) | 初版 best-effort 在线捕获、actor-bounded add/revise、隔离 Hearth Review Item、双 CAS、候选清除与 Forget safeguard；不含 Scope-identified revise |
-| [Built-in Tool Transport v36（当前）](builtin-tool-transport-v36.md) | 封闭 member list/get/update、Core PATCH、复合图片与现有请求幂等；无 Runtime 或成员关系扩权 |
+| [Built-in Tool Transport v37（当前）](builtin-tool-transport-v37.md) | Send 正文文件、严格旧请求识别、输入冲突诊断及冻结 Session 兼容；其他操作输入和 Core Send 合同不变 |
+| [Built-in Tool Transport v36（历史）](builtin-tool-transport-v36.md) | 封闭 member list/get/update、Core PATCH、复合图片与现有请求幂等；无 Runtime 或成员关系扩权 |
 | [Built-in Tool Transport v35（历史）](builtin-tool-transport-v35.md) | thread.runs、read addressing、Agent Output 8；旧 Session 和 Bootstrap 保持 |
 | [Built-in Tool Transport v34（历史）](builtin-tool-transport-v34.md) | User 主称呼与双别名；新 Agent Output 7，旧 receipt 原字节复用 |
 | [Built-in Tool Transport v33（历史）](builtin-tool-transport-v33.md) | Thread 命名与冻结 Session 身份保持 |
@@ -497,7 +505,8 @@ Architecture 解释组件如何组成，Version 概览记录交付范围；它�
 | [Gather v3（历史）](gather-v3.md) | v2 lifecycle/limits 不变；Completion Input 使用 `agent_v1` request/captured 投影、projected digest 与 schema v3 |
 | [Gather v2（历史）](gather-v2.md) | v1 lifecycle 加当前代最后 captured result、独立回传限额、完整 request 与 completion input v2 |
 | [Gather v1（历史）](gather-v1.md) | GatherRecord/Item、Default Lead 接受、持久 capture/Barrier、completion snapshot/FIFO 与旧 capture budget/input v1 |
-| [Message Delivery v11（当前）](message-delivery-v11.md) | 续做复用 waiting Delivery，独立成批，来源状态不传播；non-batch 改为事件唤醒，移除旧全局维护循环 |
+| [Message Delivery v12（当前）](message-delivery-v12.md) | 内部续做请求使用独立 FIFO 序号，不创建消息，执行区复用原输入 |
+| [Message Delivery v11（历史）](message-delivery-v11.md) | 续做复用 waiting Delivery，独立成批，来源状态不传播；non-batch 改为事件唤醒，移除旧全局维护循环 |
 | [Message Delivery v10（历史）](message-delivery-v10.md) | 继承 v9；claim 原子修复历史 waiting lane 缺失的 Camp-member Conversation，启动扫描与兜底自动恢复 |
 | [Message Delivery v9（历史）](message-delivery-v9.md) | waiting Delivery 是唯一队列；claim 原子创建不可变的多输入 AgentRun，无预算、Gather 或业务重试 |
 | [Message Delivery v8（历史）](message-delivery-v8.md) | Managed v2 Message 的旧 dispatch/attempt 模型 |
@@ -552,7 +561,10 @@ Architecture 解释组件如何组成，Version 概览记录交付范围；它�
 | [ContextManifest Evidence v9 (historical)](context-manifest-evidence-v9.md) | bounded public omission evidence；不作为 Formatter v13 恢复入口 |
 | [Context Delivery Profile v2 (historical)](context-delivery-profile-v2.md) | 公共引用链与历史 budget 的旧当前合同；不选择 self-active Task |
 | [Context Delivery Profile v1 (historical)](context-delivery-profile-v1.md) | AgentRun 公共消息窗口、Unicode scalar 正文截断、历史字符预算与遗漏提示 |
-| [Run Process Detail Surface v46（当前）](run-process-detail-surface-v46.md) | 继承 v45；继续图标直接提交，取消新会话确认弹窗 |
+| [Run Process Detail Surface v49（当前）](run-process-detail-surface-v49.md) | 单行预览首次读取失败的事件驱动恢复、在途更新补拉及新旧 Evidence 合并；不改变 v48 展示与授权规则 |
+| [Run Process Detail Surface v48](run-process-detail-surface-v48.md) | 停止区短竖线分隔、默认中性色停止按钮；按持久化续做 Delivery 恢复已受理重试的收起状态 |
+| [Run Process Detail Surface v47（历史）](run-process-detail-surface-v47.md) | 会话内单行队员占位、V2 确认停止、命令图标与中断重试；复用已有命令和 Evidence |
+| [Run Process Detail Surface v46（历史）](run-process-detail-surface-v46.md) | 继承 v45；继续图标直接提交，取消新会话确认弹窗 |
 | [Run Process Detail Surface v45（历史）](run-process-detail-surface-v45.md) | 继承 v44；失败／停止卡片的紧凑继续图标与独立排队请求 |
 | [Run Process Detail Surface v44（历史）](run-process-detail-surface-v44.md) | 继承 v43；根思考全阶段反馈、Codex/Copilot 有界原生短标题与瞬时读取 |
 | [Run Process Detail Surface v43（历史）](run-process-detail-surface-v43.md) | 继承 v42；主线按完整内容块分页、Tool 组独立游标与有界自动补齐，不新增表或迁移 |

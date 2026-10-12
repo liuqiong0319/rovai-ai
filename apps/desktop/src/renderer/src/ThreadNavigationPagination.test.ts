@@ -2,8 +2,8 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { NavigationThreadItem, NavigationSnapshot, NavigationSnapshotRequest } from '@contracts'
-import { ThreadNavigation, activateProjectNavigationRow, navigationPaginationControls } from './ThreadNavigation'
-import { createNavigationWindowReader, type NavigationGroupLimits } from './navigation-window-reader'
+import { ThreadNavigation, activateProjectNavigationRow, navigationGroupWindow, navigationPaginationControls } from './ThreadNavigation'
+import { createNavigationWindowReader, navigationGroupKey, type NavigationGroupLimits } from './navigation-window-reader'
 
 function thread(index: number, marker: NavigationThreadItem['marker'] = 'none'): NavigationThreadItem {
   return {
@@ -44,12 +44,17 @@ function harness(pinnedThreadIds: string[] = []) {
   let limits: NavigationGroupLimits = {}
   const read = vi.fn(async (request: NavigationSnapshotRequest) => {
     const next = snapshot(rows, request.groupLimits)
-    if (request.groupKeys) next.projects = next.projects.filter(group => request.groupKeys?.includes(group.projectKey))
+    if (request.groupKeys) {
+      next.projects = next.projects.filter(group => request.groupKeys?.includes(group.projectKey))
+      if (!request.groupKeys.includes('quick-chat')) next.quickChat = { totalCount: 0, recentThreads: [] }
+    }
     return next
   })
-  const readThreads = vi.fn(async (ids: string[]) => ({
-    throughGlobalSequence: 1, groupKeys: ['directory:/repo'], threads: rows.filter(row => ids.includes(row.id))
-  }))
+  const readThreads = vi.fn(async (ids: string[]) => {
+    const threads = [...rows, ...snapshot(rows, { 'quick-chat': rows.length }).quickChat.recentThreads]
+      .filter(row => ids.includes(row.id))
+    return { throughGlobalSequence: 1, groupKeys: [...new Set(threads.map(navigationGroupKey))], threads }
+  })
   const commit = vi.fn((next: NavigationSnapshot, nextLimits: NavigationGroupLimits) => {
     current = next
     limits = nextLimits
@@ -58,13 +63,22 @@ function harness(pinnedThreadIds: string[] = []) {
   const reader = createNavigationWindowReader(read, commit, { readThreads, getPinnedThreadIds: () => pinnedThreadIds, onRows })
   return {
     reader, read, readThreads, commit, onRows,
-    visibleRows: () => current?.projects[0].recentThreads.slice(0, limits['directory:/repo'] ?? 5) ?? [],
+    visibleRows: () => current ? navigationGroupWindow(current.projects[0], limits['directory:/repo'] ?? 5, new Set(pinnedThreadIds)).threads : [],
+    groupWindow: (key = 'directory:/repo') => {
+      if (!current) throw new Error('No navigation snapshot')
+      const group = key === 'quick-chat' ? current.quickChat : current.projects.find(project => project.projectKey === key)!
+      return navigationGroupWindow(group, limits[key] ?? 5, new Set(pinnedThreadIds))
+    },
+    setPins: (ids: string[]) => { pinnedThreadIds = ids; return reader.refreshPins() },
     setRows: (next: NavigationThreadItem[]) => { rows = next },
     rows: () => rows,
     markup: (pinned = false) => renderToStaticMarkup(createElement(ThreadNavigation, {
       view: 'compose', state: 'ready', navigation: current, groupLimits: limits,
       activeThreadId: null, pendingMemoryCount: 0,
-      pins: pinned ? [{ kind: 'project', targetKey: 'directory:/repo', pinnedAt: '' }] : [],
+      pins: [
+        ...pinnedThreadIds.map(targetKey => ({ kind: 'camp' as const, targetKey, pinnedAt: '' })),
+        ...(pinned ? [{ kind: 'project' as const, targetKey: 'directory:/repo', pinnedAt: '' }] : [])
+      ],
       onGroupLimitChange: reader.resizeGroup,
       onNewConversation() {}, onMembers() {}, onMemory() {}, onSettings() {}, onOpenProject() {},
       onThread() {}, onError() {}, async onRemoveProject() {}, async onRename() {}, async onDelete() {}
@@ -75,6 +89,103 @@ function harness(pinnedThreadIds: string[] = []) {
 afterEach(() => vi.useRealTimers())
 
 describe('authoritative Thread navigation windows', () => {
+  const groupMarkup = (markup: string, key: string): string => {
+    const group = markup.split(`data-group="${key}">`)[1]
+    expect(group).toBeDefined()
+    return group.split('</section>')[0]
+  }
+
+  it('fills five unpinned rows in ordinary projects, pinned projects and Quick Chat', async () => {
+    const h = harness(['camp-3', 'camp-5', 'quick-camp-3', 'quick-camp-5'])
+    await h.reader.refresh('explicit')
+    expect(h.visibleRows().map(row => row.id)).toEqual(['camp-1', 'camp-2', 'camp-4', 'camp-6', 'camp-7'])
+    for (const pinnedProject of [false, true]) {
+      const markup = h.markup(pinnedProject)
+      for (const key of ['directory:/repo', 'quick-chat']) {
+        const group = groupMarkup(markup, key)
+        expect(group.match(/data-thread-id=/g)).toHaveLength(5)
+        expect(group).toContain('查看更多')
+        expect(group).not.toContain('收起')
+        expect(group).not.toMatch(/data-thread-id="(?:quick-)?camp-(3|5)"/)
+      }
+      expect(markup.match(/data-thread-id="camp-3"/g)).toHaveLength(1)
+      expect(markup.match(/data-thread-id="quick-camp-5"/g)).toHaveLength(1)
+    }
+    h.reader.dispose()
+  })
+
+  it.each([0, 3, 5, 6])('only shows more when unpinned rows remain (%i unpinned)', async (count) => {
+    const rows = Array.from({ length: count + 4 }, (_, index) => thread(index + 1))
+    const pinIds = [rows[0], rows[1], ...rows.slice(-2)].map(row => row.id)
+    const h = harness([...pinIds, ...pinIds.map(id => `quick-${id}`)])
+    h.setRows(rows)
+    await h.reader.refresh('explicit')
+    for (const pinnedProject of [false, true]) {
+      const markup = h.markup(pinnedProject)
+      for (const key of ['directory:/repo', 'quick-chat']) {
+        const group = groupMarkup(markup, key)
+        expect(group.match(/data-thread-id=/g) ?? []).toHaveLength(Math.min(count, 5))
+        expect(group.includes('查看更多')).toBe(count > 5)
+        expect(group).not.toContain('收起')
+      }
+    }
+    h.reader.dispose()
+  })
+
+  it('refills only the affected group on pin changes and counts expansion/collapse by unpinned rows', async () => {
+    const h = harness()
+    await h.reader.refresh('explicit')
+    h.read.mockClear()
+    await h.setPins(['camp-3', 'camp-5'])
+    expect(h.read).toHaveBeenCalledTimes(1)
+    expect(h.read).toHaveBeenLastCalledWith({ groupKeys: ['directory:/repo'], groupLimits: { 'directory:/repo': 7 } })
+    expect(h.visibleRows().map(row => row.id)).toEqual(['camp-1', 'camp-2', 'camp-4', 'camp-6', 'camp-7'])
+    await h.reader.resizeGroup('directory:/repo', 15)
+    expect(h.visibleRows()).toHaveLength(15)
+    expect(h.groupWindow().hasMore).toBe(true)
+    await h.setPins(['camp-3', 'camp-5', 'camp-18'])
+    expect(h.visibleRows()).toHaveLength(15)
+    expect(h.groupWindow().hasMore).toBe(false)
+    expect(groupMarkup(h.markup(), 'directory:/repo')).toContain('收起')
+    await h.reader.resizeGroup('directory:/repo', 5)
+    expect(h.visibleRows()).toHaveLength(5)
+    expect(groupMarkup(h.markup(), 'directory:/repo')).not.toContain('收起')
+    await h.setPins([])
+    expect(h.visibleRows().map(row => row.id)).toEqual(['camp-1', 'camp-2', 'camp-3', 'camp-4', 'camp-5'])
+    h.reader.dispose()
+  })
+
+  it('fences an expansion whose pin membership changes while the read is in flight', async () => {
+    const h = harness(['camp-3', 'camp-5'])
+    await h.reader.refresh('explicit')
+    const old = deferred<NavigationSnapshot>()
+    h.read.mockImplementationOnce(() => old.promise)
+    h.commit.mockClear()
+    const expanding = h.reader.resizeGroup('directory:/repo', 15)
+    const pinning = h.setPins(['camp-1', 'camp-3', 'camp-5'])
+    old.resolve(snapshot(h.rows(), { 'directory:/repo': 17 }))
+    await Promise.all([expanding, pinning])
+    expect(h.visibleRows()).toHaveLength(15)
+    expect(h.visibleRows().map(row => row.id)).not.toContain('camp-1')
+    expect(h.groupWindow().hasMore).toBe(false)
+    for (const [next, limits] of h.commit.mock.calls) {
+      expect(navigationGroupWindow(next.projects[0], limits['directory:/repo'] ?? 5,
+        new Set(['camp-1', 'camp-3', 'camp-5'])).threads).toHaveLength(15)
+    }
+    h.reader.dispose()
+  })
+
+  it('does not publish a short discovered project when its pin refill fails; recovery retries the full window', async () => {
+    const h = harness(['camp-3', 'camp-5'])
+    h.read.mockResolvedValueOnce(snapshot(h.rows()))
+    h.read.mockRejectedValueOnce(new Error('refill failed'))
+    await expect(h.reader.refresh('explicit')).rejects.toThrow('refill failed')
+    expect(h.commit).not.toHaveBeenCalled()
+    await h.reader.refresh('foreground')
+    expect(h.visibleRows()).toHaveLength(5)
+    h.reader.dispose()
+  })
+
   it('immediately reads the full prefix, keeping five visible until the sixth Thread is fresh', async () => {
     const h = harness()
     h.setRows(h.rows().map(row => ({ ...row, marker: 'loading' })))
@@ -135,7 +246,7 @@ describe('authoritative Thread navigation windows', () => {
     expect(h.visibleRows()[5].title).toBe('新 对话 6')
     await h.reader.resizeGroup('directory:/repo', 25)
     expect(h.visibleRows()).toHaveLength(18)
-    expect(navigationPaginationControls(18, 18)).toEqual({ showMore: false, showCollapse: true })
+    expect(navigationPaginationControls(18, false)).toEqual({ showMore: false, showCollapse: true })
     h.reader.dispose()
   })
 
@@ -221,7 +332,7 @@ describe('authoritative Thread navigation windows', () => {
     await vi.advanceTimersByTimeAsync(80)
     await deletion
     expect(h.read).toHaveBeenCalledTimes(1)
-    expect(h.read).toHaveBeenLastCalledWith({ groupKeys: ['directory:/repo'], groupLimits: {} })
+    expect(h.read).toHaveBeenLastCalledWith({ groupKeys: ['directory:/repo'], groupLimits: { 'directory:/repo': 6 } })
     expect(h.visibleRows().map(row => row.id)).toEqual(['camp-2', 'camp-3', 'camp-4', 'camp-5', 'camp-6'])
     // A simultaneous status notification must not expand a different group's read.
     h.read.mockClear()
@@ -230,7 +341,7 @@ describe('authoritative Thread navigation windows', () => {
     await vi.advanceTimersByTimeAsync(80)
     await Promise.all([reordered, quickStatus])
     expect(h.read).toHaveBeenCalledTimes(1)
-    expect(h.read).toHaveBeenLastCalledWith({ groupKeys: ['directory:/repo'], groupLimits: {} })
+    expect(h.read).toHaveBeenLastCalledWith({ groupKeys: ['directory:/repo'], groupLimits: { 'directory:/repo': 6 } })
     expect(h.readThreads).toHaveBeenLastCalledWith(['quick-camp-1'])
     await h.reader.refresh('foreground')
     expect(h.readThreads).toHaveBeenLastCalledWith(['camp-18'])
@@ -298,9 +409,9 @@ describe('authoritative Thread navigation windows', () => {
     const calls: string[] = []
     activateProjectNavigationRow(() => calls.push('select'), () => calls.push('toggle'))
     expect(calls).toEqual(['select', 'toggle'])
-    expect(navigationPaginationControls(5, 18)).toEqual({ showMore: true, showCollapse: false })
-    expect(navigationPaginationControls(15, 18)).toEqual({ showMore: true, showCollapse: true })
-    expect(navigationPaginationControls(5, 5)).toEqual({ showMore: false, showCollapse: false })
-    expect(navigationPaginationControls(0, 0)).toEqual({ showMore: false, showCollapse: false })
+    expect(navigationPaginationControls(5, true)).toEqual({ showMore: true, showCollapse: false })
+    expect(navigationPaginationControls(15, true)).toEqual({ showMore: true, showCollapse: true })
+    expect(navigationPaginationControls(5, false)).toEqual({ showMore: false, showCollapse: false })
+    expect(navigationPaginationControls(0, false)).toEqual({ showMore: false, showCollapse: false })
   })
 })

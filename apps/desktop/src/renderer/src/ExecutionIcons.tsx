@@ -1,4 +1,10 @@
 /** Shared execution identity; status glyphs keep their own state-specific shapes. */
+export function ExecutionStopIcon(): React.JSX.Element {
+  return <svg viewBox="0 0 24 24" aria-hidden="true">
+    <rect x="5" y="5" width="14" height="14" rx="1.5" fill="currentColor" stroke="none" />
+  </svg>
+}
+
 export function ExecutionIcon({ className }: { className?: string }): React.JSX.Element {
   return <svg className={className} viewBox="0 0 24 24" aria-hidden="true" focusable="false"
     fill="none" stroke="currentColor" strokeWidth="1.65" strokeLinecap="round" strokeLinejoin="round">

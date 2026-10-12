@@ -11,8 +11,8 @@ mod workspaces;
 pub use updates::{UpdateFuture, UpdateHost, UpdateRequest};
 
 use anyhow::{Context, Result, ensure};
+pub use auth::{AuthStoreFailure, Sessions as WebSessions, new_token, stored_administrator_token};
 use auth::{LOGIN_TICKET_LIFETIME, LoginFailure, SESSION_LIFETIME, Session, Sessions, TicketGrant};
-pub use auth::{Sessions as WebSessions, new_token, stored_administrator_token};
 use axum::{
     Json, Router,
     body::Body,
@@ -526,10 +526,7 @@ fn login_failure(failure: LoginFailure) -> Response {
         LoginFailure::Unauthorized => {
             error(StatusCode::UNAUTHORIZED, "invalid_administrator_token")
         }
-        LoginFailure::Storage => error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "session_storage_unavailable",
-        ),
+        LoginFailure::Storage(failure) => storage_failure(failure),
         LoginFailure::Throttled | LoginFailure::Capacity => {
             error(StatusCode::TOO_MANY_REQUESTS, "login_limited")
         }
@@ -542,11 +539,18 @@ async fn logout(
 ) -> Response {
     match state.sessions.revoke(&session) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(_) => error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "session_storage_unavailable",
-        ),
+        Err(failure) => storage_failure(AuthStoreFailure::saving(failure)),
     }
+}
+
+fn storage_failure(failure: AuthStoreFailure) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": {
+            "code": "session_storage_unavailable", "message": failure.message()
+        }})),
+    )
+        .into_response()
 }
 
 async fn renew_session(

@@ -82,7 +82,7 @@ const fixtureExecutionRoot = join(fixtureRoot, 'workspace')
 const codexExpectedCommand = 'rovai camp read --limit 20'
 const claudeExpectedCommand = "printf '%s\\n' 'ROVAI_CLAUDE_EMPTY_OUTPUT_OK'"
 const webSearchQueries = ['password=公开验收词 token=保持原样', '第二项公开查询']
-const fixtureContextManifestVersion = 32
+const fixtureContextManifestVersion = 33
 const fixtureContextDeliveryProfile = {
   profileVersion: 10,
   maxSelfActiveTasks: 8
@@ -194,6 +194,11 @@ try {
   await setTheme(app.cdp, 'day')
   await activateControlledRun()
   await openCamp(app.cdp, threadId)
+  await waitForExpression(app.cdp, `(() => {
+    const presence = document.querySelector('[data-presence-run="${activeRunId}"]')
+    return presence?.querySelector('.run-presence-open')?.dataset.previewKind === 'command'
+      && presence.querySelector('.run-presence-preview')?.textContent?.includes(${JSON.stringify(codexExpectedCommand)})
+  })()`, 30_000)
   await waitForExpression(app.cdp,
     `document.querySelectorAll(${JSON.stringify(runArticleSelector)}).length > 0`, 30_000)
   const renderedMessageCount = await evaluate(app.cdp,
@@ -400,11 +405,8 @@ try {
     `Timeline did not use durable message dates: ${JSON.stringify(conversationPresentation)}`)
 
   const userReceiptActionLine = await collectUserReceiptActionLine(app.cdp)
-  assert(userReceiptActionLine.text === '处理中 · 1'
-    && userReceiptActionLine.sameActionLine
-    && userReceiptActionLine.receiptBeforeActions
-    && userReceiptActionLine.centerDelta <= 1,
-  `User processing receipt and copy action did not share one row: ${JSON.stringify(userReceiptActionLine)}`)
+  assert(userReceiptActionLine.text === null && userReceiptActionLine.copyActionPresent,
+    `Terminal input retained a processing receipt or lost its copy action: ${JSON.stringify(userReceiptActionLine)}`)
 
   const messageAuthorProfileTriggers = await collectMessageAuthorProfileTriggers(app.cdp)
   assert(messageAuthorProfileTriggers.length === runtimes.length
@@ -632,7 +634,7 @@ try {
     drawerPlacement: document.querySelector('.execution-drawer')?.dataset.placement ?? null,
     resizeHandle: Boolean(document.querySelector('.execution-drawer .execution-drawer-resize-handle')),
     inspectorTabLabels: [...document.querySelectorAll('.camp-detail-entry')]
-      .map((tab) => tab.querySelector(':scope > span:not([aria-hidden="true"])')?.textContent?.trim() ?? '')
+      .map((tab) => tab.querySelector('.camp-detail-entry-copy > span')?.textContent?.trim() ?? '')
   }))()`)
   assert(returnedExecutionDock.followsTimeline
     && returnedExecutionSelection.selectedAgentId === activeAgentId
@@ -903,6 +905,23 @@ try {
     return timeline?.scrollTop ?? 0
   })()`)
   await wait(200)
+  const compactPresence = await evaluate(app.cdp, `(() => {
+    const timeline = document.querySelector('.camp-timeline').getBoundingClientRect()
+    const row = [...document.querySelectorAll('.conversation-run-presence')].at(-1)?.getBoundingClientRect()
+    return { visible: Boolean(row && row.top >= timeline.top - 1 && row.bottom <= timeline.bottom + 1),
+      contained: Boolean(row && row.left >= timeline.left - 1 && row.right <= timeline.right + 1) }
+  })()`)
+  assert(compactPresence.visible && compactPresence.contained,
+    `The live tail escaped the compact timeline: ${JSON.stringify(compactPresence)}`)
+  await capture(app.cdp, join(outputDir, 'run-presence-compact.png'))
+  // The live tail now follows the last message. Inspect that message's footer
+  // at its own reading position, rather than assuming it is the timeline tail.
+  await evaluate(app.cdp, `(() => {
+    const timeline = document.querySelector('.camp-timeline')
+    timeline.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -120 }))
+    document.querySelector('.message-delivery-footer')?.scrollIntoView({ block: 'center' })
+  })()`)
+  await wait(200)
   const compactLayout = await collectCompactHandoffLayout(app.cdp)
   const compactRuntimeModel = await collectFocusedRuntimeModelLayout(app.cdp)
   assertFocusedRuntimeModelLayout(compactRuntimeModel, '1040x700 bottom Drawer')
@@ -989,8 +1008,9 @@ try {
     outputDir,
     verified: {
       runtimeCount: observed.length,
+      conversationRunPresence: { coldCommandRestored: true, compact: compactPresence },
       canonicalToolRows: totalToolRows,
-      codexLifecycleMergedToOneRow: observed.find((row) => row.runtime === 'Codex CLI')?.toolTitles.length === 1,
+      codexLifecycleMergedToOneRow: observed.find((row) => row.agentId === activeAgentId)?.toolTitles.length === 1,
       toolGroupsCollapsedByDefault: observed.every((row) => row.toolTitles.length === 0
         ? row.groupingDefaults.groupCount === 0
         : row.groupingDefaults.groupCount === 1 && row.groupingDefaults.openGroupCount === 0),
@@ -1006,7 +1026,7 @@ try {
       completeToolOutput,
       webSearchPresentation,
       claudeCommandDisclosure,
-      antigravityCoreToolCatalogName: observed.find((row) => row.runtime === 'Antigravity')?.toolTitles[0] === 'thread.message.send',
+      antigravityCoreToolCatalogName: observed.find((row) => row.agentId === runtimes.find(entry => entry.key === 'antigravity').agentId)?.toolTitles[0] === 'rovai send',
       conversationPresentation,
       timelineFollowLatest,
       messageAuthorProfileTriggers,
@@ -2278,24 +2298,12 @@ async function collectHandoffFooter(cdp) {
 
 async function collectUserReceiptActionLine(cdp) {
   return evaluate(cdp, `(() => {
-    const receipt = [...document.querySelectorAll('.user-message-receipt')]
-      .find((candidate) => candidate.textContent?.replace(/\\s+/g, ' ').trim() === '处理中 · 1')
-    const receiptRow = receipt?.closest('.user-message-receipt-row')
-    const actionLine = receiptRow?.closest('.message-action-line')
-    const actions = actionLine?.querySelector(':scope > .message-actions')
-    const receiptRect = receiptRow?.getBoundingClientRect()
-    const actionsRect = actions?.getBoundingClientRect()
+    // Accepted Input Recovery v8 settles this fixture on startup. A terminal
+    // source input keeps its message actions without a stale processing receipt.
+    const message = document.querySelector('[data-message-id="message-recovery-input"]')
     return {
-      text: receipt?.textContent?.replace(/\\s+/g, ' ').trim() ?? null,
-      sameActionLine: Boolean(actionLine)
-        && receiptRow?.parentElement === actionLine
-        && actions?.parentElement === actionLine
-        && Boolean(actions?.querySelector('.message-copy-button')),
-      receiptBeforeActions: Boolean(receiptRow && actions)
-        && [...actionLine.children].indexOf(receiptRow) < [...actionLine.children].indexOf(actions),
-      centerDelta: receiptRect && actionsRect
-        ? Math.abs((receiptRect.top + receiptRect.height / 2) - (actionsRect.top + actionsRect.height / 2))
-        : Number.POSITIVE_INFINITY
+      text: message?.querySelector('.user-message-receipt')?.textContent?.trim() ?? null,
+      copyActionPresent: Boolean(message?.querySelector('.message-action-line .message-copy-button'))
     }
   })()`)
 }
@@ -2486,7 +2494,7 @@ async function collectAgentDock(cdp) {
     const auditTabCount = [...document.querySelectorAll('.camp-detail-entry')]
       .filter((tab) => tab.textContent?.includes('审计')).length
     const inspectorTabLabels = [...document.querySelectorAll('.camp-detail-entry')]
-      .map((tab) => tab.querySelector(':scope > span:not([aria-hidden="true"])')?.textContent?.trim() ?? '')
+      .map((tab) => tab.querySelector('.camp-detail-entry-copy > span')?.textContent?.trim() ?? '')
     return {
       chipCount: agentIds.length,
       overviewCount: allChips.filter((chip) => chip.dataset.agentId === ${JSON.stringify(executionOverviewScope)}).length,
@@ -2572,9 +2580,9 @@ async function collectExecutionSidecar(cdp) {
     const rects = allChips.map((chip) => chip.getBoundingClientRect())
     const agentIds = chips.map((chip) => chip.dataset.agentId ?? '').filter(Boolean)
     const inspectorTabLabels = [...document.querySelectorAll('.camp-detail-entry')]
-      .map((tab) => tab.querySelector(':scope > span:not([aria-hidden="true"])')?.textContent?.trim() ?? '')
+      .map((tab) => tab.querySelector('.camp-detail-entry-copy > span')?.textContent?.trim() ?? '')
     const activeTab = document.querySelector('.camp-detail-entry[aria-expanded="true"]')
-      ?.querySelector(':scope > span:not([aria-hidden="true"])')?.textContent?.trim() ?? null
+      ?.querySelector('.camp-detail-entry-copy > span')?.textContent?.trim() ?? null
     const drawer = document.querySelector('.execution-drawer')
     const rail = sideDock?.querySelector('.run-pulse-avatar-rail')
     const placementControl = sideDock?.querySelector('.execution-placement-control')
@@ -3075,7 +3083,7 @@ async function collectRuntimeRows(cdp) {
       const configurationModelStyle = configurationModel ? getComputedStyle(configurationModel) : null
       return {
         member: selectedMember,
-        agentId: ${JSON.stringify(expected.agentId)},
+        agentId: document.querySelector('.run-pulse-chip.is-selected')?.dataset.agentId ?? null,
         runtime: spans.find((text) => ${JSON.stringify(runtimes.map((entry) => entry.runtimeName))}.includes(text)) ?? '',
         runCount: stages.length,
         runIds: stages.map((stage) => stage.dataset.agentRunId ?? ''),
@@ -3194,8 +3202,8 @@ function assertFocusedRuntimeModelLayout(layout, context) {
   assert(layout.runId === activeRunId
     && layout.count === 1
     && layout.perRunModelCount === 0
-    && layout.text === 'Agent 运行时默认'
-    && layout.title === 'Agent 运行时默认'
+    && layout.text === '智能体默认'
+    && layout.title === '智能体默认'
     && layout.whiteSpace === 'nowrap'
     && layout.overflowX === 'hidden'
     && layout.textOverflow === 'ellipsis'
@@ -3500,7 +3508,7 @@ async function collectConversationDropPresentation(cdp, sourceDirectory) {
     const composerBox = document.querySelector('.composer-box')?.getBoundingClientRect()
     const destination = document.querySelector('.composer-destination')
     const tabs = [...document.querySelectorAll('.camp-detail-entry')]
-      .map((tab) => tab.querySelector(':scope > span:not([aria-hidden="true"])')?.textContent?.trim())
+      .map((tab) => tab.querySelector('.camp-detail-entry-copy > span')?.textContent?.trim())
     const overlap = (left, right) => Boolean(left && right
       && left.left < right.right && left.right > right.left
       && left.top < right.bottom && left.bottom > right.top)
@@ -3557,61 +3565,37 @@ function assertConversationDropPresentation(presentation, context, expectedCallo
 
 async function verifyRecoveryBlockerPresentation(cdp) {
   const opened = await evaluate(cdp, `(() => {
-    const chip = [...document.querySelectorAll('.run-pulse-chip[data-agent-id]')]
-      .find((candidate) => candidate.dataset.agentId === ${JSON.stringify(recoveryBlockedAgentId)})
+    const chip = document.querySelector('.run-pulse-chip[data-agent-id="${recoveryBlockedAgentId}"]')
     chip?.click()
     return Boolean(chip)
   })()`)
-  assert(opened, 'Could not open the Agent process containing the recovery blocker')
+  assert(opened, 'Could not open the Agent process containing the interrupted Run')
   await expandSelectedRunCards(cdp)
   await waitForExpression(cdp, `(() => {
-    const stage = document.querySelector(
-      '.execution-process-stage[data-agent-run-id="${recoveryBlockedRunId}"]'
-    )
-    return stage?.classList.contains('status-waiting')
+    const stage = document.querySelector('.execution-process-stage[data-agent-run-id="${recoveryBlockedRunId}"]')
+    return stage?.classList.contains('status-failed')
       && stage.querySelector('.execution-run-toggle')?.getAttribute('aria-expanded') === 'true'
   })()`)
-  await evaluate(cdp, `(() => {
-    const stage = document.querySelector(
-      '.execution-process-stage[data-agent-run-id="${recoveryBlockedRunId}"]'
-    )
-    stage?.scrollIntoView({ block: 'center' })
-    return Boolean(stage)
-  })()`)
-  await waitForExpression(cdp, `Boolean(document.querySelector(
-    '.execution-process-stage[data-agent-run-id="${recoveryBlockedRunId}"] .process-recovery-blocker[role="status"]'
-  ))`)
   const presentation = await evaluate(cdp, `(() => {
-    const stage = document.querySelector(
-      '.execution-process-stage[data-agent-run-id="${recoveryBlockedRunId}"]'
-    )
-    const blocker = stage?.querySelector('.process-recovery-blocker')
-    const style = blocker ? getComputedStyle(blocker) : null
+    const stage = document.querySelector('.execution-process-stage[data-agent-run-id="${recoveryBlockedRunId}"]')
+    const failure = stage.querySelector('.runtime-failure-notice')
+    stage.scrollIntoView({ block: 'center' })
     return {
-      status: [...(stage?.classList ?? [])].find((name) => name.startsWith('status-'))?.slice(7) ?? null,
-      heading: blocker?.querySelector('strong')?.textContent?.trim() ?? '',
-      copy: blocker?.querySelector('p')?.textContent?.replace(/\\s+/g, ' ').trim() ?? '',
-      buttonCount: blocker?.querySelectorAll('button').length ?? -1,
-      spinnerCount: stage?.querySelectorAll('.process-spinner').length ?? -1,
-      role: blocker?.getAttribute('role') ?? null,
-      borderTopWidth: style?.borderTopWidth ?? null,
-      backgroundColor: style?.backgroundColor ?? null,
-      drawerSummary: document.querySelector('.execution-drawer-header p')?.textContent?.trim() ?? '',
-      selectedChipState: document.querySelector('.run-pulse-chip.is-selected .run-pulse-chip-state')
-        ?.getAttribute('aria-label') ?? null
+      status: [...stage.classList].find(name => name.startsWith('status-')).slice(7),
+      copy: failure?.textContent?.trim() ?? '',
+      role: failure?.getAttribute('role') ?? null,
+      staleBlockerCount: stage.querySelectorAll('.process-recovery-blocker').length,
+      spinnerCount: stage.querySelectorAll('.process-spinner').length,
+      continueCount: stage.querySelectorAll('.execution-continue').length,
+      retryCount: document.querySelectorAll('[data-presence-run="${recoveryBlockedRunId}"] .run-presence-retry').length,
+      stopCount: document.querySelectorAll('[data-presence-run="${recoveryBlockedRunId}"] .run-presence-stop').length
     }
   })()`)
-  assert(presentation.status === 'waiting'
-    && presentation.heading === '执行异常，正在清理'
-    && presentation.copy.includes('原请求不会自动重发')
-    && presentation.copy.includes('清理完成后，后续消息会按正常顺序继续执行')
-    && presentation.buttonCount === 0
-    && presentation.spinnerCount === 0
-    && presentation.role === 'status'
-    && presentation.borderTopWidth !== '0px'
-    && !presentation.drawerSummary.includes('当前有进行中 AgentRun')
-    && presentation.selectedChipState === '结果待确认',
-  `Recovery blocker presentation mismatch: ${JSON.stringify(presentation)}`)
+  assert(presentation.status === 'failed'
+    && (presentation.role === null || presentation.role === 'status') && presentation.staleBlockerCount === 0
+    && presentation.spinnerCount === 0 && presentation.continueCount === 1
+    && presentation.retryCount === 1 && presentation.stopCount === 0,
+    `Interrupted Run did not retain its terminal failure and explicit continuation: ${JSON.stringify(presentation)}`)
   return presentation
 }
 
@@ -3865,6 +3849,9 @@ async function verifyCompleteToolOutput(cdp) {
     `document.querySelector('.execution-drawer-body')?.dataset.followingLatest ?? null`)
   assert(followingLatestBeforeProgrammaticScroll === 'false',
     `Inspector tab round-trip unexpectedly resumed live following: ${JSON.stringify(followingLatestBeforeProgrammaticScroll)}`)
+  // Separate the synthetic programmatic scroll from the preceding user wheel
+  // gesture. The reader's 1.5s input-intent lease must have expired first.
+  await wait(1_600)
   // Browser focus and menu positioning may scroll the drawer without reading intent.
   // That must not replace the user's last reading position or re-enable live following.
   await evaluate(cdp, `(() => {
@@ -4422,15 +4409,15 @@ function assertRuntimeRows(observed) {
     && active.focusedEvidenceOpen,
     `Explicit Agent click did not focus and reveal the running AgentRun: ${JSON.stringify(active)}`)
   for (const expected of runtimes) {
-    const row = observed.find((candidate) => candidate.runtime === expected.runtimeName)
+    const row = observed.find((candidate) => candidate.agentId === expected.agentId)
     assert(row, `Missing ${expected.runtimeName} row: ${JSON.stringify(observed)}`)
     assert(row.runSelectorCount === 0,
       `${expected.runtimeName} Drawer exposed an AgentRun selector: ${JSON.stringify(row)}`)
     assert(row.drawerHorizontalOverflow === false,
       `${expected.runtimeName} model metadata overflowed the Drawer: ${JSON.stringify(row)}`)
     assert(row.configurationModel.count === 1
-      && row.configurationModel.text === 'Agent 运行时默认'
-      && row.configurationModel.title === 'Agent 运行时默认'
+      && row.configurationModel.text === '智能体默认'
+      && row.configurationModel.title === '智能体默认'
       && row.configurationModel.whiteSpace === 'nowrap'
       && row.configurationModel.overflowX === 'hidden'
       && row.configurationModel.textOverflow === 'ellipsis'
@@ -4498,7 +4485,7 @@ function assertRuntimeRows(observed) {
     } else if (expected.cancelledWithInProgressActivity) {
       assert(row.focusedStatus === 'cancelled'
         && row.toolGroupLayouts[0]?.statusLabel === null
-        && row.toolGroupLayouts[0]?.summaryAriaLabel === '已完成 0 个步骤'
+        && row.toolGroupLayouts[0]?.summaryAriaLabel === '已完成 1 个步骤'
         && row.toolStates.length === 1
         && row.toolStates[0].label === '已停止'
         && row.toolStates[0].status === 'stopped'
@@ -5197,16 +5184,16 @@ async function verifyExecutionBackgrounds(cdp) {
     }
   })()`)
   const expected = {
-    day: { running: 'rgb(250, 250, 250)', selectedViewButton: 'rgb(233, 238, 243)' },
-    night: { running: 'rgb(27, 32, 36)', selectedViewButton: 'rgb(34, 48, 58)' }
+    day: { selectedViewButton: 'rgb(233, 238, 243)' },
+    night: { selectedViewButton: 'rgb(34, 48, 58)' }
   }[colors.theme]
   assert(expected && colors.conversation
     && colors.selectedViewButton === expected.selectedViewButton
     && colors.header === colors.conversation
-    && colors.runningRun === expected.running
+    && colors.runningRun === colors.conversation
     && colors.historicalRun === colors.conversation
     && colors.canvas === colors.conversation,
-  `Execution backgrounds diverged from the approved porcelain and conversation surfaces: ${JSON.stringify(colors)}`)
+  `Execution backgrounds diverged from the shared conversation surface: ${JSON.stringify(colors)}`)
   return colors
 }
 
@@ -5263,16 +5250,16 @@ async function verifyGlobalExecutionPlacement(cdp) {
     `document.querySelector('.camp-workspace')?.getAttribute('aria-label') === ${JSON.stringify(`会话：${threadTitle}`)}`, 30_000)
   await waitForExpression(cdp, `(() => {
     const activeTab = document.querySelector('.camp-detail-entry[aria-expanded="true"]')
-      ?.querySelector(':scope > span:not([aria-hidden="true"])')?.textContent?.trim()
+      ?.querySelector('.camp-detail-entry-copy > span')?.textContent?.trim()
     return activeTab === '执行'
-      && document.querySelector('.run-pulse-inspector .run-pulse-chip.is-selected')?.dataset.agentId === ${JSON.stringify(activeAgentId)}
+      && document.querySelector('.run-pulse-inspector .run-pulse-chip.is-selected')?.dataset.agentId === ${JSON.stringify(executionOverviewScope)}
       && document.querySelector('.execution-process-stage.is-focused')?.dataset.agentRunId === ${JSON.stringify(activeRunId)}
   })()`, 30_000)
   const runningEntryReveal = await evaluate(cdp, `(() => ({
     inspectorCollapsed: document.querySelector('.camp-detail-popover')?.hidden ?? false,
     bottomDockCount: document.querySelectorAll('.timeline-pane > .run-pulse-bottom').length,
     activeTab: document.querySelector('.camp-detail-entry[aria-expanded="true"]')
-      ?.querySelector(':scope > span:not([aria-hidden="true"])')?.textContent?.trim() ?? null,
+      ?.querySelector('.camp-detail-entry-copy > span')?.textContent?.trim() ?? null,
     selectedAgentId: document.querySelector('.run-pulse-inspector .run-pulse-chip.is-selected')?.dataset.agentId ?? null,
     focusedRunId: document.querySelector('.execution-process-stage.is-focused')?.dataset.agentRunId ?? null,
     drawerOwnsFocus: Boolean(document.activeElement?.closest('.execution-drawer'))
@@ -5280,7 +5267,7 @@ async function verifyGlobalExecutionPlacement(cdp) {
   assert(!runningEntryReveal.inspectorCollapsed
     && runningEntryReveal.bottomDockCount === 0
     && runningEntryReveal.activeTab === '执行'
-    && runningEntryReveal.selectedAgentId === activeAgentId
+    && runningEntryReveal.selectedAgentId === executionOverviewScope
     && runningEntryReveal.focusedRunId === activeRunId
     && !runningEntryReveal.drawerOwnsFocus,
     `Entering a running Camp did not reveal its current Inspector Run without stealing focus: ${JSON.stringify(runningEntryReveal)}`)
@@ -5292,24 +5279,28 @@ async function verifyGlobalExecutionPlacement(cdp) {
     `document.querySelector('.camp-workspace')?.getAttribute('aria-label') === ${JSON.stringify(`会话：${threadTitle}`)}`, 30_000)
   await waitForExpression(cdp, `(() => {
     const activeTab = document.querySelector('.camp-detail-entry[aria-expanded="true"]')
-      ?.querySelector(':scope > span:not([aria-hidden="true"])')?.textContent?.trim()
+      ?.querySelector('.camp-detail-entry-copy > span')?.textContent?.trim()
     return activeTab === '执行'
-      && document.querySelector('.run-pulse-inspector .run-pulse-chip.is-selected')?.dataset.agentId === ${JSON.stringify(activeAgentId)}
+      && document.querySelector('.run-pulse-inspector .run-pulse-chip.is-selected')?.dataset.agentId === ${JSON.stringify(executionOverviewScope)}
       && document.querySelector('.execution-process-stage.is-focused')?.dataset.agentRunId === ${JSON.stringify(activeRunId)}
   })()`, 30_000)
   const runningPageReturn = await evaluate(cdp, `(() => ({
     activeTab: document.querySelector('.camp-detail-entry[aria-expanded="true"]')
-      ?.querySelector(':scope > span:not([aria-hidden="true"])')?.textContent?.trim() ?? null,
+      ?.querySelector('.camp-detail-entry-copy > span')?.textContent?.trim() ?? null,
     selectedAgentId: document.querySelector('.run-pulse-inspector .run-pulse-chip.is-selected')?.dataset.agentId ?? null,
     focusedRunId: document.querySelector('.execution-process-stage.is-focused')?.dataset.agentRunId ?? null,
     drawerOwnsFocus: Boolean(document.activeElement?.closest('.execution-drawer'))
   }))()`)
   assert(runningPageReturn.activeTab === '执行'
-    && runningPageReturn.selectedAgentId === activeAgentId
+    && runningPageReturn.selectedAgentId === executionOverviewScope
     && runningPageReturn.focusedRunId === activeRunId
     && !runningPageReturn.drawerOwnsFocus,
     `Returning from another primary page did not restore the running Run: ${JSON.stringify(runningPageReturn)}`)
 
+  // Subsequent card checks explicitly select one member, as a user would.
+  await evaluate(cdp, `document.querySelector('.run-pulse-chip[data-agent-id="${activeAgentId}"]')?.click()`)
+  await waitForExpression(cdp,
+    `document.querySelector('.run-pulse-chip.is-selected')?.dataset.agentId === ${JSON.stringify(activeAgentId)}`)
   return {
     authority,
     acrossCamp,
@@ -5430,7 +5421,7 @@ async function verifyExecutionPlacementAcrossRestart(currentApp) {
         .filter((tab) => tab.textContent?.includes('执行')).length,
       inspectorHidden: document.querySelector('.camp-detail-popover')?.hidden ?? false,
       activeTab: document.querySelector('.camp-detail-entry[aria-expanded="true"]')
-        ?.querySelector(':scope > span:not([aria-hidden="true"])')?.textContent?.trim() ?? null,
+        ?.querySelector('.camp-detail-entry-copy > span')?.textContent?.trim() ?? null,
       selectedAgentId: document.querySelector('.run-pulse-inspector .run-pulse-chip.is-selected')?.dataset.agentId ?? null,
       focusedRunId: document.querySelector('.execution-process-stage.is-focused')?.dataset.agentRunId ?? null,
       drawerOwnsFocus: Boolean(document.activeElement?.closest('.execution-drawer'))

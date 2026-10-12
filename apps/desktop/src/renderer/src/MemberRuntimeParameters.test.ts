@@ -34,6 +34,11 @@ describe('runtime model catalog source', () => {
     installation.modelCatalog.status = 'expired'
     installation.snapshot!.probeStatus = 'light_ready'
     expect(displayableInstallationModels(installation)).toEqual([])
+    installation.adapterKind = 'pi'
+    installation.snapshot!.staleAt = 'old-health-invalidation'
+    expect(displayableInstallationModels(installation)).toEqual(installation.snapshot!.models)
+    installation.modelCatalog.status = 'invalidated'
+    expect(displayableInstallationModels(installation)).toEqual([])
   })
   const installation = runtimeInstallation('copilot-cli')
   const cached: RuntimeModelCatalogView = {
@@ -118,6 +123,15 @@ describe('explicit model changes', () => {
     expect(explicitSelection(model, { mode: 'runtime_default' }, true)).toEqual({
       mode: 'explicit', modelId: 'runtime/next', options: {}
     })
+    for (const dshSource of ['native', 'web'] as const) {
+      expect(explicitSelection({ ...model, runtimeMetadata: { dshSource } }, {
+        mode: 'explicit', modelId: model.id, options: {},
+        dshSource: dshSource === 'web' ? 'native' : 'web'
+      }, true)).toEqual({ mode: 'explicit', modelId: model.id, options: {}, dshSource })
+    }
+    expect(explicitSelection(model, {
+      mode: 'explicit', modelId: 'old-web', options: {}, dshSource: 'web'
+    }, true)).toEqual({ mode: 'explicit', modelId: model.id, options: {} })
   })
 
   it('retains an explicit value while an expired historical catalog cannot verify the new model', () => {
@@ -312,6 +326,8 @@ describe('member runtime parameters', () => {
     ['qwen-code', '审批模式', 'yolo'],
     ['trae-cn-cli', '权限模式', 'bypass_permissions'],
     ['kimi-code-cli', '权限模式', 'yolo'],
+    ['cline-cli', '执行模式', 'act'],
+    ['command-code-cli', '权限模式', 'bypass'],
     ['grok-build', '权限模式', 'bypassPermissions']
   ] as const)('renders %s with its native permission value', (kind, label, value) => {
     const installation = runtimeInstallation(kind)
@@ -341,10 +357,30 @@ describe('member runtime parameters', () => {
     expect(markup).toContain('<span>模型</span>')
     expect(markup).not.toContain('审批模式')
     expect(markup).not.toContain('partial_managed')
+    for (const [state, values, value, expected] of [
+      ['known', ['off', 'high'], '', '跟随 Pi 原生设置'],
+      ['known', ['off'], '', null],
+      ['known', [], '', null],
+      ['unknown', [], '', null],
+      ['unknown', [], 'max', '尚未核对 · max'],
+      ['known', ['off'], 'high', '当前目录未提供 · high'],
+    ] as const) {
+      const model = installation.snapshot!.models[0]
+      model.runtimeMetadata = { piThinkingSchemaVersion: 1, piThinkingState: state }
+      model.options = state === 'unknown' ? [] : [{ key: 'thinking_level', label: '思考强度',
+        valueType: 'enum', scope: 'session', defaultValue: null,
+        values: values.map(value => ({ value, label: value })) }]
+      const rendered = renderToStaticMarkup(createElement(MemberModelParameters, {
+        adapterKind: 'pi', installation, disabled: false, onChange: () => undefined,
+        model: { mode: 'explicit', modelId: model.id, options: value ? { thinking_level: value } : {} }
+      }))
+      if (expected) expect(rendered).toContain(`aria-label="思考强度，${expected}"`)
+      else expect(rendered).not.toContain('aria-label="思考强度')
+    }
   })
 
-  it('uses switches for Copilot, Kiro, and Antigravity on/off fields', () => {
-    for (const kind of ['copilot-cli', 'kiro-cli', 'antigravity-app'] as const) {
+  it('uses switches for native on/off and boolean-string permission fields', () => {
+    for (const kind of ['copilot-cli', 'kiro-cli', 'antigravity-app', 'cline-cli'] as const) {
       const installation = runtimeInstallation(kind)
       const markup = renderToStaticMarkup(createElement(MemberRuntimeParameters, {
         adapterKind: kind,
@@ -357,6 +393,15 @@ describe('member runtime parameters', () => {
       expect(markup).toContain('checked=""')
       expect(markup).toContain('field-label runtime-parameter-switch-field')
       expect(markup).toContain('class="runtime-parameter-switch-state" aria-hidden="true">开启')
+      if (kind === 'cline-cli') {
+        const draft = draftFromDefaults(installation.memberRuntimeDefaults!)
+        draft.permissions.values.auto_approve = 'false'
+        const disabledMarkup = renderToStaticMarkup(createElement(MemberRuntimeParameters, {
+          adapterKind: kind, installation, draft, disabled: false, onChange: () => undefined
+        }))
+        expect(disabledMarkup).toContain('aria-label="自动通过权限请求"')
+        expect(disabledMarkup).not.toContain('checked=""')
+      }
     }
     expect(styles).toContain('.runtime-parameter-switch input:checked { border-color: var(--conversation-action); background: var(--conversation-action); }')
     expect(styles).toContain('.runtime-parameter-switch input:checked::after { background: var(--conversation-action-contrast);')
@@ -515,6 +560,10 @@ function runtimePermissionDefaults(kind: AdapterKind): Record<string, unknown> {
     case 'codex-cli':
     case 'deepseek-harness':
       return { sandbox_mode: 'danger-full-access', approval_policy: 'never' }
+    case 'command-code-cli':
+      return { permission_mode: 'bypass' }
+    case 'cline-cli':
+      return { mode: 'act', auto_approve: 'true' }
     case 'pi':
       return {}
     case 'opencode-cli':
@@ -561,6 +610,8 @@ function runtimePermissionOptions(kind: AdapterKind): PermissionOptionDescriptor
       ? (key === 'sandbox_mode'
           ? ['read-only', 'workspace-write', 'danger-full-access']
           : ['ask', 'never']).map(value => ({ value, label: value }))
+      : key === 'auto_approve'
+        ? [{ value: 'false', label: 'false' }, { value: 'true', label: 'true' }]
       : key === 'allow_all' || key === 'trust_all_tools' || key === 'dangerously_skip_permissions'
         ? [{ value: 'off', label: 'off' }, { value: 'on', label: 'on' }]
         : [{ value: String(value), label: String(value) }],

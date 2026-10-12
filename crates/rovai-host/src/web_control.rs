@@ -1,10 +1,19 @@
 use rovai_core::application::{
     CoreService, HostControl, HostControlError, HostControlFuture, HostWebOperation,
 };
-use rovai_web::{WebConfig, WebServer, WebSessions};
+use rovai_web::{AuthStoreFailure, WebConfig, WebServer, WebSessions};
 use serde_json::{Value, json};
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
+
+fn credential_failure(error: &anyhow::Error) -> Option<HostControlError> {
+    error
+        .downcast_ref::<AuthStoreFailure>()
+        .map(|failure| HostControlError {
+            code: failure.code(),
+            message: failure.message().into(),
+        })
+}
 
 pub struct WebControl {
     core: CoreService,
@@ -103,9 +112,11 @@ impl HostControl for WebControl {
                         .lock()
                         .await
                         .credentials(&self.data_dir, None)
-                        .map_err(|_| HostControlError {
-                            code: "HOST_WEB_AUTH_UNAVAILABLE",
-                            message: "登录凭据无法读取或保存，请检查数据目录。".into(),
+                        .map_err(|error| {
+                            credential_failure(&error).unwrap_or(HostControlError {
+                                code: "HOST_WEB_AUTH_UNAVAILABLE",
+                                message: "登录凭据暂不可用，请稍后重试。".into(),
+                            })
                         })?
                         .administrator_token();
                     Ok(json!({"administratorToken":token}))
@@ -125,7 +136,7 @@ impl HostControl for WebControl {
                     let config: WebConfig =
                         serde_json::from_value(params).map_err(|_| invalid())?;
                     let mut state = self.state.lock().await;
-                    let mut status = state.start(self.core.clone(), config, &self.data_dir, None, self.channels.clone().map(|channels| channels as Arc<dyn rovai_web::ChannelHost>), self.updates.clone()).await.map_err(|_| HostControlError { code: "HOST_WEB_START_FAILED", message: "Web 服务未开启。请检查端口是否被占用、WebUI 是否已构建，以及局域网访问是否已明确开启。".into() })?;
+                    let mut status = state.start(self.core.clone(), config, &self.data_dir, None, self.channels.clone().map(|channels| channels as Arc<dyn rovai_web::ChannelHost>), self.updates.clone()).await.map_err(|error| credential_failure(&error).unwrap_or(HostControlError { code: "HOST_WEB_START_FAILED", message: "Web 服务未开启。请检查端口是否被占用、WebUI 是否已构建，以及局域网访问是否已明确开启。".into() }))?;
                     // The closed, parent-owned pipe returns this only to the
                     // local manager. It is absent from status and diagnostics.
                     status["administratorToken"] = json!(
@@ -138,9 +149,12 @@ impl HostControl for WebControl {
                     Ok(status)
                 }
                 HostWebOperation::Stop => {
-                    self.stop().await.map_err(|_| HostControlError {
-                        code: "HOST_WEB_STOP_FAILED",
-                        message: "会话撤销未能保存，关闭操作未完成，请检查数据目录后重试。".into(),
+                    self.stop().await.map_err(|error| {
+                        credential_failure(&error).unwrap_or(HostControlError {
+                            code: "HOST_WEB_STOP_FAILED",
+                            message: "会话撤销未能保存，关闭操作未完成，请检查数据目录后重试。"
+                                .into(),
+                        })
                     })?;
                     Ok(json!({"enabled":false,"sessions":0}))
                 }
@@ -150,7 +164,9 @@ impl HostControl for WebControl {
                         code: "HOST_WEB_DISABLED",
                         message: "请先开启 Web 服务。".into(),
                     })?;
-                    let token = server.rotate().map_err(|_| invalid())?;
+                    let token = server
+                        .rotate()
+                        .map_err(|error| credential_failure(&error).unwrap_or_else(invalid))?;
                     let mut status = server.status();
                     status["administratorToken"] = json!(token);
                     Ok(status)

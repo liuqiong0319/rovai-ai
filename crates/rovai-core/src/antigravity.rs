@@ -536,6 +536,9 @@ impl AntigravityAppRuntimeAdapter {
             rovai_core::agent_profile::AdapterKind::AntigravityApp,
             &mut command,
         );
+        if let Some(environment) = &request.runtime.environment {
+            environment.apply(&mut command)?;
+        }
         if let Some(config) = &request.builtin_tools {
             config.configure_command(&mut command)?;
         }
@@ -674,6 +677,11 @@ impl AntigravityAppRuntimeAdapter {
             let resumable_native_session_id = request.resumable_native_session_id.clone();
             let runtime_events = request.runtime_events.clone();
             let image_log_path = log_path.clone();
+            let credential_redactor = request
+                .runtime
+                .environment
+                .as_ref()
+                .map(|environment| environment.redactor());
             tokio::spawn(async move {
                 capture_antigravity_stream(
                     stdout,
@@ -681,6 +689,7 @@ impl AntigravityAppRuntimeAdapter {
                     runtime_events.as_ref(),
                     &image_log_path,
                     native_metrics_root,
+                    credential_redactor,
                 )
                 .await
                 .map(|capture| AntigravityStdoutCapture::Structured(Box::new(capture)))
@@ -1019,6 +1028,10 @@ impl AntigravityAppRuntimeAdapter {
                 }
             },
         };
+        let final_output = request.runtime.environment.as_ref().map_or_else(
+            || final_output.clone(),
+            |environment| environment.redactor().text(&final_output),
+        );
         if final_output.is_empty() {
             let internal = anyhow::anyhow!("Antigravity final output was empty");
             let failure = antigravity_public_failure(
@@ -1075,13 +1088,19 @@ fn antigravity_public_failure(
     if let Some(config) = request.builtin_tools.as_ref() {
         sensitive_paths.push((config.run_tmp(), "<run-tmp>"));
     }
+    let protected_detail = raw_detail.map(|detail| {
+        request.runtime.environment.as_ref().map_or_else(
+            || detail.to_owned(),
+            |environment| environment.redactor().text(detail),
+        )
+    });
     public_runtime_failure_from_output(
         rovai_core::agent_profile::AdapterKind::AntigravityApp,
         origin,
         phase,
         code,
         summary,
-        raw_detail,
+        protected_detail.as_deref(),
         &sensitive_paths,
         retryable,
     )
@@ -1187,6 +1206,7 @@ enum AntigravityStdoutCapture {
 
 #[derive(Debug, Default)]
 struct AntigravityStreamCapture {
+    credential_redactor: Option<rovai_core::runtime_custom_api::CredentialRedactor>,
     conversation_id: Option<String>,
     final_result: Option<AntigravityJsonResult>,
     model_observation_emitted: bool,
@@ -1214,6 +1234,7 @@ async fn capture_antigravity_stream<R>(
     runtime_events: Option<&mpsc::UnboundedSender<AntigravityRuntimeEvent>>,
     log_path: &Path,
     native_metrics_root: Option<PathBuf>,
+    credential_redactor: Option<rovai_core::runtime_custom_api::CredentialRedactor>,
 ) -> Result<AntigravityStreamCapture>
 where
     R: AsyncRead + Unpin,
@@ -1222,6 +1243,7 @@ where
     let mut buffer = [0_u8; 16 * 1024];
     let mut capture = AntigravityStreamCapture {
         native_metrics_root,
+        credential_redactor,
         ..Default::default()
     };
     loop {
@@ -1364,7 +1386,11 @@ async fn process_antigravity_stream_line(
                         payload: serde_json::to_value(images)?,
                     });
                 }
-                let _ = sender.send(runtime_event);
+                let mut public_event = runtime_event;
+                if let Some(redactor) = &capture.credential_redactor {
+                    public_event.payload = redactor.redacted_value(&public_event.payload);
+                }
+                let _ = sender.send(public_event);
             }
         }
         Some("result") => {
@@ -2237,6 +2263,7 @@ mod tests {
                 },
                 permission_semantics: PermissionSemantics::CoreEnforcedV1,
                 runtime: FrozenAgentRuntimeConfig {
+                    environment: None,
                     custom_api: None,
                     camp_fast: None,
                     adapter_kind: AdapterKind::AntigravityApp,
@@ -2252,6 +2279,7 @@ mod tests {
                     capabilities: vec!["cli.print".to_string()],
                     protocol_version: "antigravity-app-cli-v1".to_string(),
                     model: ResolvedModelSelection {
+                        dsh_source: None,
                         source: "runtime_default".to_string(),
                         model_id: ANTIGRAVITY_RUNTIME_DEFAULT_MODEL_ID.to_string(),
                         options: json!({}),
@@ -2427,6 +2455,7 @@ mod tests {
             },
             permission_semantics: PermissionSemantics::RuntimeManagedV2,
             runtime: FrozenAgentRuntimeConfig {
+                environment: None,
                 custom_api: None,
                 camp_fast: None,
                 adapter_kind: AdapterKind::AntigravityApp,
@@ -2443,6 +2472,7 @@ mod tests {
                 capabilities: vec!["cli.print".to_string()],
                 protocol_version: "antigravity-app-cli-v1".to_string(),
                 model: ResolvedModelSelection {
+                    dsh_source: None,
                     source: "runtime_default".to_string(),
                     model_id: ANTIGRAVITY_RUNTIME_DEFAULT_MODEL_ID.to_string(),
                     options: json!({}),
@@ -2590,7 +2620,8 @@ printf '%s\n' '{{"event":"result","result":{{"conversation_id":"{session}","stat
             assert!(
                 adapter
                     .wait_for_agent_run_quiescence(&run_id, 1, Duration::from_secs(3))
-                    .await
+                    .await,
+                "input gate mode {mode} did not finish process cleanup"
             );
             std::fs::remove_dir_all(root).unwrap();
         }
@@ -3011,6 +3042,7 @@ echo "Created conversation 0bdd2166-d420-40c6-94be-70b93eb290c5" > "$log_file"
                 },
                 permission_semantics: PermissionSemantics::RuntimeManagedV2,
                 runtime: FrozenAgentRuntimeConfig {
+                    environment: None,
                     custom_api: None,
                     camp_fast: None,
                     adapter_kind: AdapterKind::AntigravityApp,
@@ -3026,6 +3058,7 @@ echo "Created conversation 0bdd2166-d420-40c6-94be-70b93eb290c5" > "$log_file"
                     capabilities: vec!["cli.print".to_string()],
                     protocol_version: "antigravity-app-cli-v1".to_string(),
                     model: ResolvedModelSelection {
+                        dsh_source: None,
                         source: "runtime_default".to_string(),
                         model_id: ANTIGRAVITY_RUNTIME_DEFAULT_MODEL_ID.to_string(),
                         options: json!({}),
@@ -3123,6 +3156,7 @@ exec sleep 30
             },
             permission_semantics: PermissionSemantics::CoreEnforcedV1,
             runtime: FrozenAgentRuntimeConfig {
+                environment: None,
                 custom_api: None,
                 camp_fast: None,
                 adapter_kind: AdapterKind::AntigravityApp,
@@ -3139,6 +3173,7 @@ exec sleep 30
                 capabilities: vec!["cli.print".to_string()],
                 protocol_version: "antigravity-app-cli-v1".to_string(),
                 model: ResolvedModelSelection {
+                    dsh_source: None,
                     source: "runtime_default".to_string(),
                     model_id: ANTIGRAVITY_RUNTIME_DEFAULT_MODEL_ID.to_string(),
                     options: json!({}),

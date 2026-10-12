@@ -16,6 +16,7 @@ export interface NavigationInvalidation {
 }
 export interface NavigationWindowReader extends NavigationRefreshCoordinator {
   resizeGroup(groupKey: string, limit: number): Promise<void>
+  refreshPins(): Promise<void>
   refreshThreads(threadIds: string[], trigger?: NavigationRefreshTrigger): Promise<void>
   refreshGroups(groupKeys: string[], trigger?: NavigationRefreshTrigger): Promise<void>
   invalidate(change: NavigationInvalidation): Promise<void>
@@ -46,6 +47,7 @@ export function createNavigationWindowReader(
   let pending = emptyRead()
   let disposed = false
   let rowRevision = 0
+  let pinnedThreadIds = new Set(options.getPinnedThreadIds?.() ?? [])
   const appliedRows = new Map<string, { sequence: number; seen: number; version: number }>()
   const resizeTokens = new Map<string, symbol>()
   const restore = (scope: PendingRead): void => {
@@ -56,6 +58,31 @@ export function createNavigationWindowReader(
   }
   const allRows = (): NavigationThreadItem[] => snapshot
     ? [...snapshot.quickChat.recentThreads, ...snapshot.projects.flatMap(group => group.recentThreads)] : []
+  const readWindow = async (windows: NavigationGroupLimits, keys?: string[]): Promise<NavigationSnapshot> => {
+    const limits = { ...windows }
+    // Pins are a local presentation preference. Keep Core's raw counts/prefixes,
+    // but leave enough room for every pin to be removed before slicing the window.
+    const padding = pinnedThreadIds.size
+    const pad = (key: string): void => {
+      limits[key] = (windows[key] ?? NAVIGATION_INITIAL_VISIBLE_CAMPS) + padding
+    }
+    if (padding > 0) {
+      for (const key of keys ?? ['quick-chat', ...(snapshot?.projects.map(group => group.projectKey) ?? [])]) pad(key)
+    }
+    const next = await read({ groupLimits: limits, ...(keys ? { groupKeys: keys } : {}) })
+    if (next.schemaVersion !== 3) throw new Error('会话列表数据版本不兼容。')
+    if (padding === 0) return next
+    // A full snapshot can discover new project keys. Repeat the same scope with
+    // their padded limits so every committed row still shares one Core read watermark.
+    const refill = next.projects.filter(group =>
+      group.recentThreads.length < Math.min(group.totalCount,
+        (windows[group.projectKey] ?? NAVIGATION_INITIAL_VISIBLE_CAMPS) + padding))
+    if (refill.length === 0) return next
+    refill.forEach(group => pad(group.projectKey))
+    const filled = await read({ groupLimits: limits, ...(keys ? { groupKeys: keys } : {}) })
+    if (filled.schemaVersion !== 3) throw new Error('会话列表数据版本不兼容。')
+    return filled
+  }
   const rememberRows = (threads: NavigationThreadItem[], sequence: number): void => {
     for (const thread of threads) appliedRows.set(thread.id, {
       sequence, seen: thread.lastSeenGlobalSequence ?? 0, version: thread.version
@@ -114,9 +141,9 @@ export function createNavigationWindowReader(
       }
       const keys = [...scope.groups]
       const next = scope.all || keys.length > 0
-        ? await read({ groupLimits: { ...windows }, ...(scope.all ? {} : { groupKeys: keys }) })
+        ? await readWindow(windows, scope.all ? undefined : keys)
         : undefined
-      const ids = [...new Set([...scope.threads, ...(scope.all ? options.getPinnedThreadIds?.() ?? [] : [])])]
+      const ids = [...new Set([...scope.threads, ...(scope.all ? pinnedThreadIds : [])])]
       // State-only Thread IDs must not expand a simultaneous group's read scope.
       const rows = ids.length > 0 ? await options.readThreads(ids) : undefined
       if (disposed) return
@@ -163,6 +190,15 @@ export function createNavigationWindowReader(
     refresh(trigger) { pending.all = true; return coordinator.refresh(trigger) },
     refreshThreads,
     refreshGroups,
+    refreshPins() {
+      const next = new Set(options.getPinnedThreadIds?.() ?? [])
+      const changed = new Set([...pinnedThreadIds, ...next].filter(id => pinnedThreadIds.has(id) !== next.has(id)))
+      if (changed.size === 0) return Promise.resolve()
+      pinnedThreadIds = next
+      rowRevision += 1
+      changed.forEach(id => pending.groupThreads.add(id))
+      return coordinator.refresh('explicit')
+    },
     invalidate(change) {
       if (change.scope === 'camp' && change.threadId) return refreshThreads([change.threadId])
       if (change.scope === 'group') {

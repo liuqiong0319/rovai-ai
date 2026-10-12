@@ -55,10 +55,11 @@ impl Default for AgentRuntimeFleetConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum RuntimeReuseScope {
-    Camp { camp_id: String },
-    Member { camp_id: String, agent_id: String },
-    Workspace { workspace_key: String },
+struct RuntimeReuseScope {
+    camp_id: String,
+    agent_id: String,
+    // Session snapshot reference fences explicit reset; never a hash of its values.
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -71,58 +72,32 @@ pub(crate) struct RuntimeCompatibilityKey {
 }
 
 impl RuntimeCompatibilityKey {
+    #[cfg(test)]
     pub(crate) fn member(
         camp_id: impl Into<String>,
         agent_id: impl Into<String>,
+        digest: impl Into<String>,
+    ) -> Self {
+        Self::member_session(camp_id, agent_id, None, digest)
+    }
+
+    pub(crate) fn member_session(
+        camp_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        session_id: Option<&str>,
         runtime_compatibility_digest: impl Into<String>,
     ) -> Self {
         let camp_id = camp_id.into();
         let agent_id = agent_id.into();
         Self {
-            reuse_scope: RuntimeReuseScope::Member {
+            reuse_scope: RuntimeReuseScope {
                 camp_id: camp_id.clone(),
                 agent_id: agent_id.clone(),
+                session_id: session_id.map(str::to_owned),
             },
             invalidation_camp_id: Some(camp_id),
             invalidation_agent_id: Some(agent_id.clone()),
             residency_bucket: agent_id,
-            runtime_compatibility_digest: runtime_compatibility_digest.into(),
-        }
-    }
-
-    pub(crate) fn camp(
-        camp_id: impl Into<String>,
-        agent_id: impl Into<String>,
-        runtime_compatibility_digest: impl Into<String>,
-    ) -> Self {
-        let camp_id = camp_id.into();
-        Self {
-            reuse_scope: RuntimeReuseScope::Camp {
-                camp_id: camp_id.clone(),
-            },
-            invalidation_camp_id: Some(camp_id.clone()),
-            invalidation_agent_id: Some(agent_id.into()),
-            residency_bucket: format!("camp:{camp_id}"),
-            runtime_compatibility_digest: runtime_compatibility_digest.into(),
-        }
-    }
-
-    pub(crate) fn workspace(
-        camp_id: impl Into<String>,
-        agent_id: impl Into<String>,
-        workspace_key: impl Into<String>,
-        runtime_compatibility_digest: impl Into<String>,
-    ) -> Self {
-        let camp_id = camp_id.into();
-        let agent_id = agent_id.into();
-        let workspace_key = workspace_key.into();
-        Self {
-            reuse_scope: RuntimeReuseScope::Workspace {
-                workspace_key: workspace_key.clone(),
-            },
-            invalidation_camp_id: Some(camp_id),
-            invalidation_agent_id: Some(agent_id),
-            residency_bucket: format!("workspace:{workspace_key}"),
             runtime_compatibility_digest: runtime_compatibility_digest.into(),
         }
     }
@@ -1404,6 +1379,25 @@ impl AgentRuntimeFleetManager {
             owner_records,
             builtin_tool_leases,
         }
+    }
+
+    pub(crate) async fn opencode_version_for_program(&self, identity: &str) -> Option<String> {
+        self.state
+            .lock()
+            .await
+            .processes
+            .values()
+            .find_map(|entry| {
+                if entry.retire_after_run {
+                    return None;
+                }
+                match &entry.host {
+                    Some(RuntimeProcessHost::Acp(host)) => {
+                        host.opencode_version_for_program(identity)
+                    }
+                    _ => None,
+                }
+            })
     }
 
     pub(crate) async fn acquire<F, Fut>(
@@ -3228,13 +3222,11 @@ mod tests {
 
     #[tokio::test]
     async fn warm_hosts_never_cross_camp_compatibility_keys() {
-        for camp_scope in [false, true] {
+        for adapter_kind in [AdapterKind::CodexCli, AdapterKind::DeepseekHarness] {
             let request = |run: &str, camp: &str, agent: &str| {
                 let mut request = acquire_request(run, camp);
-                request.adapter_kind = AdapterKind::DeepseekHarness;
-                if camp_scope {
-                    request.compatibility = RuntimeCompatibilityKey::camp(camp, agent, "digest-1");
-                }
+                request.adapter_kind = adapter_kind;
+                request.compatibility = RuntimeCompatibilityKey::member(camp, agent, "digest-1");
                 request
             };
             let fleet = Arc::new(AgentRuntimeFleetManager::new(test_config(
@@ -3263,7 +3255,7 @@ mod tests {
                 .await;
 
             let camp_a_again = fleet
-                .acquire(request("run-a2", "camp-a", "agent-c"), || async {
+                .acquire(request("run-a2", "camp-a", "agent-a"), || async {
                     Ok(fake_host("unexpected-host"))
                 })
                 .await
@@ -3272,7 +3264,7 @@ mod tests {
             fleet
                 .release("run-a2", 1, FleetReleaseDisposition::Reusable)
                 .await;
-            let mut changed = request("run-a3", "camp-a", "agent-c");
+            let mut changed = request("run-a3", "camp-a", "agent-a");
             fleet
                 .retire_incompatible_hosts(changed.adapter_kind, &changed.compatibility)
                 .await
@@ -3310,7 +3302,7 @@ mod tests {
             loop {
                 let retirement_is_waiting_for_release =
                     fleet.state.lock().await.processes.values().any(|entry| {
-                        entry.adapter_kind == AdapterKind::DeepseekHarness
+                        entry.adapter_kind == adapter_kind
                             && entry.compatibility.runtime_compatibility_digest == "digest-2"
                             && entry.retire_after_run
                             && entry.retirement.is_some()
@@ -3410,7 +3402,7 @@ mod tests {
                 agent_run_id: run.to_string(),
                 execution_epoch: 1,
                 adapter_kind: AdapterKind::ZcodeApp,
-                compatibility: RuntimeCompatibilityKey::camp("camp", member, "digest"),
+                compatibility: RuntimeCompatibilityKey::member("camp", member, "digest"),
             };
             let host = fake_host("background-host");
             let RuntimeProcessHost::Fake(fake) = &host else {
@@ -3472,11 +3464,11 @@ mod tests {
             fake.zcode_background.store(false, Ordering::Release);
             let shared = fleet
                 .acquire(request("b2", "b"), || async {
-                    panic!("completed jobs restore Camp reuse")
+                    Ok(fake_host("other-member-after-background"))
                 })
                 .await
                 .unwrap();
-            assert_eq!(shared.host.process_id(), "background-host");
+            assert_eq!(shared.host.process_id(), "other-member-after-background");
             fleet
                 .release("b2", 1, FleetReleaseDisposition::Reusable)
                 .await;
@@ -3486,77 +3478,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_hosts_reuse_across_camps_and_track_the_current_invalidation_scope() {
+    async fn member_sessions_reuse_only_within_their_camp_and_current_session() {
         let fleet = AgentRuntimeFleetManager::new(test_config(Duration::from_secs(1)));
-        let request = |run: &str, camp: &str, agent: &str, workspace: &str| FleetAcquireRequest {
-            agent_run_id: run.to_string(),
-            execution_epoch: 1,
-            adapter_kind: AdapterKind::Pi,
-            compatibility: RuntimeCompatibilityKey::workspace(
-                camp,
-                agent,
-                workspace,
-                "pi-digest-1",
+        let request =
+            |run: &str, camp: &str, agent: &str, session: &str, digest: &str| FleetAcquireRequest {
+                agent_run_id: run.into(),
+                execution_epoch: 1,
+                adapter_kind: AdapterKind::Pi,
+                compatibility: RuntimeCompatibilityKey::member_session(
+                    camp,
+                    agent,
+                    Some(session),
+                    digest,
+                ),
+            };
+        // Same owner/session stays warm; same workspace/config never permits another owner.
+        for (run, camp, agent, session, digest, expected) in [
+            ("a1", "camp-a", "agent-a", "session-a", "cwd-a", "host-a"),
+            ("a2", "camp-a", "agent-a", "session-a", "cwd-a", "host-a"),
+            ("b1", "camp-a", "agent-b", "session-a", "cwd-a", "host-b"),
+            ("c1", "camp-b", "agent-a", "session-a", "cwd-a", "host-c"),
+            (
+                "reset",
+                "camp-a",
+                "agent-a",
+                "session-reset",
+                "cwd-a",
+                "host-reset",
             ),
-        };
-        let first = fleet
-            .acquire(
-                request("run-a", "camp-a", "agent-a", "workspace-a"),
-                || async { Ok(fake_host("pi-host-a")) },
-            )
-            .await
-            .unwrap();
-        assert_eq!(first.host.process_id(), "pi-host-a");
-        fleet
-            .release("run-a", 1, FleetReleaseDisposition::Reusable)
-            .await;
-
-        let second = fleet
-            .acquire(
-                request("run-b", "camp-b", "agent-b", "workspace-a"),
-                || async { Ok(fake_host("unexpected-pi-host")) },
-            )
-            .await
-            .unwrap();
-        assert_eq!(second.host.process_id(), "pi-host-a");
-        fleet
-            .release("run-b", 1, FleetReleaseDisposition::Reusable)
-            .await;
-
-        let other_workspace = fleet
-            .acquire(
-                request("run-other", "camp-other", "agent-other", "workspace-b"),
-                || async { Ok(fake_host("pi-host-b")) },
-            )
-            .await
-            .unwrap();
-        assert_eq!(other_workspace.host.process_id(), "pi-host-b");
-        fleet
-            .release("run-other", 1, FleetReleaseDisposition::Reusable)
-            .await;
-
+            (
+                "cwd",
+                "camp-a",
+                "agent-a",
+                "session-reset",
+                "cwd-b",
+                "host-cwd",
+            ),
+        ] {
+            let lease = fleet
+                .acquire(
+                    request(run, camp, agent, session, digest),
+                    move || async move {
+                        assert_ne!(run, "a2", "same session must use the existing process");
+                        Ok(fake_host(expected))
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(lease.host.process_id(), expected);
+            fleet
+                .release(run, 1, FleetReleaseDisposition::Reusable)
+                .await;
+        }
         fleet.invalidate_camp("camp-a").await;
-        let second_again = fleet
+        let surviving = fleet
             .acquire(
-                request("run-b2", "camp-b", "agent-b", "workspace-a"),
-                || async { Ok(fake_host("unexpected-pi-host-2")) },
+                request("c2", "camp-b", "agent-a", "session-a", "cwd-a"),
+                || async { panic!("another Camp remains warm") },
             )
             .await
             .unwrap();
-        assert_eq!(second_again.host.process_id(), "pi-host-a");
+        assert_eq!(surviving.host.process_id(), "host-c");
         fleet
-            .release("run-b2", 1, FleetReleaseDisposition::Reusable)
+            .release("c2", 1, FleetReleaseDisposition::Reusable)
             .await;
-
-        fleet.invalidate_member("agent-b").await;
-        let third = fleet
+        fleet.invalidate_member("agent-a").await;
+        let replaced = fleet
             .acquire(
-                request("run-c", "camp-c", "agent-c", "workspace-a"),
-                || async { Ok(fake_host("pi-host-c")) },
+                request("c3", "camp-b", "agent-a", "session-a", "cwd-a"),
+                || async { Ok(fake_host("replacement")) },
             )
             .await
             .unwrap();
-        assert_eq!(third.host.process_id(), "pi-host-c");
+        assert_eq!(replaced.host.process_id(), "replacement");
         fleet.shutdown_all().await;
     }
 
@@ -3832,6 +3826,15 @@ mod tests {
                     .success()
             );
             // Even an observable empty Job is not a cross-Core exit receipt.
+            // Leader exit and the Job's zero-active-process observation are
+            // separate barriers; wait for the fixture's actual empty Job.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !child.tree_is_empty().unwrap() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("receipt fixture Job did not become empty after leader exit");
             assert!(child.tree_is_empty().unwrap());
             let handshake = root.join("live.pid");
             let mut live_command = tokio::process::Command::new(std::env::current_exe().unwrap());

@@ -25,7 +25,9 @@ export async function revealMessageQuote(quote: MessageQuoteSnapshot, root: HTML
   let selected: [number, number] | null
   if (quote.locator) {
     const { startScalar, endScalar, projectionDigest, projectionVersion } = quote.locator
-    selected = projectionVersion === 1 && startScalar >= 0 && endScalar > startScalar
+    // Old anchors remain valid only when their frozen visible text still matches.
+    // A changed CJK projection never falls back to guessing a new range.
+    selected = (projectionVersion === 1 || projectionVersion === 2) && startScalar >= 0 && endScalar > startScalar
       && await quoteProjectionDigest(projection.text) === projectionDigest
       && Array.from(projection.text).slice(startScalar, endScalar).join('') === quote.text
       ? [startScalar, endScalar] : null

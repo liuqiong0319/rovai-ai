@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawn, execFileSync } from 'node:child_process'
-import { mkdtemp, realpath, rm, mkdir, rename, writeFile, readdir, readFile as readAssetFile, cp, utimes, symlink } from 'node:fs/promises'
+import { mkdtemp, realpath, rm, mkdir, rename, writeFile, readdir, readFile as readAssetFile, cp, utimes, symlink, chmod } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { launchHost, within } from './host-test-client.mjs'
@@ -40,7 +40,56 @@ test('Desktop and Web share one Core while listener failure, revocation and stop
   try {
     await within(host.ready)
     assert.equal((await host.request('host.web.status')).enabled, false)
-    const initialToken = (await host.request('host.web.token')).administratorToken
+    const authPath = join(dataDir, 'web-auth.json')
+    let inheritedAcl
+    const fixtureAcl = (script, sddl = '') => execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+      `$ErrorActionPreference='Stop'; $p=$env:ROVAI_AUTH_FIXTURE; ${script}`], {
+      encoding: 'utf8', windowsHide: true, env: { ...process.env, ROVAI_AUTH_FIXTURE: authPath, ROVAI_AUTH_SDDL: sddl }
+    }).trim()
+    let inheritedBytes
+    if (process.platform === 'win32') {
+      // The actual Host/IPC seam must retain typed failures, never bootstrap a
+      // new Token after a failed read. All credentials here are synthetic.
+      await writeFile(authPath, '{broken')
+      await assert.rejects(host.request('host.web.token'), { code: 'HOST_WEB_AUTH_INVALID_CONTENT' })
+      assert.equal(await readAssetFile(authPath, 'utf8'), '{broken')
+      inheritedBytes = JSON.stringify({ version: 1, administratorToken: 'a'.repeat(64), sessions: [] })
+      await writeFile(authPath, inheritedBytes)
+      const originalAcl = fixtureAcl('([IO.File]::GetAccessControl($p)).Sddl')
+      fixtureAcl(`$acl=[IO.File]::GetAccessControl($p); $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User; $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'ReadData','Deny')); [IO.File]::SetAccessControl($p,$acl)`)
+      try {
+        await assert.rejects(host.request('host.web.token'), { code: 'HOST_WEB_AUTH_READ_FAILED' })
+      } finally {
+        fixtureAcl(`$acl=[IO.File]::GetAccessControl($p); $acl.SetSecurityDescriptorSddlForm($env:ROVAI_AUTH_SDDL,[Security.AccessControl.AccessControlSections]::Access); [IO.File]::SetAccessControl($p,$acl)`, originalAcl)
+      }
+      assert.equal(await readAssetFile(authPath, 'utf8'), inheritedBytes)
+      // Inherited ACL + extra administrator read ACE + no WRITE_DAC for its
+      // owner. Viewing credentials must request neither ACL repair nor writes.
+      fixtureAcl(`$acl=[IO.File]::GetAccessControl($p); $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'),'Read','Allow')); $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-3-4'),'ChangePermissions','Deny')); [IO.File]::SetAccessControl($p,$acl); if ($acl.AreAccessRulesProtected -or $acl.Access.Count -le 2) { throw 'Invalid inherited fixture' }`)
+      inheritedAcl = fixtureAcl('([IO.File]::GetAccessControl($p)).Sddl')
+    }
+    const directoryAcl = (script, sddl = '') => execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+      `$ErrorActionPreference='Stop'; $p=$env:ROVAI_AUTH_FIXTURE; ${script}`], {
+      encoding: 'utf8', windowsHide: true, env: { ...process.env, ROVAI_AUTH_FIXTURE: dataDir, ROVAI_AUTH_SDDL: sddl }
+    }).trim()
+    let originalDirectoryAcl
+    if (process.platform === 'win32') {
+      originalDirectoryAcl = directoryAcl('[IO.Directory]::GetAccessControl($p).Sddl')
+      directoryAcl(`$acl=[IO.Directory]::GetAccessControl($p); $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User; $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'CreateFiles','Deny')); [IO.Directory]::SetAccessControl($p,$acl)`)
+    }
+    let initialToken
+    try {
+      if (originalDirectoryAcl) await assert.rejects(writeFile(join(dataDir, '.read-only-probe'), 'synthetic'), error => ['EACCES', 'EPERM'].includes(error.code))
+      initialToken = (await host.request('host.web.token')).administratorToken
+    }
+    finally {
+      if (originalDirectoryAcl) directoryAcl(`$acl=[IO.Directory]::GetAccessControl($p); $acl.SetSecurityDescriptorSddlForm($env:ROVAI_AUTH_SDDL,[Security.AccessControl.AccessControlSections]::Access); [IO.Directory]::SetAccessControl($p,$acl)`, originalDirectoryAcl)
+    }
+    if (process.platform === 'win32') {
+      assert.equal(initialToken, 'a'.repeat(64))
+      assert.equal(await readAssetFile(authPath, 'utf8'), inheritedBytes)
+      assert.equal(fixtureAcl('([IO.File]::GetAccessControl($p)).Sddl'), inheritedAcl)
+    }
     assert.match(initialToken, /^[0-9a-f]{64}$/)
     assert.equal((await host.request('host.web.token')).administratorToken, initialToken, 'local token exists before the first start')
     assert.ok((await host.request('app.info')).dataDir)
@@ -111,6 +160,20 @@ test('Desktop and Web share one Core while listener failure, revocation and stop
       assert.equal(response.status, expected, path)
       assert.equal(response.headers.get('cache-control'), 'no-store')
       assert.equal(response.headers.get('set-cookie'), null)
+    }
+    if (process.platform === 'win32') {
+      const before = await readAssetFile(authPath)
+      await chmod(authPath, 0o444)
+      try {
+        const rejected = await request('login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ protocolVersion: 4, administratorToken: administrator }) })
+        assert.equal(rejected.status, 503)
+        const failure = await rejected.json()
+        assert.equal(failure.error.code, 'session_storage_unavailable')
+        assert.match(failure.error.message, /无法保存登录状态/)
+        assert.equal(failure.error.message.includes(administrator), false)
+        assert.deepEqual(await readAssetFile(authPath), before)
+        assert.equal((await host.request('host.web.status')).sessions, 0)
+      } finally { await chmod(authPath, 0o666) }
     }
     const first = await login()
     assert.equal(first.protocolVersion, 4)
@@ -612,7 +675,7 @@ test('Desktop and Web share one Core while listener failure, revocation and stop
 
 // This process owner proves that both Host entrances drive persisted schedules
 // without a Renderer tick. The ordinary Delivery scheduler may leave the work
-// waiting, claim it into an AgentRun, or record the missing Runtime configuration;
+// waiting, claim it into an AgentRun, or settle the missing Runtime configuration;
 // domain tests own execution and recovery.
 test('Host clock consumes scheduled occurrences with Web stopped and in standalone mode', { timeout: 180_000 }, async () => {
   const fixture = await realpath(await mkdtemp(join(tmpdir(), 'rovai-host-clock-')))
@@ -682,7 +745,13 @@ test('Host clock consumes scheduled occurrences with Web stopped and in standalo
       const runs = rows(id)
       assert.equal(runs.length, 1)
       assert.notEqual(runs[0].reason, 'missed', 'a live Host must claim the due occurrence')
-      assert.equal(runs[0].status, 'running')
+      // Event-driven scheduling may settle the missing-Runtime execution before
+      // this read. Accept only that exact terminal outcome, not arbitrary failure.
+      assert.ok(['running', 'failed'].includes(runs[0].status), JSON.stringify(runs[0]))
+      if (runs[0].status === 'failed') {
+        assert.equal(runs[0].reason, 'execution_failed', JSON.stringify(runs[0]))
+        assert.equal(runs[0].delivery_status, 'failed', JSON.stringify(runs[0]))
+      }
       assert.ok(runs[0].camp_id, 'an admitted occurrence owns a Camp')
       assert.ok(runs[0].trigger_message_id, 'an admitted occurrence owns its system message')
       assert.ok(runs[0].trigger_delivery_id, 'an admitted occurrence owns its Delivery')

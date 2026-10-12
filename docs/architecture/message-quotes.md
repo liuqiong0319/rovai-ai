@@ -2,7 +2,7 @@
 document_type: architecture
 authority: message-quote-ownership-and-projection
 status: accepted
-last_updated: 2026-09-09
+last_updated: 2026-10-11
 ---
 
 # 消息选文引用
@@ -16,5 +16,10 @@ Renderer 只在单条真实消息正文中捕获选区，排除作者、操作�
 Context 在已有统一投影入口添加 quotes，与当前问题分开，并冻结引用证据及完整输入摘要。快照不触发来源父链、派发或 Skill；只有明确 Reply 继续既有语义。Runtime adapter 只运输 Core 已冻结字节，不自行生成引用。
 
 来源回跳先定位当前会话的真实消息，再用随快照冻结的投影摘要与 Unicode scalar 范围映射到 DOM，按涉及的完整视觉行铺底色。布局变化重算，内容变化或重复选文无法唯一确认时不猜测位置。旧快照可按唯一完整选文回跳，来源失效不影响历史选文。定位信息只供 Renderer，不进入模型上下文。
+
+新捕获沿用 locator 的 projectionVersion 机制发布 CJK 兼容投影 v2；Renderer 的 remark 扩展与 Core 的
+Comrak 解析使用同一组对照用例，用户纯文本保持原义。已有 v1 locator 仅在当前摘要、范围和文本均匹配时高亮；
+失配只影响高亮，引用仍使用冻结快照展示与发送。无 locator 的唯一完整匹配保留，不引入模糊定位。
+历史消息与引用不迁移，不新增解析服务、修复队列或第二份正文存储。
 
 草稿与历史共用紧凑引用标签和非模态悬浮气泡；鼠标移入气泡保持打开，整条选文行直接回跳。键盘 focus/ArrowDown/Tab、Escape 与触屏点击使用同一入口；只有草稿可逐段直接移除，不提供撤销入口，移除最后一段后隐藏标签与气泡。公共 Pending 编辑复用已加载的当前会话来源集合，私聊始终限定当前 Conversation。

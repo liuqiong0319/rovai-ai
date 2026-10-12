@@ -44,7 +44,7 @@ export class ExecutionWindow {
   private active = true
   private generation = 0
   private refreshing = false
-  private queuedRefresh: (() => boolean) | null = null
+  private queuedRefresh: { accept: () => boolean; retryInitial: boolean } | null = null
   private pending = new Map<string, Promise<Page>>()
   private sizes = new WeakMap<Block, number>()
   private viewport: [number, number] | null = null
@@ -171,10 +171,17 @@ export class ExecutionWindow {
     }
   }
 
-  async refresh(accept: () => boolean = () => true): Promise<void> {
-    if (!this.active || !this.loaded) return
+  async refresh(accept: () => boolean = () => true, retryInitial = false): Promise<void> {
+    if (!this.active) return
+    // Keep invalidations received during the first page, before loaded becomes true.
+    if (this.refreshing || this.loading) { this.queuedRefresh = { accept, retryInitial }; return }
+    if (!this.loaded) {
+      // A tail has no manual retry UI. Retry on new information, never on a timer
+      // or before the first visible read; historical windows retain explicit retry.
+      if (retryInitial && this.error !== null) await this.read('latest')
+      return
+    }
     if (this.hasNewer) { this.latestDirty = true; return }
-    if (this.refreshing || this.loading) { this.queuedRefresh = accept; return }
     const generation = this.generation
     this.refreshing = true
     try {
@@ -228,13 +235,13 @@ export class ExecutionWindow {
       if (generation === this.generation) {
         this.refreshing = false
         const queued = this.queuedRefresh; this.queuedRefresh = null
-        if (queued) void this.refresh(queued)
+        if (queued) void this.refresh(queued.accept, queued.retryInitial)
       }
     }
   }
   private afterRead(): void {
     const queued = this.queuedRefresh; this.queuedRefresh = null
-    if (queued) void this.refresh(queued)
+    if (queued) void this.refresh(queued.accept, queued.retryInitial)
     else void this.prefetch()
   }
   private async prefetch(): Promise<void> {

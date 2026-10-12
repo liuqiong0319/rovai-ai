@@ -71,6 +71,28 @@ async fn bounded_output(command: &mut Command, deadline: Duration) -> Result<Bou
     .await
 }
 
+pub(crate) async fn read_opencode_version(path: &Path) -> Result<String> {
+    let mut command = runtime_command(path, Some(AdapterKind::OpencodeCli));
+    command.arg("--version");
+    let output = bounded_output(&mut command, Duration::from_secs(15))
+        .await
+        .context("OpenCode initialization could not read the selected executable's version")?;
+    if !output.status.success() {
+        bail!(
+            "OpenCode version read failed: {}",
+            command_detail(
+                &output.stdout.bytes,
+                &output.stderr.bytes,
+                "selected executable returned an error"
+            )
+        );
+    }
+    let version = first_nonempty_line(&output.stdout.bytes, &output.stderr.bytes)
+        .context("OpenCode version read returned no identity")?;
+    crate::opencode_compat::Generation::require(Some(&version))?;
+    Ok(version)
+}
+
 const REQUIRED_CODEX_CAPABILITIES: &[(&str, &str, &str)] = &[
     ("model.list", "ClientRequest.json", "\"model/list\""),
     ("thread.start", "ClientRequest.json", "\"thread/start\""),
@@ -212,14 +234,8 @@ pub async fn acp_capability_probe_at_for_purpose(
 ) -> AcpCapabilityProbe {
     let mut probe = acp_probe_at(path, kind, acp_deep_session_probe_enabled(kind), purpose).await;
     redact_probe(kind, &mut probe.result);
-    if let Some(redactor) = probe_redactor(kind) {
-        for value in [&mut probe.initialize_result, &mut probe.session_result]
-            .into_iter()
-            .flatten()
-        {
-            redactor.value(value);
-        }
-    }
+    // Capability/session results remain protocol data for catalog and compatibility
+    // consumers. Only the diagnostic view above is scrubbed.
     probe
 }
 
@@ -232,9 +248,11 @@ fn probe_redactor(kind: AdapterKind) -> Option<rovai_core::runtime_custom_api::C
 
 fn redact_probe(kind: AdapterKind, result: &mut AgentRuntimeProbeResult) {
     if let Some(redactor) = probe_redactor(kind) {
-        let mut value = serde_json::to_value(&*result).expect("serializable probe");
-        redactor.value(&mut value);
-        *result = serde_json::from_value(value).expect("redaction preserves the probe shape");
+        result.detail = result.detail.as_deref().map(|text| redactor.text(text));
+        if let Some(failure) = &mut result.failure {
+            failure.summary = redactor.text(&failure.summary);
+            failure.detail = failure.detail.as_deref().map(|text| redactor.text(text));
+        }
     }
 }
 
@@ -287,12 +305,30 @@ pub fn catalog_refresh_evidence_current(
 }
 
 /// Catalog-only branch of the same check task. Returns models, never Ready evidence.
-pub async fn refresh_model_catalog(path: &Path, kind: AdapterKind) -> Result<Vec<ModelDescriptor>> {
+#[derive(Debug)]
+pub struct RefreshedModelCatalog {
+    pub models: Vec<ModelDescriptor>,
+    pub dsh_preparation: Option<Value>,
+}
+
+pub async fn refresh_model_catalog(
+    path: &Path,
+    kind: AdapterKind,
+) -> Result<RefreshedModelCatalog> {
+    refresh_model_catalog_for_selection(path, kind, None).await
+}
+
+pub async fn refresh_model_catalog_for_selection(
+    path: &Path,
+    kind: AdapterKind,
+    target: Option<(&str, Option<crate::agent_profile::DshModelSource>)>,
+) -> Result<RefreshedModelCatalog> {
     let purpose = RuntimeLaunchPurpose::AvailabilityCheck;
     if !runtime_launch_allowed(kind, purpose) {
         bail!(runtime_launch_disallowed_detail(purpose));
     }
-    match kind {
+    let mut dsh_preparation = None;
+    let models = match kind {
         AdapterKind::CodexCli => {
             rovai_core::agent_runtime_adapter::codex_models(&codex_model_catalog(path).await?)
         }
@@ -314,7 +350,14 @@ pub async fn refresh_model_catalog(path: &Path, kind: AdapterKind) -> Result<Vec
             Ok(rovai_core::agent_runtime_adapter::antigravity_models(ids))
         }
         _ => {
-            let (_, session, _) = run_acp_probe_with_scope(path, kind, true, purpose, true).await?;
+            let (_, session, _) =
+                run_acp_probe_with_scope(path, kind, true, purpose, true, target, None).await?;
+            if kind == AdapterKind::DeepseekHarness {
+                dsh_preparation = session
+                    .as_ref()
+                    .and_then(|session| session.pointer("/_meta/rovaiDshModels"))
+                    .cloned();
+            }
             let mut models = rovai_core::agent_runtime_adapter::acp_model_catalog_for_adapter(
                 kind,
                 session
@@ -329,7 +372,11 @@ pub async fn refresh_model_catalog(path: &Path, kind: AdapterKind) -> Result<Vec
             }
             Ok(models)
         }
-    }
+    }?;
+    Ok(RefreshedModelCatalog {
+        models,
+        dsh_preparation,
+    })
 }
 
 pub async fn pi_capability_probe_at(path: &Path) -> PiCapabilityProbe {
@@ -1526,6 +1573,8 @@ async fn acp_probe_at(
             | AdapterKind::TraeCnCli
             | AdapterKind::GrokBuild
             | AdapterKind::DeepseekHarness
+            | AdapterKind::CommandCodeCli
+            | AdapterKind::ClineCli
             | AdapterKind::CursorAgent
             | AdapterKind::KimiCodeCli
             | AdapterKind::ZcodeApp
@@ -1697,6 +1746,8 @@ async fn acp_probe_at(
         && !grok_build_minimum_version_satisfied(reported_version.as_deref()))
         || (kind == AdapterKind::DeepseekHarness
             && !crate::dsh::supported_version(reported_version.as_deref()))
+        || (kind == AdapterKind::CommandCodeCli
+            && !crate::command_code_acp::supported_version(reported_version.as_deref()))
     {
         return AcpCapabilityProbe {
             result: agent_probe_result(
@@ -1708,7 +1759,9 @@ async fn acp_probe_at(
                 Vec::new(),
                 vec![format!(
                     "runtime.version>={}",
-                    if kind == AdapterKind::DeepseekHarness {
+                    if kind == AdapterKind::CommandCodeCli {
+                        crate::command_code_acp::MINIMUM_VERSION
+                    } else if kind == AdapterKind::DeepseekHarness {
                         crate::dsh::MINIMUM_VERSION
                     } else {
                         GROK_BUILD_MINIMUM_VERSION_LABEL
@@ -1717,7 +1770,9 @@ async fn acp_probe_at(
                 Some(format!(
                     "{} >= {} is required.",
                     kind.display_name(),
-                    if kind == AdapterKind::DeepseekHarness {
+                    if kind == AdapterKind::CommandCodeCli {
+                        crate::command_code_acp::MINIMUM_VERSION
+                    } else if kind == AdapterKind::DeepseekHarness {
                         crate::dsh::MINIMUM_VERSION
                     } else {
                         GROK_BUILD_MINIMUM_VERSION_LABEL
@@ -1729,7 +1784,16 @@ async fn acp_probe_at(
             session_result: None,
         };
     }
-    let probe = run_acp_probe(&canonical, kind, include_session, purpose).await;
+    let probe = run_acp_probe_with_scope(
+        &canonical,
+        kind,
+        include_session,
+        purpose,
+        false,
+        None,
+        reported_version.as_deref(),
+    )
+    .await;
     match probe {
         Ok((initialize_result, session_result, grok_resume_verified)) => {
             let mut capabilities = acp_observed_capabilities(
@@ -1757,8 +1821,10 @@ async fn acp_probe_at(
             } else {
                 AgentRuntimeProbeStatus::MissingCapabilities
             };
-            let detail = if matches!(kind, AdapterKind::ZcodeApp | AdapterKind::DeepseekHarness)
-                && missing.is_empty()
+            let mut detail = if matches!(
+                kind,
+                AdapterKind::ZcodeApp | AdapterKind::DeepseekHarness | AdapterKind::CommandCodeCli
+            ) && missing.is_empty()
             {
                 Some("Native configuration and basic connection checked in a temporary workspace; no prompt sent. Model generation, balance and advanced capabilities were not tested. Native initialization may access the network and write state.".to_string())
             } else {
@@ -1769,6 +1835,13 @@ async fn acp_probe_at(
                     )
                 })
             };
+            if kind == AdapterKind::DeepseekHarness
+                && let Some(diagnostic) = initialize_result
+                    .pointer("/_meta/rovaiDshModels")
+                    .and_then(crate::dsh::preparation_diagnostic)
+            {
+                detail = Some(format!("{} {diagnostic}", detail.unwrap_or_default()));
+            }
             AcpCapabilityProbe {
                 result: agent_probe_result(
                     kind.as_str(),
@@ -1807,21 +1880,25 @@ async fn acp_probe_at(
     }
 }
 
+#[cfg(all(test, feature = "extended-tests"))]
 async fn run_acp_probe(
     path: &Path,
     kind: AdapterKind,
     include_session: bool,
     purpose: RuntimeLaunchPurpose,
 ) -> Result<(Value, Option<Value>, bool)> {
-    run_acp_probe_with_scope(path, kind, include_session, purpose, false).await
+    run_acp_probe_with_scope(path, kind, include_session, purpose, false, None, None).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_acp_probe_with_scope(
     path: &Path,
     kind: AdapterKind,
     include_session: bool,
     purpose: RuntimeLaunchPurpose,
     catalog_only: bool,
+    target: Option<(&str, Option<crate::agent_profile::DshModelSource>)>,
+    reported_version: Option<&str>,
 ) -> Result<(Value, Option<Value>, bool)> {
     if !runtime_launch_allowed(kind, purpose) {
         bail!(runtime_launch_disallowed_detail(purpose));
@@ -1836,7 +1913,23 @@ async fn run_acp_probe_with_scope(
         write_kiro_additive_agent_config(&probe_root, &Default::default())?;
     }
     let mut command = runtime_command(path, Some(kind));
-    configure_acp_command(&mut command, kind, false);
+    if kind == AdapterKind::DeepseekHarness {
+        crate::dsh::configure_probe(&mut command, &probe_root)?;
+    } else if kind == AdapterKind::OpencodeCli && catalog_only {
+        crate::opencode_compat::configure_catalog_command(&mut command);
+    } else {
+        let read_version;
+        let version = if kind == AdapterKind::OpencodeCli && reported_version.is_none() {
+            read_version = read_opencode_version(path).await?;
+            Some(read_version.as_str())
+        } else {
+            reported_version
+        };
+        configure_acp_command(&mut command, kind, false, version)?;
+    }
+    if kind == AdapterKind::ClineCli {
+        crate::cline::configure_native_environment(&mut command)?;
+    }
     if kind == AdapterKind::CodebuddyCli
         && let Ok(model) = env::var("ROVAI_CODEBUDDY_MODEL")
     {
@@ -1844,9 +1937,6 @@ async fn run_acp_probe_with_scope(
         if !model.is_empty() {
             command.arg("--model").arg(model);
         }
-    }
-    if kind == AdapterKind::KimiCodeCli {
-        crate::acp::configure_kimi_model_environment(&mut command)?;
     }
     let grok_byok_configured =
         kind == AdapterKind::GrokBuild && crate::acp::grok_native_byok_configured()?;
@@ -1867,6 +1957,18 @@ async fn run_acp_probe_with_scope(
     let result = {
         let (stdin, lines) = process.split_io()?;
         let exchange = async {
+            let model_preparation = if kind == AdapterKind::DeepseekHarness {
+                let prepared = crate::dsh::await_model_preparation(&probe_root).await?;
+                if !crate::dsh::model_inputs_unchanged(&prepared) {
+                    bail!("dsh_model_configuration_changed_during_preparation");
+                }
+                Some(prepared)
+            } else {
+                None
+            };
+            let dsh_options_context = (kind == AdapterKind::DeepseekHarness)
+                .then(|| crate::dsh::model_options_context(path))
+                .transpose()?;
             write_json_line(
                 stdin,
                 &json!({
@@ -1888,7 +1990,10 @@ async fn run_acp_probe_with_scope(
                 }),
             )
             .await?;
-            let initialize = read_rpc_result(lines, 1).await?;
+            let mut initialize = read_rpc_result(lines, 1).await?;
+            if let Some(preparation) = &model_preparation {
+                crate::dsh::annotate_session(&mut initialize, preparation);
+            }
             if initialize.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
                 bail!("Runtime did not negotiate ACP v1");
             }
@@ -1964,7 +2069,57 @@ async fn run_acp_probe_with_scope(
                 }),
             )
             .await?;
-            let session = read_rpc_result(lines, session_request_id).await?;
+            let mut session = read_rpc_result(lines, session_request_id).await?;
+            if let Some(preparation) = &model_preparation {
+                if !crate::dsh::model_inputs_unchanged(preparation) {
+                    bail!("dsh_model_configuration_changed_during_preparation");
+                }
+                crate::dsh::annotate_session(&mut session, preparation);
+            }
+            if let Some((model_id, source)) = target {
+                if kind != AdapterKind::DeepseekHarness {
+                    bail!("Target-model option discovery is only supported for DSH");
+                }
+                let preparation = model_preparation
+                    .as_ref()
+                    .context("DSH model preparation missing")?;
+                if !crate::dsh::selected_route_available(preparation, model_id, source) {
+                    bail!("所选 DSH 模型来源不可用；未切换到同名的其他来源");
+                }
+                let models =
+                    crate::agent_runtime_adapter::acp_model_catalog_for_adapter(kind, &session)?;
+                crate::agent_runtime_adapter::validate_live_model_selection(
+                    &models,
+                    model_id,
+                    &json!({}),
+                )?;
+                let default_model =
+                    crate::agent_runtime_adapter::acp_runtime_model_id_from_session(&session);
+                write_json_line(stdin, &json!({
+                    "jsonrpc": "2.0", "id": session_request_id + 1,
+                    "method": "session/set_config_option",
+                    "params": {"sessionId": session["sessionId"], "configId": "model", "value": model_id}
+                })).await?;
+                let selected = read_rpc_result(lines, session_request_id + 1).await?;
+                session = crate::agent_runtime_adapter::dsh_model_config_after_selection(
+                    &session, &selected, model_id,
+                )?;
+                if let Some(default_model) = default_model {
+                    session["_meta"]["rovaiDshDefaultModel"] = json!(default_model);
+                }
+                if !crate::dsh::model_inputs_unchanged(preparation) {
+                    bail!("dsh_model_configuration_changed_during_preparation");
+                }
+            }
+            if let Some(context) = dsh_options_context {
+                anyhow::ensure!(
+                    crate::dsh::model_options_context(path)? == context,
+                    "dsh_model_configuration_changed_during_preparation"
+                );
+                session["_meta"]["rovaiDshOptionsContext"] = json!(context);
+                session["_meta"]["rovaiDshOptionsObservedAt"] =
+                    json!(chrono::Utc::now().to_rfc3339());
+            }
             let session_id = session
                 .get("sessionId")
                 .and_then(Value::as_str)
@@ -2060,6 +2215,14 @@ async fn run_acp_probe_with_scope(
     };
     match result {
         Ok(result) => Ok(result),
+        Err(_) if matches!(kind, AdapterKind::CommandCodeCli) => {
+            // Native diagnostics and RPC error bodies can contain BYOK
+            // settings. The probe only publishes a stable failure category.
+            Err(anyhow::anyhow!(
+                "{} ACP probe failed; check its native provider configuration",
+                kind.as_str()
+            ))
+        }
         Err(error) if stderr.bytes.iter().any(|byte| !byte.is_ascii_whitespace()) => {
             let detail = String::from_utf8_lossy(&stderr.bytes);
             let bounded = detail.chars().take(4096).collect::<String>();
@@ -2108,6 +2271,36 @@ pub(crate) fn select_grok_noninteractive_auth_method(
         "Grok Build ACP did not advertise a non-interactive authentication method \
          (expected cached_token or xai.api_key; advertised: {advertised}). \
          Run `grok login` or `grok login --device-auth` before retrying account authentication"
+    )
+}
+
+pub(crate) async fn inspect_command_code_native_mcp_server_names(
+    executable: &Path,
+    cwd: &Path,
+) -> Result<BTreeSet<String>> {
+    if !runtime_launch_allowed(
+        AdapterKind::CommandCodeCli,
+        RuntimeLaunchPurpose::DispatchPreflight,
+    ) {
+        bail!("runtime_launch_disallowed:dispatch_preflight");
+    }
+    let mut command = runtime_command(executable, Some(AdapterKind::CommandCodeCli));
+    command
+        .args(["mcp", "list"])
+        .current_dir(cwd)
+        .env("COMMANDCODE_SKIP_UPDATES", "1")
+        .env("NO_COLOR", "1")
+        .env("FORCE_COLOR", "0");
+    let output = bounded_output(&mut command, Duration::from_secs(15))
+        .await
+        .map_err(|_| anyhow::anyhow!("command_code_native_mcp_inspection_failed"))?;
+    anyhow::ensure!(
+        output.status.success() && !output.stdout.truncated,
+        "command_code_native_mcp_inspection_failed"
+    );
+    crate::command_code_acp::native_mcp_names(
+        std::str::from_utf8(&output.stdout.bytes)
+            .context("command_code_native_mcp_list_invalid")?,
     )
 }
 
@@ -2486,10 +2679,15 @@ fn validate_trae_permission_request(
     Ok(())
 }
 
-pub fn configure_acp_command(command: &mut Command, kind: AdapterKind, allow_all: bool) {
+pub fn configure_acp_command(
+    command: &mut Command,
+    kind: AdapterKind,
+    allow_all: bool,
+    version: Option<&str>,
+) -> Result<()> {
     match kind {
         AdapterKind::OpencodeCli => {
-            command.args(["acp", "--pure", "--log-level", "ERROR"]);
+            crate::opencode_compat::Generation::require(version)?.configure_command(command);
         }
         AdapterKind::CopilotCli => {
             command.args([
@@ -2527,11 +2725,19 @@ pub fn configure_acp_command(command: &mut Command, kind: AdapterKind, allow_all
         AdapterKind::KimiCodeCli => {
             command.arg("acp");
         }
+        AdapterKind::CommandCodeCli => {
+            command.arg("acp").env("COMMANDCODE_SKIP_UPDATES", "1");
+        }
         AdapterKind::DeepseekHarness => {
             command.args(["--profile", "acp"]);
         }
         AdapterKind::GrokBuild => {
             configure_grok_acp_command(command, None);
+        }
+        AdapterKind::ClineCli => {
+            command
+                .arg("--acp")
+                .env("CLINE_SESSION_BACKEND_MODE", "local");
         }
         AdapterKind::CodexCli
         | AdapterKind::Pi
@@ -2539,6 +2745,7 @@ pub fn configure_acp_command(command: &mut Command, kind: AdapterKind, allow_all
         | AdapterKind::AntigravityApp
         | AdapterKind::ZcodeApp => {}
     }
+    Ok(())
 }
 
 pub(crate) fn configure_grok_acp_command(command: &mut Command, plugin_dir: Option<&Path>) {
@@ -2625,8 +2832,13 @@ fn acp_observed_capabilities(
             .to_string(),
         );
     }
-    if kind == AdapterKind::DeepseekHarness {
+    if matches!(
+        kind,
+        AdapterKind::DeepseekHarness | AdapterKind::CommandCodeCli
+    ) {
         capabilities.retain(|capability| capability != "workspace.additional_roots");
+    }
+    if kind == AdapterKind::DeepseekHarness {
         if let Some(session) = session
             && crate::agent_runtime_adapter::acp_model_catalog_from_session(session).is_ok()
         {
@@ -2637,6 +2849,22 @@ fn acp_observed_capabilities(
 }
 
 fn acp_required_capabilities(kind: AdapterKind) -> Vec<String> {
+    if matches!(kind, AdapterKind::CommandCodeCli) {
+        return [
+            "acp.initialize",
+            "session.new",
+            "session.prompt",
+            "session.cancel",
+            "session.update",
+            "session.load",
+            "session.set_config_option",
+            "structured_permission_request",
+            "mcp.additive_per_run",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    }
     if kind == AdapterKind::DeepseekHarness {
         return [
             "acp.initialize",
@@ -2742,6 +2970,8 @@ fn additive_acp_mcp_verified(kind: AdapterKind) -> bool {
             | AdapterKind::TraeCnCli
             | AdapterKind::GrokBuild
             | AdapterKind::DeepseekHarness
+            | AdapterKind::CommandCodeCli
+            | AdapterKind::ClineCli
     )
 }
 
@@ -3487,6 +3717,8 @@ pub fn find_adapter(kind: AdapterKind) -> Option<PathBuf> {
         AdapterKind::KimiCodeCli => (&["ROVAI_KIMI_BIN"][..], "kimi"),
         AdapterKind::GrokBuild => (&["ROVAI_GROK_BIN"][..], "grok"),
         AdapterKind::DeepseekHarness => (&["ROVAI_DEEPSEEK_HARNESS_BIN"][..], "dsh"),
+        AdapterKind::ClineCli => (&["ROVAI_CLINE_BIN"][..], "cline"),
+        AdapterKind::CommandCodeCli => (&["ROVAI_COMMAND_CODE_BIN"][..], "command-code"),
         AdapterKind::ZcodeApp => {
             return rovai_core::zcode::default_executables()
                 .into_iter()
@@ -3691,7 +3923,7 @@ for line in sys.stdin:
     // Owns command/process omission, not the model-row parser. The retained
     // full path is the baseline, and malformed refreshes must not fabricate success.
     #[tokio::test]
-    async fn antigravity_catalog_refresh_skips_version_and_help() {
+    async fn catalog_refresh_skips_version_and_help() {
         let root = env::temp_dir().join(format!("rovai-agy-catalog-{}", uuid::Uuid::new_v4()));
         let _cleanup = ProbeRootCleanup(root.clone());
         std::fs::create_dir_all(&root).unwrap();
@@ -3724,7 +3956,7 @@ esac
             .unwrap();
         let light_ms = light_started.elapsed().as_millis();
         assert_eq!(
-            models,
+            models.models,
             rovai_core::agent_runtime_adapter::antigravity_models(full.models)
         );
         assert_eq!(
@@ -3739,6 +3971,33 @@ esac
             refresh_model_catalog(&executable, AdapterKind::AntigravityApp)
                 .await
                 .is_err()
+        );
+        let executable = root.join("opencode");
+        std::fs::write(&executable, r#"#!/bin/sh
+root=$(/usr/bin/dirname "$0")
+printf '%s\n' "$*" >> "$root/opencode-calls"
+[ "$*" = "acp" ] || exit 91
+IFS= read -r initialize || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+IFS= read -r session || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"fixture","models":{"currentModelId":"fixture/model","availableModels":[{"modelId":"fixture/model","name":"Fixture"}]}}}'
+while IFS= read -r ignored; do :; done
+"#).unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let models = refresh_model_catalog(&executable, AdapterKind::OpencodeCli)
+            .await
+            .unwrap();
+        assert!(
+            models
+                .models
+                .iter()
+                .any(|model| model.id == "fixture/model")
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("opencode-calls")).unwrap(),
+            "acp\n"
         );
     }
     #[tokio::test]
@@ -3791,9 +4050,63 @@ esac
 
     #[test]
     fn additive_acp_launch_shapes_match_the_verified_cli_contracts() {
+        for (version, v1) in [
+            ("1.18.32", true),
+            ("opencode v1.99.1", true),
+            ("2.0.26", false),
+            ("opencode v2.99.1-preview.2", false),
+        ] {
+            let mut command = Command::new("/selected/opencode");
+            configure_acp_command(&mut command, AdapterKind::OpencodeCli, false, Some(version))
+                .unwrap();
+            let args = command
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().to_string())
+                .collect::<Vec<_>>();
+            if v1 {
+                assert_eq!(args, ["acp", "--log-level", "ERROR"]);
+            } else {
+                assert_eq!(args, ["acp", "--log-level", "error"]);
+            }
+        }
+        for pure in ["0", "1"] {
+            let mut command = Command::new("/selected/opencode");
+            command.env("OPENCODE_PURE", pure);
+            configure_acp_command(
+                &mut command,
+                AdapterKind::OpencodeCli,
+                false,
+                Some("1.18.32"),
+            )
+            .unwrap();
+            assert!(!command.as_std().get_args().any(|arg| arg == "--pure"));
+            assert_eq!(
+                command
+                    .as_std()
+                    .get_envs()
+                    .find(|(key, _)| *key == "OPENCODE_PURE")
+                    .and_then(|(_, value)| value),
+                Some(std::ffi::OsStr::new(pure))
+            );
+        }
+        for version in [
+            None,
+            Some("unknown"),
+            Some("0.0.0-next"),
+            Some("3.0.0"),
+            Some("2.0.bad"),
+        ] {
+            let mut command = Command::new("/selected/opencode");
+            assert!(
+                configure_acp_command(&mut command, AdapterKind::OpencodeCli, false, version)
+                    .is_err()
+            );
+            assert_eq!(command.as_std().get_args().count(), 0);
+        }
         let arguments = |kind| {
             let mut command = Command::new("/usr/bin/true");
-            configure_acp_command(&mut command, kind, false);
+            configure_acp_command(&mut command, kind, false, None).unwrap();
             command
                 .as_std()
                 .get_args()
@@ -3806,6 +4119,22 @@ esac
         assert_eq!(arguments(AdapterKind::TraeCnCli), ["acp", "serve"]);
         assert_eq!(arguments(AdapterKind::CursorAgent), ["acp"]);
         assert_eq!(arguments(AdapterKind::KimiCodeCli), ["acp"]);
+        assert_eq!(arguments(AdapterKind::CommandCodeCli), ["acp"]);
+        assert_eq!(arguments(AdapterKind::ClineCli), ["--acp"]);
+        assert_eq!(
+            crate::command_code_acp::native_mcp_names("\nNo MCP servers configured\n").unwrap(),
+            BTreeSet::new()
+        );
+        assert_eq!(crate::command_code_acp::native_mcp_names("MCP Servers\n NAME TYPE SCOPE AUTH STATUS\n native stdio user - enabled\n disabled http project x disabled\n Total: 2 servers\n").unwrap(),
+            BTreeSet::from(["native".to_owned(), "disabled".to_owned()]));
+        for invalid in [
+            "NAME TYPE SCOPE AUTH STATUS\nnative stdio project x enabled",
+            "NAME TYPE SCOPE AUTH STATUS\nTotal: 9 servers",
+            "unknown format",
+            "\x1b[31mNo MCP servers configured",
+        ] {
+            assert!(crate::command_code_acp::native_mcp_names(invalid).is_err());
+        }
         assert_eq!(
             arguments(AdapterKind::GrokBuild),
             ["--no-auto-update", "agent", "--no-leader", "stdio"]
@@ -3815,7 +4144,7 @@ esac
             ["acp", "--agent", KIRO_ADDITIVE_AGENT_NAME]
         );
         let mut trusted_kiro = Command::new("/usr/bin/true");
-        configure_acp_command(&mut trusted_kiro, AdapterKind::KiroCli, true);
+        configure_acp_command(&mut trusted_kiro, AdapterKind::KiroCli, true, None).unwrap();
         assert_eq!(
             trusted_kiro
                 .as_std()

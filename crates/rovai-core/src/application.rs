@@ -2009,6 +2009,10 @@ struct CheckProductRuntimeParams {
     runtime_kind: rovai_core::agent_profile::AdapterKind,
     #[serde(default)]
     wait_for_refresh: bool,
+    model_id: Option<String>,
+    #[serde(default)]
+    cache_only: bool,
+    dsh_source: Option<crate::agent_profile::DshModelSource>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2187,9 +2191,17 @@ struct RuntimeCheckActivity {
     running: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DshOptionsTarget {
+    model_id: String,
+    source: Option<crate::agent_profile::DshModelSource>,
+    context: String,
+}
+
 struct RuntimeCheckRequest {
     search: Arc<RuntimeSearchEnvironment>,
     startup_preview: Option<Arc<startup_settings::StartupPreview>>,
+    model_target: Option<DshOptionsTarget>,
     runtime_kind: AdapterKind,
     purpose: RuntimeLaunchPurpose,
     trigger: RuntimeCheckTrigger,
@@ -2200,6 +2212,7 @@ struct RuntimeCheckRequest {
 struct RuntimeCheckAttempt {
     search: Arc<RuntimeSearchEnvironment>,
     startup_preview: Option<Arc<startup_settings::StartupPreview>>,
+    model_target: Option<DshOptionsTarget>,
     attempt_id: String,
     runtime_kind: AdapterKind,
     purpose: RuntimeLaunchPurpose,
@@ -2222,7 +2235,10 @@ impl RuntimeCheckAttempt {
     fn accepts(&self, request: &RuntimeCheckRequest) -> bool {
         request.startup_preview.is_none()
             && self.startup_preview.is_none()
+            && self.model_target == request.model_target
             && self.runtime_kind == request.runtime_kind
+            && (self.runtime_kind != AdapterKind::Pi
+                || self.catalog_only == (request.trigger == RuntimeCheckTrigger::CatalogOpen))
             && self.search.generation() == request.search.generation()
     }
 }
@@ -2401,6 +2417,8 @@ struct Core {
     kimi_code_cli: AcpCliRuntimeAdapter,
     grok_build: AcpCliRuntimeAdapter,
     deepseek_harness: AcpCliRuntimeAdapter,
+    cline_cli: AcpCliRuntimeAdapter,
+    command_code_cli: AcpCliRuntimeAdapter,
     zcode_app: AcpCliRuntimeAdapter,
     runtime_fleet: Arc<AgentRuntimeFleetManager>,
     builtin_tool_leases: Arc<BuiltinToolLeaseRegistry>,
@@ -2754,6 +2772,8 @@ fn runtime_display_name(kind: AdapterKind) -> &'static str {
         AdapterKind::KimiCodeCli => "Kimi Code",
         AdapterKind::GrokBuild => "Grok Build",
         AdapterKind::DeepseekHarness => "DeepSeek Harness",
+        AdapterKind::ClineCli => "Cline",
+        AdapterKind::CommandCodeCli => "Command Code",
         AdapterKind::AntigravityApp => "Antigravity",
         AdapterKind::ZcodeApp => "ZCode",
     }
@@ -3773,7 +3793,11 @@ impl Core {
             .unwrap_or(RuntimeModelCatalogCacheStatus::Unavailable);
         let refresh_status = match cache_status {
             RuntimeModelCatalogCacheStatus::Fresh => "not_required",
-            _ if !wait_for_refresh
+            // Pi keeps cached entries visible in the picker while this request
+            // awaits the shared observation. Its outcome needs no health event
+            // or persisted health diagnostic to reach every waiting picker.
+            _ if kind != AdapterKind::Pi
+                && !wait_for_refresh
                 && initial.as_ref().is_some_and(|installation| {
                     installation.model_catalog_can_display()
                         && installation
@@ -3843,7 +3867,9 @@ impl Core {
                 },
                 "models": [],
                 "refreshStatus": refresh_status,
-                "diagnosticCode": diagnostic.map(|value| value.diagnostic_code),
+                "diagnosticCode": if kind == AdapterKind::Pi {
+                    (refresh_status == "failed").then(|| "runtime_model_catalog_refresh_failed".to_string())
+                } else { diagnostic.map(|value| value.diagnostic_code) },
             }));
         };
         let models = if installation.model_catalog_can_display() {
@@ -3860,13 +3886,149 @@ impl Core {
             "cache": installation.model_catalog,
             "models": models,
             "refreshStatus": refresh_status,
-            "diagnosticCode": installation
+            "diagnosticCode": if kind == AdapterKind::Pi {
+                (refresh_status == "failed").then(|| "runtime_model_catalog_refresh_failed".to_string())
+            } else { installation
                 .last_probe_attempt
                 .as_ref()
                 .filter(|attempt| attempt.status == "failed")
                 .and_then(|attempt| attempt.diagnostic_code.clone())
-                .or_else(|| diagnostic.map(|value| value.diagnostic_code)),
+                .or_else(|| diagnostic.map(|value| value.diagnostic_code)) },
         }))
+    }
+
+    async fn dsh_model_options_payload(
+        &self,
+        model_id: &str,
+        source: Option<crate::agent_profile::DshModelSource>,
+    ) -> Result<(Value, String, bool)> {
+        let kind = AdapterKind::DeepseekHarness;
+        let search = self.runtime_search_environment.read().await.clone();
+        let path = {
+            let database = self.database.lock().await;
+            AgentProfileService::default()
+                .managed_installation(&database, kind, "default")?
+                .context("DSH installation is unavailable")?
+                .executable_path
+        };
+        // Configuration and executable identity are local observations, never a probe.
+        let context = with_runtime_configuration(kind, &search, async {
+            crate::dsh::model_options_context(Path::new(&path))
+        })
+        .await?;
+        let _update = self
+            .runtime_check_update_guard(&search)
+            .await
+            .context("DSH configuration changed during cache validation")?;
+        let mut payload = self
+            .runtime_model_catalog_payload(kind, "not_required")
+            .await?;
+        let catalog_valid = matches!(payload["cache"]["status"].as_str(), Some("fresh" | "stale"));
+        let mut fresh = false;
+        if let Some(models) = payload["models"].as_array_mut() {
+            for model in models {
+                let identity_matches =
+                    catalog_valid && model["runtimeMetadata"]["dshOptionsContext"] == context;
+                if !identity_matches {
+                    // Retain history, but never describe a previous context as confirmed.
+                    model["runtimeMetadata"]["dshOptionsResolved"] = json!(false);
+                }
+                if model["id"] == model_id
+                    && model["runtimeMetadata"]["dshSource"]
+                        == json!(source.unwrap_or(crate::agent_profile::DshModelSource::Native))
+                    && model["runtimeMetadata"]["dshOptionsResolved"] == true
+                {
+                    fresh = model["runtimeMetadata"]["dshOptionsObservedAt"]
+                        .as_str()
+                        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                        .is_some_and(|at| {
+                            let age = chrono::Utc::now().signed_duration_since(at);
+                            age >= chrono::Duration::zero() && age < chrono::Duration::seconds(60)
+                        });
+                }
+            }
+        }
+        payload["selectedModelId"] = json!(model_id);
+        payload["refreshStatus"] = json!(if fresh { "not_required" } else { "deferred" });
+        Ok((payload, context, fresh))
+    }
+
+    async fn open_dsh_model_options(
+        &self,
+        model_id: &str,
+        source: Option<crate::agent_profile::DshModelSource>,
+        cache_only: bool,
+    ) -> Result<Value> {
+        let kind = AdapterKind::DeepseekHarness;
+        if let Some(blocker) = current_runtime_platform_blocker(kind) {
+            anyhow::bail!("{}: {}", blocker.code, blocker.payload);
+        }
+        anyhow::ensure!(
+            !model_id.trim().is_empty(),
+            "DSH target model must not be empty"
+        );
+        let (cached, context, fresh) = self.dsh_model_options_payload(model_id, source).await?;
+        if fresh || cache_only {
+            return Ok(cached);
+        }
+        let result = self
+            .await_runtime_check_target(
+                kind,
+                RuntimeLaunchPurpose::AvailabilityCheck,
+                RuntimeCheckTrigger::CatalogOpen,
+                Some(DshOptionsTarget {
+                    model_id: model_id.to_owned(),
+                    source,
+                    context,
+                }),
+            )
+            .await;
+        let (mut payload, _, _) = self.dsh_model_options_payload(model_id, source).await?;
+        payload["refreshStatus"] = json!(match result {
+            Ok(RuntimeCheckOutcome::Ready) => "completed",
+            Ok(RuntimeCheckOutcome::Superseded) => "deferred",
+            _ => "failed",
+        });
+        Ok(payload)
+    }
+
+    async fn refresh_dsh_model_options(
+        &self,
+        search: Arc<RuntimeSearchEnvironment>,
+        target: DshOptionsTarget,
+    ) -> Result<RuntimeCheckOutcome> {
+        let (_, context, fresh) = self
+            .dsh_model_options_payload(&target.model_id, target.source)
+            .await?;
+        if context != target.context {
+            return Ok(RuntimeCheckOutcome::Superseded);
+        }
+        if fresh {
+            return Ok(RuntimeCheckOutcome::Ready);
+        }
+        let kind = AdapterKind::DeepseekHarness;
+        let selection = Some((target.model_id.as_str(), target.source));
+        if let Some(outcome) = self
+            .refresh_verified_runtime_catalog_for_selection(kind, search.clone(), selection)
+            .await?
+        {
+            return Ok(outcome);
+        }
+        // Reuse the existing readiness fallback only when no verified installation exists.
+        let outcome = self
+            .run_product_runtime_resolution_in_environment(
+                kind,
+                RuntimeLaunchPurpose::AvailabilityCheck,
+                tokio::time::Instant::now() + RUNTIME_CHECK_TOTAL_DEADLINE,
+                search.clone(),
+            )
+            .await?;
+        if outcome != RuntimeCheckOutcome::Ready {
+            return Ok(outcome);
+        }
+        self.refresh_verified_runtime_catalog_for_selection(kind, search, selection)
+            .await
+            .map(|outcome| outcome.unwrap_or(RuntimeCheckOutcome::Superseded))
     }
 
     async fn record_runtime_check_manager_failure(
@@ -3922,6 +4084,7 @@ impl Core {
             .send(RuntimeCheckRequest {
                 search: self.runtime_search_environment.read().await.clone(),
                 startup_preview: None,
+                model_target: None,
                 runtime_kind: kind,
                 purpose,
                 trigger,
@@ -3941,6 +4104,17 @@ impl Core {
         purpose: RuntimeLaunchPurpose,
         trigger: RuntimeCheckTrigger,
     ) -> Result<RuntimeCheckOutcome> {
+        self.await_runtime_check_target(kind, purpose, trigger, None)
+            .await
+    }
+
+    async fn await_runtime_check_target(
+        &self,
+        kind: AdapterKind,
+        purpose: RuntimeLaunchPurpose,
+        trigger: RuntimeCheckTrigger,
+        model_target: Option<DshOptionsTarget>,
+    ) -> Result<RuntimeCheckOutcome> {
         if let Some(blocker) = current_runtime_platform_blocker(kind) {
             anyhow::bail!("{}: {}", blocker.code, blocker.payload);
         }
@@ -3955,6 +4129,7 @@ impl Core {
             .send(RuntimeCheckRequest {
                 search,
                 startup_preview: None,
+                model_target,
                 runtime_kind: kind,
                 purpose,
                 trigger,
@@ -4126,6 +4301,29 @@ impl Core {
         {
             let database = self.database.lock().await;
             checks.push(database_integrity_check(&database));
+            match rovai_core::member_environment::legacy_list(database.connection()) {
+                Ok(legacy) => {
+                    for item in legacy.as_array().into_iter().flatten() {
+                        let kind = item["runtimeKind"].as_str().unwrap_or_default();
+                        checks.push(DiagnosticCheck::new(format!("legacy-environment:{kind}"), DiagnosticGroup::ManagedContent,
+                        "legacy_runtime_environment", kind,
+                        if item["handled"]==true {DiagnosticStatus::Ok} else {DiagnosticStatus::Attention},
+                        "runtime_environment_moved_to_members", "Environment settings moved from Agents to Teammates; manually migrate the values still needed")
+                        .with_subject_id(kind)
+                        .with_fact("variableCount",item["count"].to_string())
+                        .with_fact("identity",item["identity"].as_str().unwrap_or_default()));
+                    }
+                }
+                Err(_) => checks.push(DiagnosticCheck::new(
+                    "legacy-environment",
+                    DiagnosticGroup::ManagedContent,
+                    "legacy_runtime_environment_unavailable",
+                    "environment",
+                    DiagnosticStatus::Unknown,
+                    "runtime_environment_legacy_unavailable",
+                    "Legacy environment archive could not be read",
+                )),
+            }
 
             match SkillProjectionReconciler.legacy_entry_count(&database) {
                 Ok(0) => checks.push(
@@ -4324,6 +4522,148 @@ impl Core {
         kind: AdapterKind,
         search: Arc<RuntimeSearchEnvironment>,
     ) -> Result<Option<RuntimeCheckOutcome>> {
+        if kind == AdapterKind::Pi {
+            return self.refresh_pi_model_catalog(search).await.map(Some);
+        }
+        self.refresh_verified_runtime_catalog_for_selection(kind, search, None)
+            .await
+    }
+
+    async fn refresh_pi_model_catalog(
+        &self,
+        search: Arc<RuntimeSearchEnvironment>,
+    ) -> Result<RuntimeCheckOutcome> {
+        let kind = AdapterKind::Pi;
+        let service = AgentProfileService::default();
+        let (initial, locator) = {
+            let database = self.database.lock().await;
+            let installation = service.managed_installation(&database, kind, "default")?;
+            let locator = installation
+                .as_ref()
+                .map(|installation| {
+                    service.runtime_entrypoint_locator_identity(&database, &installation.id)
+                })
+                .transpose()?
+                .flatten();
+            (installation, locator)
+        };
+        if initial
+            .as_ref()
+            .is_some_and(|installation| !installation.enabled)
+        {
+            return Ok(RuntimeCheckOutcome::StableFailure);
+        }
+        let mut entry_search = search.as_ref().clone();
+        if !search.has_startup_configuration(kind)
+            && let Some(installation) = initial.as_ref().filter(|installation| {
+                matches!(
+                    installation.source,
+                    InstallationSource::Manual | InstallationSource::Custom
+                )
+            })
+        {
+            let mut configuration = entry_search.startup_configuration(kind);
+            configuration.program_path = Some(
+                locator
+                    .as_ref()
+                    .map(|locator| locator.canonical_shim_path.clone())
+                    .unwrap_or_else(|| installation.executable_path.clone()),
+            );
+            entry_search = entry_search.with_startup_configuration(kind, configuration);
+        }
+        let saved_path = initial
+            .as_ref()
+            .map(|installation| PathBuf::from(&installation.executable_path));
+        let observation = tokio::task::spawn_blocking(move || {
+            rovai_core::runtime_discovery::discover_runtime_path_with_manual_candidates(
+                kind,
+                &entry_search,
+                saved_path,
+            )
+        })
+        .await
+        .context("Pi catalog entry resolution worker failed")?;
+        if observation.discovery_status != RuntimeDiscoveryStatus::Found {
+            return Ok(RuntimeCheckOutcome::StableFailure);
+        }
+        let verified = self.verify_runtime_entry(&observation).await?;
+        let path = PathBuf::from(
+            observation
+                .executable_path
+                .as_ref()
+                .context("missing Pi path")?,
+        );
+        let fingerprint = observation
+            .executable_fingerprint
+            .as_deref()
+            .context("missing Pi fingerprint")?;
+        let identity = verified.executable_file_identity().clone();
+        let installation = {
+            let Some(_update) = self.runtime_check_update_guard(&search).await else {
+                return Ok(RuntimeCheckOutcome::Superseded);
+            };
+            let mut database = self.database.lock().await;
+            let current = service.managed_installation(&database, kind, "default")?;
+            if current.as_ref().map(|value| (&value.id, value.generation))
+                != initial.as_ref().map(|value| (&value.id, value.generation))
+            {
+                return Ok(RuntimeCheckOutcome::Superseded);
+            }
+            service.commit_discovered_runtime_entry(
+                &mut database,
+                verified,
+                initial.as_ref().map(|value| value.id.as_str()),
+            )?;
+            service
+                .managed_installation(&database, kind, "default")?
+                .context("Pi installation disappeared")?
+        };
+        // This temporary Host observes the whole catalog and never creates a
+        // conversation or borrows the task Host. Failure is local to this read.
+        let catalog = with_runtime_configuration(kind, &search, async {
+            health::refresh_model_catalog(&path, kind).await
+        })
+        .await;
+        let identity_current = observe_executable_file_identity(&path).ok().as_ref()
+            == Some(&identity)
+            && rovai_core::runtime_discovery::entrypoint_locator_identity_is_current(
+                observation.entrypoint_locator_identity.as_ref(),
+            );
+        let Some(_update) = self.runtime_check_update_guard(&search).await else {
+            return Ok(RuntimeCheckOutcome::Superseded);
+        };
+        if !identity_current {
+            return Ok(RuntimeCheckOutcome::Superseded);
+        }
+        match catalog {
+            Ok(catalog) => {
+                let committed = service.commit_pi_model_catalog(
+                    &mut *self.database.lock().await,
+                    &installation,
+                    fingerprint,
+                    search.generation(),
+                    &catalog.models,
+                    &chrono::Utc::now().to_rfc3339(),
+                )?;
+                Ok(if committed {
+                    RuntimeCheckOutcome::Ready
+                } else {
+                    RuntimeCheckOutcome::Superseded
+                })
+            }
+            Err(error) => {
+                eprintln!("[model-catalog] Pi observation failed: {error:#}");
+                Ok(RuntimeCheckOutcome::StableFailure)
+            }
+        }
+    }
+
+    async fn refresh_verified_runtime_catalog_for_selection(
+        &self,
+        kind: AdapterKind,
+        search: Arc<RuntimeSearchEnvironment>,
+        target: Option<(&str, Option<crate::agent_profile::DshModelSource>)>,
+    ) -> Result<Option<RuntimeCheckOutcome>> {
         let service = AgentProfileService::default();
         let (installation, verified_identity) = {
             let Some(_update) = self.runtime_check_update_guard(&search).await else {
@@ -4399,9 +4739,24 @@ impl Core {
             "[model-catalog] probe runtime={} mode=catalog full_probe_count=0",
             kind.as_str()
         );
-        let catalog =
-            with_runtime_configuration(kind, &search, health::refresh_model_catalog(path, kind))
-                .await;
+        let catalog = with_runtime_configuration(kind, &search, async {
+            if target.is_some() {
+                health::refresh_model_catalog_for_selection(path, kind, target).await
+            } else {
+                health::refresh_model_catalog(path, kind).await
+            }
+        })
+        .await;
+        let dsh_context = if kind == AdapterKind::DeepseekHarness {
+            Some(
+                with_runtime_configuration(kind, &search, async {
+                    crate::dsh::model_options_context(path)
+                })
+                .await?,
+            )
+        } else {
+            None
+        };
         let Some(_update) = self.runtime_check_update_guard(&search).await else {
             return Ok(Some(RuntimeCheckOutcome::Superseded));
         };
@@ -4426,17 +4781,48 @@ impl Core {
         if !current.as_ref().is_some_and(|current| {
             current.id == installation.id
                 && current.generation == installation.generation
-                && current.snapshot == installation.snapshot
+                && if kind == AdapterKind::DeepseekHarness {
+                    current
+                        .snapshot
+                        .as_ref()
+                        .zip(installation.snapshot.as_ref())
+                        .is_some_and(|(current, expected)| {
+                            // Another model's capability write is not an identity change.
+                            // The transaction merges against the latest persisted catalog.
+                            let mut current = current.clone();
+                            current.models.clone_from(&expected.models);
+                            current == *expected
+                        })
+                } else {
+                    current.snapshot == installation.snapshot
+                }
         }) || self.runtime_search_environment.read().await.generation() != search_generation
         {
             return Ok(Some(RuntimeCheckOutcome::Superseded));
         }
         match catalog {
-            Ok(models) => {
+            Ok(catalog) => {
+                if let Some(context) = dsh_context
+                    && catalog.models.iter().any(|model| {
+                        model
+                            .runtime_metadata
+                            .as_ref()
+                            .is_none_or(|meta| meta["dshOptionsContext"] != context)
+                    })
+                {
+                    return Ok(Some(RuntimeCheckOutcome::Superseded));
+                }
+                if catalog
+                    .dsh_preparation
+                    .as_ref()
+                    .is_some_and(|prepared| !crate::dsh::model_inputs_unchanged(prepared))
+                {
+                    return Ok(Some(RuntimeCheckOutcome::Superseded));
+                }
                 let committed = service.commit_runtime_model_catalog(
                     &mut database,
                     &installation,
-                    &models,
+                    &catalog.models,
                     &chrono::Utc::now().to_rfc3339(),
                 )?;
                 Ok(Some(if committed {
@@ -4446,6 +4832,11 @@ impl Core {
                 }))
             }
             Err(error) => {
+                // A failed optional model read is not a failed Runtime check.
+                // Keep the usable catalog and all saved member selections.
+                if target.is_some() {
+                    return Ok(Some(RuntimeCheckOutcome::StableFailure));
+                }
                 let failure = health::model_catalog_failure(kind, &error, path);
                 service.record_managed_probe_failure(
                     &mut database,
@@ -4976,6 +5367,20 @@ impl Core {
             latest_observation.reported_version = snapshot.reported_version.clone();
             latest_observation.version_probe_succeeded = Some(snapshot.reported_version.is_some());
             if snapshot.probe_status == "ready" {
+                if kind == AdapterKind::DeepseekHarness {
+                    let context = with_runtime_configuration(kind, &search, async {
+                        crate::dsh::model_options_context(&canonical)
+                    })
+                    .await?;
+                    if snapshot.models.iter().any(|model| {
+                        model
+                            .runtime_metadata
+                            .as_ref()
+                            .is_none_or(|meta| meta["dshOptionsContext"] != context)
+                    }) {
+                        return Ok(RuntimeCheckOutcome::Superseded);
+                    }
+                }
                 let executable_path = canonical.to_string_lossy().to_string();
                 let mut database = self.database.lock().await;
                 AgentProfileService::default().commit_verified_managed_installation(
@@ -5239,6 +5644,20 @@ impl Core {
         {
             return Some(AgentRunRuntime::Acp(runtime));
         }
+        if let Some(runtime) = self
+            .cline_cli
+            .get_agent_run(agent_run_id, execution_epoch)
+            .await
+        {
+            return Some(AgentRunRuntime::Acp(runtime));
+        }
+        if let Some(runtime) = self
+            .command_code_cli
+            .get_agent_run(agent_run_id, execution_epoch)
+            .await
+        {
+            return Some(AgentRunRuntime::Acp(runtime));
+        }
         self.grok_build
             .get_agent_run(agent_run_id, execution_epoch)
             .await
@@ -5345,6 +5764,7 @@ impl Core {
         tokio::join!(
             self.codex_cli.shutdown_all(),
             self.pi.shutdown_all(),
+            self.cline_cli.shutdown_all(),
             self.opencode_cli.shutdown_all(),
             self.copilot_cli.shutdown_all(),
             self.kiro_cli.shutdown_all(),
@@ -5356,6 +5776,7 @@ impl Core {
             self.kimi_code_cli.shutdown_all(),
             self.grok_build.shutdown_all(),
             self.deepseek_harness.shutdown_all(),
+            self.command_code_cli.shutdown_all(),
             self.zcode_app.shutdown_all(),
             self.claude_code_cli.shutdown_all(),
             self.antigravity_app.shutdown_all(),
@@ -5368,6 +5789,7 @@ impl Core {
             tokio::join!(
                 self.codex_cli.shutdown_all(),
                 self.pi.shutdown_all(),
+                self.cline_cli.shutdown_all(),
                 self.opencode_cli.shutdown_all(),
                 self.copilot_cli.shutdown_all(),
                 self.kiro_cli.shutdown_all(),
@@ -5379,6 +5801,7 @@ impl Core {
                 self.kimi_code_cli.shutdown_all(),
                 self.grok_build.shutdown_all(),
                 self.deepseek_harness.shutdown_all(),
+                self.command_code_cli.shutdown_all(),
                 self.zcode_app.shutdown_all(),
                 self.claude_code_cli.shutdown_all(),
                 self.antigravity_app.shutdown_all(),
@@ -5406,6 +5829,8 @@ impl Core {
             rovai_core::agent_profile::AdapterKind::KimiCodeCli => Some(&self.kimi_code_cli),
             rovai_core::agent_profile::AdapterKind::GrokBuild => Some(&self.grok_build),
             AdapterKind::DeepseekHarness => Some(&self.deepseek_harness),
+            AdapterKind::CommandCodeCli => Some(&self.command_code_cli),
+            AdapterKind::ClineCli => Some(&self.cline_cli),
             rovai_core::agent_profile::AdapterKind::ZcodeApp => Some(&self.zcode_app),
             rovai_core::agent_profile::AdapterKind::CodexCli
             | rovai_core::agent_profile::AdapterKind::Pi
@@ -5744,6 +6169,7 @@ impl Core {
         &self,
         source: &AgentRunExecution,
         payload: &Value,
+        output_redactor: &rovai_core::runtime_custom_api::CredentialRedactor,
     ) -> Result<()> {
         let execution = {
             let database = self.database.lock().await;
@@ -5807,6 +6233,7 @@ impl Core {
                 preparation.result.code
             );
         }
+        let reason = reason.as_deref().map(|text| output_redactor.text(text));
         emit(
             &self.output,
             "action.prepared",
@@ -8516,8 +8943,18 @@ impl Core {
                 Ok(serde_json::to_value(execution.result)?)
             }
             "members.runtime.set" => {
-                let params: UserCommandParams<SetMemberRuntimeConfigurationCommand> =
+                let mut params: UserCommandParams<SetMemberRuntimeConfigurationCommand> =
                     serde_json::from_value(request.params.clone())?;
+                let environment_edit = request
+                    .params
+                    .get("command")
+                    .and_then(|command| command.get("environment"))
+                    .cloned()
+                    .map(serde_json::from_value::<rovai_core::member_environment::EnvironmentEdit>)
+                    .transpose()
+                    .map_err(|_| anyhow::anyhow!("Member environment input is invalid"))?;
+                // The receipt is Host-derived. Client environment values never enter the domain command.
+                params.command.environment_update = None;
                 if let Some(blocker) = current_runtime_platform_blocker(params.command.adapter_kind)
                 {
                     return Ok(serde_json::to_value(blocker)?);
@@ -8525,9 +8962,23 @@ impl Core {
                 let agent_id = params.command.agent_id.clone();
                 let execution = {
                     let mut database = self.database.lock().await;
-                    let execution = AgentProfileService::default().set_runtime(
+                    let environment = environment_edit
+                        .map(|edit| {
+                            rovai_core::member_environment::prepare(
+                                database.connection(),
+                                &agent_id,
+                                params.command.adapter_kind,
+                                &params.command.model,
+                                edit,
+                            )
+                        })
+                        .transpose()?;
+                    params.command.environment_update =
+                        environment.as_ref().map(|update| update.receipt.clone());
+                    let execution = AgentProfileService::default().set_runtime_with_environment(
                         &mut database,
                         &user_command_envelope(params.command_id, params.command),
+                        environment.as_ref(),
                     )?;
                     if execution.result.status == CommandResultStatus::Applied {
                         self.mark_skill_projections_dirty_best_effort(&mut database, true);
@@ -9310,6 +9761,21 @@ impl Core {
                     ))
                 })?;
                 Ok(serde_json::to_value(execution.result)?)
+            }
+            "conversations.memberSession.get" => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct Params {
+                    camp_id: String,
+                    agent_id: String,
+                }
+                let params: Params = serde_json::from_value(request.params.clone())?;
+                let database = self.database.lock().await;
+                let view: Option<Value> = database.connection().query_row(
+                    "SELECT id,version,EXISTS(SELECT 1 FROM agent_run WHERE conversation_id=conversation.id AND status IN ('queued','running','waiting'))
+                     FROM conversation WHERE camp_id=?1 AND agent_id=?2 AND kind='camp_member'",
+                    rusqlite::params![params.camp_id,params.agent_id], |r| Ok(json!({"conversationId":r.get::<_,String>(0)?,"version":r.get::<_,i64>(1)?,"active":r.get::<_,bool>(2)?}))).optional()?;
+                Ok(json!(view))
             }
             "conversations.restartNativeSession" => {
                 let params: UserCommandParams<RestartNativeSessionCommand> =
@@ -10896,6 +11362,57 @@ impl Core {
                 self.handle_runtime_startup(method, request.params.clone())
                     .await
             }
+            "member.runtimeEnvironment.get" => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct Params {
+                    member_id: String,
+                    adapter_kind: AdapterKind,
+                    #[serde(default)]
+                    reveal: bool,
+                }
+                let params: Params = serde_json::from_value(request.params.clone())?;
+                let database = self.database.lock().await;
+                rovai_core::member_environment::get(
+                    database.connection(),
+                    &params.member_id,
+                    params.adapter_kind,
+                    params.reveal,
+                )
+            }
+            "runtime.environmentLegacy.list" => {
+                let database = self.database.lock().await;
+                rovai_core::member_environment::legacy_list(database.connection())
+            }
+            "runtime.environmentLegacy.get" | "runtime.environmentLegacy.acknowledge" => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct Params {
+                    runtime_kind: AdapterKind,
+                    #[serde(default)]
+                    reveal: bool,
+                    identity: Option<String>,
+                }
+                let params: Params = serde_json::from_value(request.params.clone())?;
+                let database = self.database.lock().await;
+                if request.method.ends_with(".get") {
+                    rovai_core::member_environment::legacy_get(
+                        database.connection(),
+                        params.runtime_kind,
+                        params.reveal,
+                    )
+                } else {
+                    rovai_core::member_environment::legacy_acknowledge(
+                        database.connection(),
+                        params.runtime_kind,
+                        params
+                            .identity
+                            .as_deref()
+                            .context("Legacy identity is required")?,
+                    )?;
+                    Ok(json!({"handled":true}))
+                }
+            }
             "runtime.discovery.rescan" => {
                 let params: RuntimeDiscoveryRescanParams =
                     serde_json::from_value(request.params.clone())?;
@@ -10933,8 +11450,17 @@ impl Core {
             "runtime.modelCatalog.open" => {
                 let params: CheckProductRuntimeParams =
                     serde_json::from_value(request.params.clone())?;
-                self.open_runtime_model_catalog(params.runtime_kind, params.wait_for_refresh)
-                    .await
+                if let Some(model_id) = params.model_id {
+                    anyhow::ensure!(
+                        params.runtime_kind == AdapterKind::DeepseekHarness,
+                        "Target-model option discovery is only supported for DSH"
+                    );
+                    self.open_dsh_model_options(&model_id, params.dsh_source, params.cache_only)
+                        .await
+                } else {
+                    self.open_runtime_model_catalog(params.runtime_kind, params.wait_for_refresh)
+                        .await
+                }
             }
             "health.check" => {
                 let git_path = self
@@ -11266,6 +11792,8 @@ impl Core {
             | rovai_core::agent_profile::AdapterKind::KimiCodeCli
             | rovai_core::agent_profile::AdapterKind::GrokBuild
             | rovai_core::agent_profile::AdapterKind::DeepseekHarness
+            | rovai_core::agent_profile::AdapterKind::CommandCodeCli
+            | rovai_core::agent_profile::AdapterKind::ClineCli
             | rovai_core::agent_profile::AdapterKind::ZcodeApp) => {
                 let probe =
                     health::acp_capability_probe_at_for_purpose(executable_path, kind, purpose)
@@ -11275,8 +11803,11 @@ impl Core {
                         adapter_kind: kind,
                         reported_version: probe.result.reported_version,
                         executable_fingerprint: probe.result.executable_fingerprint,
-                        authentication_status: probe_authentication_status(probe.result.status)
-                            .to_string(),
+                        authentication_status: if kind == AdapterKind::ClineCli {
+                            "unknown".to_string()
+                        } else {
+                            probe_authentication_status(probe.result.status).to_string()
+                        },
                         probe_status: probe_status_name(probe.result.status).to_string(),
                         capabilities: probe.result.capabilities,
                         initialize_result: probe.initialize_result,
@@ -11284,7 +11815,9 @@ impl Core {
                         attempted_at,
                         last_error: if matches!(
                             kind,
-                            AdapterKind::ZcodeApp | AdapterKind::DeepseekHarness
+                            AdapterKind::ZcodeApp
+                                | AdapterKind::DeepseekHarness
+                                | AdapterKind::CommandCodeCli
                         ) && probe.result.status
                             == health::AgentRuntimeProbeStatus::Ready
                         {
@@ -13647,6 +14180,16 @@ impl Core {
             .context("failed to discover effective Grok native MCP names")?;
             projection.finalize_native_name_conflicts(&native_names)?;
         }
+        if execution.runtime.adapter_kind == AdapterKind::CommandCodeCli
+            && !projection.servers.is_empty()
+        {
+            let native_names = health::inspect_command_code_native_mcp_server_names(
+                Path::new(&execution.runtime.executable_path),
+                &execution_root,
+            )
+            .await?;
+            projection.finalize_native_name_conflicts(&native_names)?;
+        }
         Ok(projection)
     }
 
@@ -13694,7 +14237,7 @@ impl Core {
         Ok(())
     }
 
-    async fn acknowledge_pi_agent_start(
+    async fn acknowledge_native_agent_start(
         &self,
         agent_run_id: &str,
         execution_epoch: i64,
@@ -14155,7 +14698,67 @@ impl Core {
         }
     }
 
+    async fn prepare_runtime_identity(
+        &self,
+        mut runtime: FrozenAgentRuntimeConfig,
+    ) -> std::result::Result<FrozenAgentRuntimeConfig, RuntimeDispatchFailure> {
+        if runtime.adapter_kind == AdapterKind::OpencodeCli {
+            let prepared = async {
+                let identity = crate::opencode_compat::program_identity(&runtime)?;
+                if let Some(version) = self
+                    .runtime_fleet
+                    .opencode_version_for_program(&identity)
+                    .await
+                {
+                    runtime.reported_version = Some(version);
+                } else if crate::opencode_compat::Generation::from_version(
+                    runtime.reported_version.as_deref(),
+                )
+                .is_none()
+                {
+                    runtime.reported_version = Some(
+                        health::read_opencode_version(Path::new(&runtime.executable_path)).await?,
+                    );
+                }
+                anyhow::Ok(())
+            }
+            .await;
+            prepared.map_err(|error| RuntimeDispatchFailure {
+                code: "runtime_initialization_failed".to_string(),
+                error,
+                effective_version: None,
+            })?;
+        }
+        Ok(runtime)
+    }
+
     async fn prepare_runtime_for_dispatch(
+        &self,
+        candidate: &rovai_core::runtime::QueuedAgentRunCandidate,
+        runtime: FrozenAgentRuntimeConfig,
+        workspace: &AgentRunWorkspace,
+    ) -> std::result::Result<(FrozenAgentRuntimeConfig, i64), RuntimeDispatchFailure> {
+        let mut runtime = runtime;
+        let environment = runtime.environment.as_mut().ok_or_else(|| RuntimeDispatchFailure {
+            code: "runtime_environment_unavailable".into(),
+            error: anyhow::anyhow!("The session environment is unavailable; reset this member's session to use the current configuration"),
+            effective_version: None,
+        })?;
+        environment
+            .hydrate(self.database.lock().await.connection())
+            .map_err(|error| RuntimeDispatchFailure {
+                code: "runtime_environment_unavailable".into(),
+                error,
+                effective_version: None,
+            })?;
+        rovai_core::runtime_discovery::with_frozen_environment(
+            runtime.environment.clone(),
+            self.prepare_runtime_for_dispatch_in_environment(candidate, runtime, workspace),
+        )
+        .await
+    }
+
+    async fn prepare_runtime_for_dispatch_in_environment(
         &self,
         candidate: &rovai_core::runtime::QueuedAgentRunCandidate,
         runtime: FrozenAgentRuntimeConfig,
@@ -14203,8 +14806,9 @@ impl Core {
                 effective_version: None,
             })? {
             RuntimeIntegrityPreflight::Verified => {
+                let prepared_runtime = self.prepare_runtime_identity(runtime.clone()).await?;
                 let effective_runtime =
-                    acp::freeze_native_session_compatibility(runtime.clone(), workspace).map_err(
+                    acp::freeze_native_session_compatibility(prepared_runtime, workspace).map_err(
                         |error| RuntimeDispatchFailure {
                             code: "runtime_configuration_invalid".to_string(),
                             error,
@@ -14359,6 +14963,7 @@ impl Core {
             error: anyhow::anyhow!("{}", blocker.payload),
             effective_version: None,
         })?;
+        let effective_runtime = self.prepare_runtime_identity(effective_runtime).await?;
         let effective_runtime =
             acp::freeze_native_session_compatibility(effective_runtime, workspace).map_err(
                 |error| RuntimeDispatchFailure {
@@ -14535,6 +15140,31 @@ impl Core {
     }
 
     async fn launch_agent_run(
+        self: &Arc<Self>,
+        execution: &AgentRunExecution,
+        attachment_admission: &ThreadAttachmentReadAdmission,
+        attachment_authorization: &ThreadOutputDirectory,
+        output: &mpsc::UnboundedSender<String>,
+        launch_permit: &mut ExecutionLaunchPermit,
+    ) -> Result<()> {
+        let mut resolved = execution.clone();
+        resolved.runtime.environment.as_mut().context("The session environment is unavailable; reset this member's session to use the current configuration")?
+            .hydrate(self.database.lock().await.connection())?;
+        let environment = resolved.runtime.environment.clone();
+        rovai_core::runtime_discovery::with_frozen_environment(
+            environment,
+            self.launch_agent_run_in_environment(
+                &resolved,
+                attachment_admission,
+                attachment_authorization,
+                output,
+                launch_permit,
+            ),
+        )
+        .await
+    }
+
+    async fn launch_agent_run_in_environment(
         self: &Arc<Self>,
         execution: &AgentRunExecution,
         attachment_admission: &ThreadAttachmentReadAdmission,
@@ -15335,6 +15965,26 @@ impl Core {
         let (runtime_event_sender, mut runtime_event_receiver) = mpsc::unbounded_channel();
         let (launch_handoff_sender, mut launch_handoff_receiver) = oneshot::channel();
         let (input_ready_sender, mut input_ready_receiver) = mpsc::unbounded_channel();
+        // Keep the display scrubber with the consumer until its queue is drained,
+        // including events delivered after the CLI process has already exited.
+        let output_redactor = execution
+            .runtime
+            .environment
+            .as_ref()
+            .map(|env| env.redactor())
+            .unwrap_or_else(|| {
+                rovai_core::runtime_custom_api::CredentialRedactor::from_values(Vec::new())
+            })
+            .extend(
+                execution
+                    .runtime
+                    .custom_api
+                    .as_ref()
+                    .and_then(|api| api.redactor().ok())
+                    .unwrap_or_else(|| {
+                        rovai_core::runtime_custom_api::CredentialRedactor::from_values(Vec::new())
+                    }),
+            );
         let run = self.claude_code_cli.run(ClaudeCodeRunRequest {
             agent_run_id: execution.agent_run_id.clone(),
             execution_epoch: execution.execution_epoch,
@@ -15558,7 +16208,7 @@ impl Core {
                             continue;
                         };
                         if let Err(error) = self.process_claude_runtime_event(
-                            execution, output, builtin_tools.run_tmp(), &runtime_event,
+                            execution, output, builtin_tools.run_tmp(), &runtime_event, &output_redactor,
                         ).await {
                             eprintln!(
                                 "failed to persist Claude Code Runtime Evidence for AgentRun {}: {error:#}",
@@ -15571,7 +16221,7 @@ impl Core {
             };
             while let Ok(runtime_event) = runtime_event_receiver.try_recv() {
                 if let Err(error) = self.process_claude_runtime_event(
-                    execution, output, builtin_tools.run_tmp(), &runtime_event,
+                    execution, output, builtin_tools.run_tmp(), &runtime_event, &output_redactor,
                 ).await {
                     eprintln!(
                         "failed to persist queued Claude Code Runtime Evidence for AgentRun {}: {error:#}",
@@ -15739,6 +16389,7 @@ impl Core {
         output: &mpsc::UnboundedSender<String>,
         managed_output_root: &Path,
         event: &claude::ClaudeCodeRuntimeEvent,
+        output_redactor: &rovai_core::runtime_custom_api::CredentialRedactor,
     ) -> Result<()> {
         if event.event_type == "runtime.fast.initialized" {
             record_runtime_fast_default(
@@ -15768,7 +16419,7 @@ impl Core {
         }
         if event.event_type == "claude.permission_request" {
             if let Err(error) = self
-                .prepare_claude_permission_action(execution, &event.payload)
+                .prepare_claude_permission_action(execution, &event.payload, output_redactor)
                 .await
             {
                 if let Some(runtime) = self
@@ -15807,6 +16458,7 @@ impl Core {
             },
             event.event_type,
             &event.payload,
+            Some(output_redactor),
         )
         .await
     }
@@ -16373,6 +17025,7 @@ impl Core {
                             },
                             runtime_event.event_type,
                             &runtime_event.payload,
+                            None,
                         ).await {
                             eprintln!(
                                 "failed to persist Antigravity Runtime Evidence for AgentRun {}: {error:#}",
@@ -16396,6 +17049,7 @@ impl Core {
                     },
                     runtime_event.event_type,
                     &runtime_event.payload,
+                    None,
                 )
                 .await
                 {
@@ -16577,6 +17231,28 @@ impl Core {
         .await
     }
 
+    // A native file Rule is immutable for the lifetime of its member Host.
+    // Freeze B before acquisition so a changed Binding payload gets a new Host;
+    // a normal warm Run observes the same frozen payload and reuses its Host.
+    async fn acp_host_bootstrap_digest(
+        &self,
+        execution: &AgentRunExecution,
+        digest: String,
+    ) -> Result<String> {
+        if execution.runtime.adapter_kind != AdapterKind::ClineCli {
+            return Ok(digest);
+        }
+        let mut database = self.database.lock().await;
+        let bootstrap = ContextService.prepare_session_bootstrap(
+            &mut database,
+            &ManagedBlobStore::new(&self.data_dir),
+            &execution.agent_run_id,
+            execution.execution_epoch,
+            CharterDeliveryMode::ManagedSystemPrompt,
+        )?;
+        canonical_json_digest(&json!({"runtime":digest,"bootstrap":bootstrap.payload}))
+    }
+
     async fn launch_acp_agent_run(
         self: &Arc<Self>,
         launch: PreparedRuntimeLaunch<'_>,
@@ -16618,6 +17294,9 @@ impl Core {
             &mcp_projection.servers,
             attachment_authorization,
         )?;
+        runtime_compatibility_digest = self
+            .acp_host_bootstrap_digest(execution, runtime_compatibility_digest)
+            .await?;
         self.persist_runtime_compatibility_digest(execution, &runtime_compatibility_digest)
             .await?;
         let runtime_result = adapter
@@ -16637,10 +17316,6 @@ impl Core {
             )
             .await;
         let mut runtime = runtime_result?;
-        let active_builtin_tools = runtime
-            .builtin_tool_process_config()
-            .context("ACP Runtime has no Built-in Tool process context")?
-            .clone();
         let session_capabilities = runtime.session_capabilities().await;
         let mut binding_credential = initial_binding;
         let mut session_continuation = runtime
@@ -16653,8 +17328,49 @@ impl Core {
             && session_continuation == acp::AcpSessionContinuation::New
         {
             binding_credential = self.prepare_builtin_tool_binding(execution, true).await?;
+            if execution.runtime.adapter_kind == AdapterKind::ClineCli {
+                let digest = acp::runtime_compatibility_digest(
+                    &execution.runtime,
+                    &execution.workspace,
+                    execution.permission_semantics,
+                    &mcp_projection.servers,
+                    attachment_authorization,
+                )?;
+                let digest = self.acp_host_bootstrap_digest(execution, digest).await?;
+                if digest != runtime_compatibility_digest {
+                    adapter
+                        .forget_agent_run(&execution.agent_run_id, execution.execution_epoch)
+                        .await;
+                    runtime_compatibility_digest = digest;
+                    self.persist_runtime_compatibility_digest(
+                        execution,
+                        &runtime_compatibility_digest,
+                    )
+                    .await?;
+                    runtime = adapter
+                        .ensure_agent_run_runtime(
+                            &execution.agent_run_id,
+                            execution.execution_epoch,
+                            &execution.camp_id,
+                            &execution.agent_id,
+                            &execution.workspace,
+                            execution.permission_semantics,
+                            &execution.runtime,
+                            &builtin_tools,
+                            &mcp_projection.servers,
+                            &mcp_projection.projection_digest,
+                            attachment_access_root,
+                            &runtime_compatibility_digest,
+                        )
+                        .await?;
+                }
+            }
             session_continuation = acp::AcpSessionContinuation::New;
         }
+        let active_builtin_tools = runtime
+            .builtin_tool_process_config()
+            .context("ACP Runtime has no Built-in Tool process context")?
+            .clone();
         let charter_delivery_mode =
             charter_delivery_mode_for_adapter(execution.runtime.adapter_kind);
         let new_session_native_rules = if execution.runtime.adapter_kind == AdapterKind::GrokBuild
@@ -16747,6 +17463,9 @@ impl Core {
                     &mcp_projection.servers,
                     attachment_authorization,
                 )?;
+                runtime_compatibility_digest = self
+                    .acp_host_bootstrap_digest(execution, runtime_compatibility_digest)
+                    .await?;
                 self.persist_runtime_compatibility_digest(execution, &runtime_compatibility_digest)
                     .await?;
                 launch_permit.check_cancelled()?;
@@ -16812,15 +17531,18 @@ impl Core {
         self.bind_prepared_native_session(execution, &binding_credential, &session_id)
             .await
             .context("failed to bind ACP Native Session")?;
-        if execution.runtime.adapter_kind == AdapterKind::DeepseekHarness {
+        if matches!(
+            execution.runtime.adapter_kind,
+            AdapterKind::DeepseekHarness | AdapterKind::CommandCodeCli | AdapterKind::ClineCli
+        ) {
             if bootstrap.native_binding_id != binding_credential.native_binding_id
                 || bootstrap.native_binding_generation
                     != binding_credential.native_binding_generation
             {
-                anyhow::bail!("DSH Bootstrap does not match its Native Binding");
+                anyhow::bail!("Managed Bootstrap does not match its Native Binding");
             }
             runtime
-                .bind_dsh_bootstrap(&session_id, &bootstrap.payload)
+                .bind_managed_bootstrap(&session_id, &bootstrap.payload)
                 .await?;
         }
         self.establish_acp_compaction_observer_best_effort(execution, &runtime, &session_id)
@@ -17181,6 +17903,8 @@ impl Core {
             | rovai_core::agent_profile::AdapterKind::KimiCodeCli
             | rovai_core::agent_profile::AdapterKind::GrokBuild
             | rovai_core::agent_profile::AdapterKind::DeepseekHarness
+            | rovai_core::agent_profile::AdapterKind::CommandCodeCli
+            | rovai_core::agent_profile::AdapterKind::ClineCli
             | rovai_core::agent_profile::AdapterKind::ZcodeApp) => {
                 if let Some(adapter) = self.acp_adapter(kind) {
                     adapter
@@ -17924,6 +18648,18 @@ async fn run_core(
     let compaction_detector_policies =
         DesiredCompactionDetectorPolicies::from_process_environment();
     let recovery = (|| -> Result<_> {
+        // An old native tool can outlive Core. Reclaim persisted ownership before
+        // readiness, so another Runtime sharing its execution root cannot race it.
+        #[cfg(target_os = "macos")]
+        rovai_core::managed_process::ManagedProcess::recover_runtime_descendants(
+            &data_dir.join("runtime"),
+        )?;
+        // Retired backend: recover only processes proven owned by the generic
+        // kernel-identity ledger. Never launch it or touch persistent history/credentials.
+        #[cfg(target_os = "macos")]
+        rovai_core::managed_process::ManagedProcess::recover_runtime_descendants(
+            &data_dir.join("runtime/cline-hub/hosts"),
+        )?;
         ManagedBlobStore::new(&data_dir).recover_gc_state(&mut database)?;
         recover_legacy_pending_cancellations(&mut database)?;
         rovai_core::single_chat::recover_pending_edit_sessions(&database)?;
@@ -18151,6 +18887,24 @@ async fn run_core(
             runtime_fleet.clone(),
             compaction_detector_policies
                 .policy_for(AdapterKind::DeepseekHarness)
+                .unwrap_or(CompactionDetectorPolicy::Disabled),
+        ),
+        command_code_cli: AcpCliRuntimeAdapter::deferred(
+            rovai_core::agent_profile::AdapterKind::CommandCodeCli,
+            acp_tx.clone(),
+            data_dir.join("runtime/command-code"),
+            runtime_fleet.clone(),
+            compaction_detector_policies
+                .policy_for(AdapterKind::CommandCodeCli)
+                .unwrap_or(CompactionDetectorPolicy::Disabled),
+        ),
+        cline_cli: AcpCliRuntimeAdapter::deferred(
+            AdapterKind::ClineCli,
+            acp_tx.clone(),
+            data_dir.join("runtime/cline-cli"),
+            runtime_fleet.clone(),
+            compaction_detector_policies
+                .policy_for(AdapterKind::ClineCli)
                 .unwrap_or(CompactionDetectorPolicy::Disabled),
         ),
         grok_build: AcpCliRuntimeAdapter::deferred(
@@ -19013,6 +19767,7 @@ struct AcpRuntimeDeltaMessage {
 
 fn prepare_codex_delta_batch(
     messages: &[Value],
+    redact_output: impl Fn(&Value) -> Value,
 ) -> Result<Option<Vec<PreparedRuntimeDeltaMessage>>> {
     let mut total_bytes = 0_usize;
     let mut prepared = Vec::with_capacity(messages.len());
@@ -19033,7 +19788,7 @@ fn prepare_codex_delta_batch(
             return Ok(None);
         }
         let Some(evidence) =
-            ExecutionEvidenceService.prepare_runtime_event(event_type, &payload)?
+            ExecutionEvidenceService.prepare_runtime_event(event_type, &redact_output(&payload))?
         else {
             return Ok(None);
         };
@@ -19059,6 +19814,7 @@ fn prepare_codex_delta_batch(
 fn prepare_acp_delta_batch(
     adapter_kind: AdapterKind,
     messages: &[AcpRuntimeDeltaMessage],
+    redact_output: impl Fn(&Value) -> Value,
 ) -> Result<Option<Vec<PreparedRuntimeDeltaMessage>>> {
     let mut total_bytes = 0_usize;
     let mut prepared = Vec::with_capacity(messages.len());
@@ -19075,7 +19831,7 @@ fn prepare_acp_delta_batch(
             return Ok(None);
         }
         let Some(evidence) =
-            ExecutionEvidenceService.prepare_runtime_event(event_type, &payload)?
+            ExecutionEvidenceService.prepare_runtime_event(event_type, &redact_output(&payload))?
         else {
             return Ok(None);
         };
@@ -19473,7 +20229,7 @@ async fn process_agent_run_pi_message(
     }
     if message_type == "agent_start"
         && let Some(execution) = core
-            .acknowledge_pi_agent_start(
+            .acknowledge_native_agent_start(
                 agent_run_id,
                 execution_epoch,
                 delivery_id,
@@ -19515,6 +20271,7 @@ async fn process_agent_run_pi_message(
         .await;
     }
     for (event_type, payload) in runtime.normalize_events(&message).await {
+        let payload = runtime.redact_output(&payload);
         if event_type != "runtime.usage" {
             let evidence = persist_runtime_evidence(
                 core,
@@ -19578,7 +20335,7 @@ async fn process_agent_run_pi_message(
         persist_pi_prompt_completion(
             core,
             output,
-            &runtime,
+            runtime.as_ref(),
             host_instance_id,
             agent_run_id,
             execution_epoch,
@@ -19620,14 +20377,14 @@ async fn persist_pi_prompt_completion(
     } else {
         format!("runtime_prompt_{stop_reason}")
     };
-    let error_detail = format!("Pi agent_settled ended the prompt as {stop_reason}");
+    let error_detail = format!("Native prompt result ended the prompt as {stop_reason}");
     let public_failure = (outcome == RuntimeTerminalOutcome::Failed).then(|| {
         public_runtime_failure_from_output(
             AdapterKind::Pi,
             RuntimeFailureOrigin::Runtime,
             RuntimeFailurePhase::Execution,
             &base_error_code,
-            "Pi 未能完成运行",
+            "Runtime 未能完成运行",
             Some(&error_detail),
             &[(&core.data_dir, "<data-dir>")],
             manual_retry_allowed,
@@ -19737,12 +20494,12 @@ async fn persist_pi_prompt_completion(
         let terminal = if outcome == RuntimeTerminalOutcome::Succeeded {
             let final_output = final_message
                 .clone()
-                .context("Pi successful terminal has no final message")?;
+                .context("Native successful terminal has no final message")?;
             let mut database = core.database.lock().await;
             let envelope = CommandEnvelope {
                 command_id: uuid::Uuid::new_v4().to_string(),
                 actor: ActorRef::System {
-                    component_id: "runtime-adapter:pi".to_string(),
+                    component_id: format!("runtime-adapter:{}", AdapterKind::Pi.as_str()),
                 },
                 camp_id: Some(execution.camp_id.clone()),
                 expected_versions: Vec::new(),
@@ -19776,7 +20533,7 @@ async fn persist_pi_prompt_completion(
                 &CommandEnvelope {
                     command_id: uuid::Uuid::new_v4().to_string(),
                     actor: ActorRef::System {
-                        component_id: "runtime-adapter:pi".to_string(),
+                        component_id: format!("runtime-adapter:{}", AdapterKind::Pi.as_str()),
                     },
                     camp_id: Some(execution.camp_id.clone()),
                     expected_versions: Vec::new(),
@@ -20191,10 +20948,14 @@ async fn process_acp_events(
                 execution_epoch,
                 registration,
                 message,
+                redactor,
             } => {
                 let params = &message["params"];
                 let (_, mut payload) =
                     normalize_acp_event(AdapterKind::ZcodeApp, "session/update", params);
+                if let Some(redactor) = redactor {
+                    payload = redactor.redacted_value(&payload);
+                }
                 let mut identity = params["background"].clone();
                 let status = identity.as_object_mut().and_then(|v| v.remove("status"));
                 let result = async {
@@ -20326,6 +21087,45 @@ async fn process_acp_events(
                     execution_epoch,
                 )
                 .await;
+            }
+            AcpIncoming::CompactionDisplay {
+                adapter_kind,
+                host_instance_id,
+                agent_run_id,
+                execution_epoch,
+                native_session_id,
+                native_prompt_id,
+                event,
+            } => {
+                let Some(runtime) = acp_runtime_on_host(
+                    &core,
+                    adapter_kind,
+                    &host_instance_id,
+                    &agent_run_id,
+                    execution_epoch,
+                )
+                .await
+                else {
+                    continue;
+                };
+                if runtime.session_id().await.as_deref() != Some(&native_session_id)
+                    || runtime.prompt_id().await.as_deref() != Some(&native_prompt_id)
+                {
+                    continue;
+                }
+                if let Err(error) = persist_runtime_compaction_display(
+                    &core,
+                    &output,
+                    &agent_run_id,
+                    execution_epoch,
+                    None,
+                    *event,
+                    "cline.plugin.compaction.v1",
+                )
+                .await
+                {
+                    eprintln!("Cline local compaction display skipped: {error:#}");
+                }
             }
             AcpIncoming::CompactionObservation {
                 adapter_kind,
@@ -20518,7 +21318,20 @@ async fn process_agent_run_acp_delta_batch(
     messages: Vec<AcpRuntimeDeltaMessage>,
     runtime_route_permit: &mut rovai_core::planned_shutdown::RuntimeRoutePermit,
 ) {
-    let prepared = match prepare_acp_delta_batch(adapter_kind, &messages) {
+    let Some(runtime) = acp_runtime_on_host(
+        core,
+        adapter_kind,
+        host_instance_id,
+        agent_run_id,
+        execution_epoch,
+    )
+    .await
+    else {
+        return;
+    };
+    let prepared = match prepare_acp_delta_batch(adapter_kind, &messages, |value| {
+        runtime.redact_output(value)
+    }) {
         Ok(Some(prepared)) => prepared,
         Ok(None) => {
             for incoming in messages {
@@ -20563,17 +21376,6 @@ async fn process_agent_run_acp_delta_batch(
             }
             return;
         }
-    };
-    let Some(runtime) = acp_runtime_on_host(
-        core,
-        adapter_kind,
-        host_instance_id,
-        agent_run_id,
-        execution_epoch,
-    )
-    .await
-    else {
-        return;
     };
     let Some(first) = messages.first() else {
         return;
@@ -20889,7 +21691,7 @@ async fn process_agent_run_acp_message(
                 execution_epoch,
                 None,
                 "agent.thinking.title",
-                &intent,
+                &runtime.redact_output(&intent),
             )
             .await
             {
@@ -20962,6 +21764,7 @@ async fn process_agent_run_acp_message(
     if event_type == "runtime.usage" {
         return;
     }
+    let payload = runtime.redact_output(&payload);
     let evidence = match persist_runtime_evidence(
         core,
         agent_run_id,
@@ -21226,6 +22029,25 @@ fn normalize_acp_event_with_completion(
                 payload["runtimeDiff"] = json!({"adapterKind":adapter_kind.as_str(),"protocolFamily":zcode::PROTOCOL,
                     "sourceEventKind":"tool.updated.result","semanticKind":"zcode_edit_patch","entries":entries});
             }
+            if adapter_kind == AdapterKind::CommandCodeCli
+                && public_status == "completed"
+                && let Some(entries) = update.pointer("/_meta/rovaiCommandMutation/entries")
+            {
+                payload["runtimeDiff"] = json!({"adapterKind":adapter_kind.as_str(),"protocolFamily":"acp-v1",
+                    "sourceEventKind":"session/update.tool_call_update.completed.edit_file", "semanticKind":"reported_mutation", "entries":entries});
+            }
+            if adapter_kind == AdapterKind::ClineCli
+                && public_status == "completed"
+                && let Some(mutation) = update.pointer("/_meta/rovaiClineMutation")
+                && let Some(tool @ ("apply_patch" | "editor")) = mutation["tool"].as_str()
+                && let Some(entries) = mutation.get("entries")
+            {
+                payload["runtimeDiff"] = json!({
+                    "adapterKind":adapter_kind.as_str(),"protocolFamily":"acp-v1",
+                    "sourceEventKind":format!("session/update.tool_call_update.completed.{tool}"),
+                    "semanticKind":"reported_mutation","entries":entries,
+                });
+            }
             ("runtime.action", payload)
         }
         Some("plan") => ("runtime.plan", update),
@@ -21459,6 +22281,7 @@ async fn process_runtime_event(
     scope: RuntimeEventScope<'_>,
     event_type: &str,
     payload: &Value,
+    output_redactor: Option<&rovai_core::runtime_custom_api::CredentialRedactor>,
 ) -> Result<()> {
     let Some(_runtime_route_permit) = core.planned_shutdown.enter_runtime_route().await else {
         return Ok(());
@@ -21545,13 +22368,19 @@ async fn process_runtime_event(
         .await?;
         return Ok(());
     }
+    // Routing, native observations and image ingestion above consume raw data.
+    // Only this independently stored/displayed evidence payload is redacted.
+    let public_payload = output_redactor.map_or_else(
+        || payload.clone(),
+        |redactor| redactor.redacted_value(payload),
+    );
     let Some(evidence) = persist_runtime_evidence(
         core,
         scope.agent_run_id,
         scope.execution_epoch,
         scope.managed_output_root,
         event_type,
-        payload,
+        &public_payload,
     )
     .await?
     else {
@@ -21878,6 +22707,11 @@ async fn process_agent_run_acp_approval_request(
         }
     };
     if execution.permission_semantics == PermissionSemantics::RuntimeManagedV2
+        // V2 already resolves the global/build/plan policy. A remaining native
+        // request can come from an explicitly narrower custom or child agent.
+        && !(execution.runtime.adapter_kind == AdapterKind::OpencodeCli
+            && crate::opencode_compat::Generation::from_version(execution.runtime.reported_version.as_deref())
+                == Some(crate::opencode_compat::Generation::V2))
         && acp::automatically_allows_permission_requests(
             execution.runtime.adapter_kind,
             &execution.runtime.permissions.values,
@@ -22018,7 +22852,7 @@ async fn process_agent_run_acp_approval_request(
             "agentRunId": agent_run_id,
             "executionEpoch": execution_epoch,
             "nativeMethod": "session/request_permission",
-            "reason": request_reason,
+            "reason": request_reason.as_deref().map(|text| runtime.redact_text(text)),
             "result": preparation.result,
             "replayed": preparation.replayed,
         }),
@@ -22046,7 +22880,7 @@ async fn reject_acp_request(
             "agentRunId": agent_run_id,
             "executionEpoch": execution_epoch,
             "nativeMethod": "session/request_permission",
-            "reason": reason,
+            "reason": runtime.redact_text(reason),
         }),
     );
     Ok(())
@@ -22723,6 +23557,7 @@ async fn flush_runtime_usage(
     // finish this Run between advancing the native cursor and buffering it.
     for kind in [
         AdapterKind::CodebuddyCli,
+        AdapterKind::ClineCli,
         AdapterKind::KimiCodeCli,
         AdapterKind::OpencodeCli,
         AdapterKind::QoderCli,
@@ -22864,7 +23699,15 @@ async fn process_agent_run_codex_delta_batch(
     messages: Vec<Value>,
     runtime_route_permit: &mut rovai_core::planned_shutdown::RuntimeRoutePermit,
 ) {
-    let prepared = match prepare_codex_delta_batch(&messages) {
+    let Some(runtime) = core
+        .codex_cli
+        .get_agent_run_on_host(host_instance_id, agent_run_id, execution_epoch)
+        .await
+    else {
+        return;
+    };
+    let prepared = match prepare_codex_delta_batch(&messages, |value| runtime.redact_output(value))
+    {
         Ok(Some(prepared)) => prepared,
         Ok(None) => {
             for message in messages {
@@ -22899,13 +23742,6 @@ async fn process_agent_run_codex_delta_batch(
             }
             return;
         }
-    };
-    let Some(runtime) = core
-        .codex_cli
-        .get_agent_run_on_host(host_instance_id, agent_run_id, execution_epoch)
-        .await
-    else {
-        return;
     };
     let evidence = match persist_prepared_runtime_evidence_batch(
         core,
@@ -23109,6 +23945,7 @@ async fn process_agent_run_codex_message(
                 },
                 "runtime.fast.observed",
                 &json!({"state": state, "observedServiceTier": tier}),
+                None,
             )
             .await;
         }
@@ -23152,6 +23989,7 @@ async fn process_agent_run_codex_message(
     }
     let (event_type, payload) = codex::normalize_event(&method, &params);
     runtime.observe_agent_message(&method, &params).await;
+    let payload = runtime.redact_output(&payload);
     let evidence = match persist_runtime_evidence(
         core,
         agent_run_id,
@@ -23317,7 +24155,7 @@ async fn process_agent_run_codex_message(
                     &ManagedBlobStore::new(&core.data_dir),
                     agent_run_id,
                     execution_epoch,
-                    &payload,
+                    &runtime.redact_output(&payload),
                     runtime
                         .builtin_tool_process_config()
                         .map(BuiltinToolProcessConfig::run_tmp),
@@ -23351,10 +24189,14 @@ async fn process_agent_run_codex_message(
     {
         eprintln!("failed to flush Codex monitoring for AgentRun {agent_run_id}: {error:#}");
     }
-    let missing_send_recovery_candidate = completed.final_agent_message.clone().map(|body| {
+    let completed_message = completed
+        .final_agent_message
+        .as_deref()
+        .map(|text| runtime.redact_text(text));
+    let missing_send_recovery_candidate = completed_message.clone().map(|body| {
         MissingSendRecoveryCandidate::new(MissingSendRecoveryBoundary::CodexCompletedTurn, body)
     });
-    let final_agent_message = match completed.final_agent_message.clone() {
+    let final_agent_message = match completed_message {
         Some(message) => Some(message),
         None => runtime.final_agent_message().await,
     };
@@ -23390,7 +24232,8 @@ async fn process_agent_run_codex_message(
             completed.turn_id, completed.status
         ),
     };
-    let public_failure = (planned_outcome == RuntimeTerminalOutcome::Failed).then(|| {
+    let error_detail = runtime.redact_text(&error_detail);
+    let mut public_failure = (planned_outcome == RuntimeTerminalOutcome::Failed).then(|| {
         if completed.status == "failed" {
             rovai_core::runtime_failure::public_codex_terminal_failure(
                 &base_error_code,
@@ -23409,6 +24252,12 @@ async fn process_agent_run_codex_message(
             )
         }
     });
+    if let Some(failure) = &mut public_failure {
+        failure.detail = failure
+            .detail
+            .as_deref()
+            .map(|detail| runtime.redact_text(detail));
+    }
     let error_code = public_failure
         .as_ref()
         .map(|failure| failure.code.clone())
@@ -23843,7 +24692,7 @@ async fn process_agent_run_approval_request(
             "agentRunId": server_request.agent_run_id,
             "executionEpoch": server_request.execution_epoch,
             "nativeMethod": server_request.method,
-            "reason": request_reason,
+            "reason": request_reason.as_deref().map(|text| runtime.redact_text(text)),
             "result": preparation.result,
             "replayed": preparation.replayed,
         }),
@@ -23956,7 +24805,7 @@ async fn reject_agent_run_approval_request(
             "agentRunId": request.agent_run_id,
             "executionEpoch": request.execution_epoch,
             "nativeMethod": request.method,
-            "reason": reason,
+            "reason": runtime.redact_text(reason),
         }),
     );
     Ok(())
@@ -24283,7 +25132,7 @@ async fn process_runtime_check_manager(
         tokio::select! {
             request = requests.recv() => {
                 let Some(request) = request else { break };
-                if execution_deferrals.should_defer(request.runtime_kind, request.trigger) {
+                if request.model_target.is_none() && execution_deferrals.should_defer(request.runtime_kind, request.trigger) {
                     if let Some(completion) = request.completion {
                         let _ = completion.send(Ok(RuntimeCheckOutcome::Superseded));
                     }
@@ -24332,10 +25181,11 @@ async fn process_runtime_check_manager(
                 if let Some(completion) = request.completion {
                     waiters.push(completion);
                 }
-                let is_private_check = request.startup_preview.is_some();
+                let is_private_check = request.startup_preview.is_some() || request.model_target.is_some();
                 let attempt = RuntimeCheckAttempt {
                     search: request.search,
                     startup_preview: request.startup_preview,
+                    model_target: request.model_target,
                     attempt_id: attempt_id.clone(),
                     runtime_kind: request.runtime_kind,
                     purpose: request.purpose,
@@ -24345,7 +25195,7 @@ async fn process_runtime_check_manager(
                     deadline,
                     waiters,
                 };
-                if !is_private_check {
+                if !is_private_check && !(attempt.runtime_kind == AdapterKind::Pi && attempt.catalog_only) {
                 core.runtime_check_activity.write().await.insert(
                     request.runtime_kind,
                     RuntimeCheckActivity {
@@ -24437,7 +25287,10 @@ async fn process_runtime_check_manager(
                 .map(|(index, _)| index);
             let Some(next) = next else { break };
             let attempt = pending.swap_remove(next);
-            if attempt.startup_preview.is_none() {
+            if attempt.startup_preview.is_none()
+                && attempt.model_target.is_none()
+                && !(attempt.runtime_kind == AdapterKind::Pi && attempt.catalog_only)
+            {
                 core.runtime_check_activity.write().await.insert(
                     attempt.runtime_kind,
                     RuntimeCheckActivity {
@@ -24462,10 +25315,15 @@ async fn process_runtime_check_manager(
             let worker_startup_preview = attempt.startup_preview.clone();
             let worker_search = attempt.search.clone();
             let worker_catalog_only = attempt.catalog_only;
+            let worker_model_target = attempt.model_target.clone();
             let abort_handle = checks.spawn(async move {
                 let mut catalog_only = worker_catalog_only;
                 let (result, finalization) = match tokio::time::timeout_at(worker_deadline, async {
-                    if let Some(preview) = worker_startup_preview {
+                    if let Some(target) = worker_model_target {
+                        check_core
+                            .refresh_dsh_model_options(worker_search, target)
+                            .await
+                    } else if let Some(preview) = worker_startup_preview {
                         let result = check_core
                             .inspect_runtime_startup(
                                 worker_kind,
@@ -24554,7 +25412,7 @@ async fn finalize_runtime_check(
     mut result: std::result::Result<RuntimeCheckOutcome, String>,
     finalization: RuntimeCheckFinalization,
 ) {
-    if attempt.startup_preview.is_some() {
+    if attempt.startup_preview.is_some() || attempt.model_target.is_some() {
         for waiter in attempt.waiters {
             let _ = waiter.send(result.clone());
         }
@@ -25798,6 +26656,45 @@ mod tests {
 
     #[test]
     fn runtime_check_activity_has_two_slots_and_one_terminal_owner() {
+        for kind in [AdapterKind::Pi, AdapterKind::CodexCli] {
+            for catalog_only in [false, true] {
+                for trigger in [
+                    RuntimeCheckTrigger::CatalogOpen,
+                    RuntimeCheckTrigger::UserCheck,
+                ] {
+                    let search = Arc::new(RuntimeSearchEnvironment::for_test_paths(1, Vec::new()));
+                    let attempt = RuntimeCheckAttempt {
+                        search: search.clone(),
+                        startup_preview: None,
+                        model_target: None,
+                        attempt_id: "fixture".into(),
+                        runtime_kind: kind,
+                        purpose: RuntimeLaunchPurpose::AvailabilityCheck,
+                        trigger,
+                        catalog_only,
+                        started_at: tokio::time::Instant::now(),
+                        deadline: tokio::time::Instant::now(),
+                        waiters: vec![],
+                    };
+                    let (acknowledged, _) = oneshot::channel();
+                    let request = RuntimeCheckRequest {
+                        search,
+                        startup_preview: None,
+                        model_target: None,
+                        runtime_kind: kind,
+                        purpose: RuntimeLaunchPurpose::AvailabilityCheck,
+                        trigger,
+                        acknowledged,
+                        completion: None,
+                    };
+                    assert_eq!(
+                        attempt.accepts(&request),
+                        kind != AdapterKind::Pi
+                            || catalog_only == (trigger == RuntimeCheckTrigger::CatalogOpen)
+                    );
+                }
+            }
+        }
         assert!(runtime_check_can_satisfy(
             false,
             RuntimeCheckTrigger::CatalogOpen
@@ -26070,6 +26967,24 @@ mod tests {
                     .policy_for(AdapterKind::DeepseekHarness)
                     .unwrap_or(CompactionDetectorPolicy::Disabled),
             )?,
+            command_code_cli: AcpCliRuntimeAdapter::new(
+                AdapterKind::CommandCodeCli,
+                acp_tx.clone(),
+                data_dir.join("runtime/command-code"),
+                runtime_fleet.clone(),
+                compaction_detector_policies
+                    .policy_for(AdapterKind::CommandCodeCli)
+                    .unwrap_or(CompactionDetectorPolicy::Disabled),
+            )?,
+            cline_cli: AcpCliRuntimeAdapter::new(
+                AdapterKind::ClineCli,
+                acp_tx.clone(),
+                data_dir.join("runtime/cline-cli"),
+                runtime_fleet.clone(),
+                compaction_detector_policies
+                    .policy_for(AdapterKind::ClineCli)
+                    .unwrap_or(CompactionDetectorPolicy::Disabled),
+            )?,
             grok_build: AcpCliRuntimeAdapter::new(
                 AdapterKind::GrokBuild,
                 acp_tx.clone(),
@@ -26310,6 +27225,349 @@ while IFS= read -r _ignored; do :; done
 
     #[cfg(all(target_os = "macos", feature = "slow-tests"))]
     #[tokio::test]
+    async fn pi_catalog_observations_are_independent_of_health_and_fenced_by_identity() {
+        // Unique owner for Pi's no-health bootstrap, manager coalescing and SQL
+        // readback. The Codex owner intentionally requires a Ready snapshot and
+        // permits full-check fallback, so it cannot own this opposite contract.
+        let root = std::env::temp_dir().join(format!("rovai-pi-catalog-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let executable = root.join("pi");
+        write_runtime_resolution_executable(&executable, &r#"#!/bin/sh
+root='__ROOT__'
+printf '%s\n' "$*" >> "$root/calls"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$root/requests"
+  id=$(printf '%s\n' "$line" | /usr/bin/sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"type":"get_state"'*) printf '{"type":"response","id":"%s","command":"get_state","success":true,"data":{}}\n' "$id" ;;
+    *'"type":"get_available_models"'*)
+      /usr/bin/touch "$root/started"
+      while [ ! -f "$root/release" ]; do /bin/sleep 0.01; done
+      if [ -f "$root/provider-error" ]; then
+        printf '%s\n' '{"type":"extension_error","extensionPath":"fixture.ts","event":"register_provider","error":"invalid provider configuration"}'
+      fi
+      printf '{"type":"response","id":"%s","command":"get_available_models","success":true,"data":{"models":' "$id"
+      /bin/cat "$root/models"
+      printf '}}\n' ;;
+    *) exit 1 ;;
+  esac
+done
+"#.replace("__ROOT__", root.to_str().unwrap()));
+        std::fs::write(
+            root.join("models"),
+            r#"[{"provider":"fixture","id":"old","reasoning":true}]"#,
+        )
+        .unwrap();
+        let mut core = runtime_resolution_test_core(&root).unwrap();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        core.runtime_check_requests = sender;
+        *core.runtime_search_environment.get_mut() = Arc::new(
+            RuntimeSearchEnvironment::for_test_paths(1, Vec::new()).with_startup_configuration(
+                AdapterKind::Pi,
+                rovai_core::runtime_startup::RuntimeStartupConfiguration {
+                    program_path: Some(executable.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            ),
+        );
+        core.database
+            .lock()
+            .await
+            .connection()
+            .execute(
+                "UPDATE runtime_search_environment_state SET generation = 1",
+                [],
+            )
+            .unwrap();
+        let core = Arc::new(core);
+        let (stop, shutdown) = oneshot::channel();
+        let manager = tokio::spawn(process_runtime_check_manager(
+            core.clone(),
+            receiver,
+            shutdown,
+        ));
+        async fn started(root: &Path) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !root.join("started").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("Pi catalog fixture did not start");
+        }
+        assert!(
+            core.enqueue_runtime_check(
+                AdapterKind::Pi,
+                RuntimeLaunchPurpose::AvailabilityCheck,
+                RuntimeCheckTrigger::CatalogOpen
+            )
+            .await
+            .unwrap()
+        );
+        started(&root).await;
+        assert!(
+            core.runtime_check_activity.read().await.is_empty(),
+            "directory reads must not mark Runtime checking"
+        );
+        {
+            let database = core.database.lock().await;
+            let installation = AgentProfileService::default()
+                .managed_installation(&database, AdapterKind::Pi, "default")
+                .unwrap()
+                .unwrap();
+            assert!(
+                installation.snapshot.is_none(),
+                "static installation exists without any health snapshot"
+            );
+        }
+        let (acknowledged, acknowledgement) = oneshot::channel();
+        let (completion, waiter) = oneshot::channel();
+        core.runtime_check_requests
+            .send(RuntimeCheckRequest {
+                search: core.runtime_search_environment.read().await.clone(),
+                startup_preview: None,
+                model_target: None,
+                runtime_kind: AdapterKind::Pi,
+                purpose: RuntimeLaunchPurpose::AvailabilityCheck,
+                trigger: RuntimeCheckTrigger::CatalogOpen,
+                acknowledged,
+                completion: Some(completion),
+            })
+            .unwrap();
+        assert!(
+            !acknowledgement.await.unwrap(),
+            "same-environment opens share one probe"
+        );
+        std::fs::write(root.join("release"), "").unwrap();
+        assert_eq!(waiter.await.unwrap().unwrap(), RuntimeCheckOutcome::Ready);
+        let payload = core
+            .open_runtime_model_catalog(AdapterKind::Pi, true)
+            .await
+            .unwrap();
+        assert_eq!(payload["refreshStatus"], "not_required");
+        assert_eq!(payload["cache"]["status"], "fresh");
+        assert_eq!(payload["models"][1]["options"][0]["key"], "thinking_level");
+        assert_eq!(
+            std::fs::read_to_string(root.join("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        {
+            let database = core.database.lock().await;
+            let installation = AgentProfileService::default()
+                .managed_installation(&database, AdapterKind::Pi, "default")
+                .unwrap()
+                .unwrap();
+            let mut models = installation.snapshot.unwrap().models;
+            models[1].runtime_metadata = None;
+            database.connection().execute("UPDATE adapter_capability_snapshot SET model_catalog_json=?1 WHERE installation_id=?2",
+                rusqlite::params![serde_json::to_string(&models).unwrap(), installation.id]).unwrap();
+        }
+        assert_eq!(
+            core.runtime_model_catalog_payload(AdapterKind::Pi, "not_required")
+                .await
+                .unwrap()["cache"]["status"],
+            "stale"
+        );
+        // Missing native capability data becomes an attempted unknown, not a
+        // recurring refresh. The fresh old-format cache needed exactly one read.
+        std::fs::write(
+            root.join("models"),
+            r#"[{"provider":"fixture","id":"old"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            core.open_runtime_model_catalog(AdapterKind::Pi, true)
+                .await
+                .unwrap()["refreshStatus"],
+            "completed"
+        );
+        assert_eq!(
+            core.open_runtime_model_catalog(AdapterKind::Pi, true)
+                .await
+                .unwrap()["refreshStatus"],
+            "not_required"
+        );
+        {
+            let database = core.database.lock().await;
+            let installation = AgentProfileService::default()
+                .managed_installation(&database, AdapterKind::Pi, "default")
+                .unwrap()
+                .unwrap();
+            let snapshot = installation.snapshot.unwrap();
+            assert_eq!(snapshot.probe_status, "installed_unverified");
+            assert_eq!(snapshot.authentication_status, "unknown");
+            assert_eq!(snapshot.last_successful_probe_at, None);
+            assert!(snapshot.capabilities.is_empty());
+            database.connection().execute("UPDATE adapter_capability_snapshot SET probe_status='ready', authentication_status='authenticated', last_successful_probe_at='2026-01-01T00:00:00Z', stale_at='old-health-invalid', last_error='old-health-failure' WHERE installation_id=?1", [installation.id]).unwrap();
+        }
+        // New environment: directory can recover without reviving stale health.
+        {
+            let _update = core.runtime_search_update.lock().await;
+            let mut search = core.runtime_search_environment.write().await;
+            *search = Arc::new(search.as_ref().clone().with_generation(2));
+            core.database
+                .lock()
+                .await
+                .connection()
+                .execute(
+                    "UPDATE runtime_search_environment_state SET generation=2",
+                    [],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            core.runtime_model_catalog_payload(AdapterKind::Pi, "not_required")
+                .await
+                .unwrap()["cache"]["status"],
+            "invalidated"
+        );
+        assert_eq!(
+            core.open_runtime_model_catalog(AdapterKind::Pi, true)
+                .await
+                .unwrap()["refreshStatus"],
+            "completed"
+        );
+        let before_failure = core
+            .runtime_model_catalog_payload(AdapterKind::Pi, "not_required")
+            .await
+            .unwrap();
+        std::fs::write(
+            root.join("models"),
+            r#"[{"provider":"fixture","id":"partial","reasoning":false}]"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("provider-error"), "").unwrap();
+        assert_eq!(
+            core.await_runtime_check(
+                AdapterKind::Pi,
+                RuntimeLaunchPurpose::AvailabilityCheck,
+                RuntimeCheckTrigger::CatalogOpen
+            )
+            .await
+            .unwrap(),
+            RuntimeCheckOutcome::StableFailure
+        );
+        let after_failure = core
+            .runtime_model_catalog_payload(AdapterKind::Pi, "failed")
+            .await
+            .unwrap();
+        assert_eq!(after_failure["models"], before_failure["models"]);
+        assert_eq!(after_failure["cache"], before_failure["cache"]);
+        std::fs::remove_file(root.join("provider-error")).unwrap();
+        // Same successful RPC without an exposed error is only an observation:
+        // no invented completeness property, no permanent merge of absent models.
+        assert_eq!(
+            core.await_runtime_check(
+                AdapterKind::Pi,
+                RuntimeLaunchPurpose::AvailabilityCheck,
+                RuntimeCheckTrigger::CatalogOpen
+            )
+            .await
+            .unwrap(),
+            RuntimeCheckOutcome::Ready
+        );
+        let partial = core
+            .runtime_model_catalog_payload(AdapterKind::Pi, "completed")
+            .await
+            .unwrap();
+        assert_eq!(partial["models"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            partial["models"][1]["id"],
+            "pi://model?provider=fixture&id=partial"
+        );
+        for changed_identity in ["installation", "environment", "executable"] {
+            std::fs::remove_file(root.join("started")).unwrap();
+            std::fs::remove_file(root.join("release")).unwrap();
+            std::fs::write(
+                root.join("models"),
+                r#"[{"provider":"fixture","id":"obsolete"}]"#,
+            )
+            .unwrap();
+            let late = tokio::spawn({
+                let core = core.clone();
+                async move {
+                    core.await_runtime_check(
+                        AdapterKind::Pi,
+                        RuntimeLaunchPurpose::AvailabilityCheck,
+                        RuntimeCheckTrigger::CatalogOpen,
+                    )
+                    .await
+                    .unwrap()
+                }
+            });
+            started(&root).await;
+            let _update = core.runtime_search_update.lock().await;
+            if changed_identity == "environment" {
+                let mut search = core.runtime_search_environment.write().await;
+                *search = Arc::new(
+                    search
+                        .as_ref()
+                        .clone()
+                        .with_generation(search.generation() + 1),
+                );
+                core.database
+                    .lock()
+                    .await
+                    .connection()
+                    .execute(
+                        "UPDATE runtime_search_environment_state SET generation=generation+1",
+                        [],
+                    )
+                    .unwrap();
+            } else if changed_identity == "installation" {
+                core.database.lock().await.connection().execute("UPDATE adapter_installation SET generation=generation+1 WHERE adapter_kind='pi'", []).unwrap();
+            } else {
+                let mut script = std::fs::read_to_string(&executable).unwrap();
+                script.push_str("\n# replaced during the catalog observation\n");
+                std::fs::write(&executable, script).unwrap();
+            }
+            drop(_update);
+            std::fs::write(root.join("release"), "").unwrap();
+            assert_eq!(late.await.unwrap(), RuntimeCheckOutcome::Superseded);
+        }
+        {
+            let database = core.database.lock().await;
+            let snapshot = AgentProfileService::default()
+                .managed_installation(&database, AdapterKind::Pi, "default")
+                .unwrap()
+                .unwrap()
+                .snapshot
+                .unwrap();
+            assert_eq!(
+                snapshot.models[1].id,
+                "pi://model?provider=fixture&id=partial"
+            );
+            assert_eq!(snapshot.stale_at.as_deref(), Some("old-health-invalid"));
+            assert_eq!(snapshot.last_error.as_deref(), Some("old-health-failure"));
+            assert_eq!(
+                snapshot.last_successful_probe_at.as_deref(),
+                Some("2026-01-01T00:00:00Z")
+            );
+        }
+        assert!(core.runtime_check_activity.read().await.is_empty());
+        assert!(core.runtime_product_diagnostics.read().await.is_empty());
+        for line in std::fs::read_to_string(root.join("requests"))
+            .unwrap()
+            .lines()
+        {
+            let request: Value = serde_json::from_str(line).unwrap();
+            assert!(matches!(
+                request["type"].as_str(),
+                Some("get_state" | "get_available_models")
+            ));
+        }
+        stop.send(()).unwrap();
+        manager.await.unwrap();
+        drop(core);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(all(target_os = "macos", feature = "slow-tests"))]
+    #[tokio::test]
     async fn codex_catalog_waiters_share_refresh_without_satisfying_full_validation() {
         // The existing Core + temporary process fixture owns real manager
         // coalescing and writeback fencing; a pure cache test cannot cover these.
@@ -26434,6 +27692,7 @@ done
             .send(RuntimeCheckRequest {
                 search: core.runtime_search_environment.read().await.clone(),
                 startup_preview: None,
+                model_target: None,
                 runtime_kind: AdapterKind::CodexCli,
                 purpose: RuntimeLaunchPurpose::AvailabilityCheck,
                 trigger: RuntimeCheckTrigger::CatalogOpen,
@@ -26464,6 +27723,7 @@ done
             .send(RuntimeCheckRequest {
                 search: core.runtime_search_environment.read().await.clone(),
                 startup_preview: None,
+                model_target: None,
                 runtime_kind: AdapterKind::CodexCli,
                 purpose: RuntimeLaunchPurpose::AvailabilityCheck,
                 trigger: RuntimeCheckTrigger::UserCheck,
@@ -27540,7 +28800,7 @@ done
             &id_bearing_output_delta
         ));
         assert!(
-            prepare_codex_delta_batch(std::slice::from_ref(&command_output_message))
+            prepare_codex_delta_batch(std::slice::from_ref(&command_output_message), Value::clone)
                 .unwrap()
                 .is_none()
         );
@@ -27677,19 +28937,23 @@ done
         let CodexIncoming::Message { message, .. } = codex_delta else {
             unreachable!()
         };
-        assert!(prepare_codex_delta_batch(&[message]).unwrap().is_none());
+        assert!(
+            prepare_codex_delta_batch(&[message], Value::clone)
+                .unwrap()
+                .is_none()
+        );
         let mut item_bounded_batch = vec![
             json!({"method":"item/plan/delta","params":{"delta":"step"}});
             RUNTIME_EVIDENCE_DELTA_BATCH_MAX_ITEMS
         ];
         assert!(
-            prepare_codex_delta_batch(&item_bounded_batch)
+            prepare_codex_delta_batch(&item_bounded_batch, Value::clone)
                 .unwrap()
                 .is_some()
         );
         item_bounded_batch.push(item_bounded_batch[0].clone());
         assert!(
-            prepare_codex_delta_batch(&item_bounded_batch)
+            prepare_codex_delta_batch(&item_bounded_batch, Value::clone)
                 .unwrap()
                 .is_none()
         );
@@ -27702,7 +28966,7 @@ done
             }
         });
         assert!(
-            prepare_codex_delta_batch(&[oversized_delta])
+            prepare_codex_delta_batch(&[oversized_delta], Value::clone)
                 .unwrap()
                 .is_none()
         );
@@ -27714,7 +28978,7 @@ done
             unreachable!()
         };
         assert!(
-            prepare_codex_delta_batch(&[terminal_message])
+            prepare_codex_delta_batch(&[terminal_message], Value::clone)
                 .unwrap()
                 .is_none()
         );
@@ -27739,7 +29003,8 @@ done
                     delivery_id,
                     sequence,
                     message,
-                }]
+                }],
+                Value::clone,
             )
             .unwrap()
             .is_none()
@@ -27764,7 +29029,8 @@ done
                     delivery_id,
                     sequence,
                     message,
-                }]
+                }],
+                Value::clone,
             )
             .unwrap()
             .is_none()
@@ -28694,6 +29960,26 @@ done
 
     #[test]
     fn controlled_native_resume_classifies_only_explicit_rejection_as_incompatible() {
+        let missing = crate::command_code_acp::verify_restore_target(
+            &json!({"sessions": []}),
+            "missing-session",
+            "/workspace",
+        )
+        .unwrap_err();
+        assert_eq!(
+            classify_native_resume_failure(&missing),
+            NativeSessionResumeFailure::Incompatible
+        );
+        let invalid = crate::command_code_acp::verify_restore_target(
+            &json!({}),
+            "missing-session",
+            "/workspace",
+        )
+        .unwrap_err();
+        assert_eq!(
+            classify_native_resume_failure(&invalid),
+            NativeSessionResumeFailure::Ambiguous
+        );
         assert_eq!(
             classify_native_resume_failure(&anyhow::anyhow!("session not found")),
             NativeSessionResumeFailure::Incompatible
@@ -31165,6 +32451,7 @@ for line in sys.stdin:
             "#!/bin/sh\ntrap '' TERM\nread -r line\nprintf '%s\\n' '{\"id\":1,\"result\":{}}'\nwhile read -r line; do :; done\n",
         );
         let runtime_config = FrozenAgentRuntimeConfig {
+            environment: None,
             custom_api: None,
             camp_fast: None,
             adapter_kind: AdapterKind::CodexCli,
@@ -31178,6 +32465,7 @@ for line in sys.stdin:
             capabilities: vec!["codex.app_server_v2".into()],
             protocol_version: "codex-app-server-v2".into(),
             model: rovai_core::agent_profile::ResolvedModelSelection {
+                dsh_source: None,
                 source: "runtime_default".into(),
                 model_id: "default".into(),
                 options: json!({}),
@@ -31281,6 +32569,53 @@ for line in sys.stdin:
         assert_eq!(payload["toolName"], "execute");
         assert!(payload["rawInputDigest"].is_string());
         assert!(payload["rawOutputDigest"].is_string());
+
+        let command_initial = json!({"sessionUpdate":"tool_call", "toolCallId":"command-edit",
+            "status":"pending", "kind":"edit", "title":"Edit file",
+            "locations":[{"path":"src/a.ts"}],
+            "rawInput":{"file_path":"src/a.ts","old_string":"old\n","new_string":"new\n","private":"COMMAND_PRIVATE"},
+            "content":[{"type":"diff","path":"src/a.ts","oldText":"old\n","newText":"new\n"}]});
+        for (status, has_diff) in [
+            ("pending", false),
+            ("in_progress", false),
+            ("failed", false),
+            ("completed", true),
+        ] {
+            let mut update = json!({"sessionUpdate":"tool_call_update","toolCallId":"command-edit","status":status});
+            rovai_core::command_code_acp::enrich_tool_update(&mut update, Some(&command_initial));
+            let (_, payload) = normalize_acp_event(
+                AdapterKind::CommandCodeCli,
+                "session/update",
+                &json!({"update":update}),
+            );
+            assert_eq!(!payload["runtimeDiff"].is_null(), has_diff, "{status}");
+            if has_diff {
+                assert_eq!(payload["runtimeDiff"]["semanticKind"], "reported_mutation");
+                assert_eq!(
+                    payload.pointer("/runtimeDiff/entries/0/fragments/0/oldText"),
+                    Some(&json!("old\n"))
+                );
+            }
+            assert!(!payload.to_string().contains("COMMAND_PRIVATE"));
+        }
+        for case in ["unknown-kind", "replace-all", "empty-old"] {
+            let mut initial = command_initial.clone();
+            let mut update = initial.clone();
+            rovai_core::command_code_acp::enrich_tool_update(&mut update, None);
+            assert_eq!(
+                update["content"],
+                json!([]),
+                "proposed diff must never enter complete-file evidence"
+            );
+            match case {
+                "unknown-kind" => initial["kind"] = json!("other"),
+                "replace-all" => initial["rawInput"]["replace_all"] = json!(true),
+                _ => initial["rawInput"]["old_string"] = json!(""),
+            }
+            update["status"] = json!("completed");
+            rovai_core::command_code_acp::enrich_tool_update(&mut update, Some(&initial));
+            assert!(update.pointer("/_meta/rovaiCommandMutation").is_none());
+        }
 
         let query = "password=公开测试词 token=也照常展示";
         let (_, web_payload) = normalize_acp_event(
@@ -31443,7 +32778,7 @@ for line in sys.stdin:
             .into_iter()
             .filter(|adapter_kind| adapter_kind.uses_acp())
             .collect::<Vec<_>>();
-        assert_eq!(acp_adapters.len(), 12);
+        assert_eq!(acp_adapters.len(), 14);
         for adapter_kind in acp_adapters {
             let expected_output = format!("{} terminal output", adapter_kind.as_str());
             let (event_type, payload) = normalize_acp_event(
