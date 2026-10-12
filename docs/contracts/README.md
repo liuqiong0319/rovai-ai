@@ -1,7 +1,7 @@
 ---
 document_type: contracts-index
 authority: protocol-contract-routing
-last_updated: 2026-10-10
+last_updated: 2026-10-12
 ---
 
 # 长期接口合同
@@ -112,7 +112,9 @@ Architecture 解释组件如何组成，Version 概览记录交付范围；它�
 | [Camp Open Projection v10（历史）](camp-open-projection-v10.md) | main Snapshot 34/Open 6；Open 不读取 event_log，移除 timeline/coverage.timeline，保留 high-water 与业务卡片 |
 | [Camp Open Projection v10（渠道分支历史）](camp-open-projection-channel-v10.md) | v9 保留；Camp/Navigation 增加可选 channelSource，原始 title 不变；合并时保留原文以区分同号合同 |
 | [Camp Open Projection v9（历史）](camp-open-projection-v9.md) | v8 保留；Snapshot 34/Open 5 增加可选 member.fast，仅查询安全缓存 |
-| [Runtime Launch and Verification v58（当前）](runtime-launch-and-verification-v58.md) | 配置透传、队员会话创建时固定、显式重置及 Camp/队员/会话进程归属 |
+| [Runtime Launch and Verification v60（当前）](runtime-launch-and-verification-v60.md) | 同类 CLI 优先原 ID 恢复、Adapter 证据限定一次降级、历史上下文不阻断新输入 |
+| [Runtime Launch and Verification v59（历史）](runtime-launch-and-verification-v59.md) | 启动时读取队员环境、Warm 保持、快照退役与单任务失败隔离 |
+| [Runtime Launch and Verification v58（历史）](runtime-launch-and-verification-v58.md) | 配置透传、队员会话创建时固定、显式重置及 Camp/队员/会话进程归属 |
 | [Runtime Launch and Verification v57（历史）](runtime-launch-and-verification-v57.md) | 队员私有 JSON 环境、冻结计划和兼容复用；Agents 旧环境停用与人工迁移 |
 | [Runtime Launch and Verification v56（历史）](runtime-launch-and-verification-v56.md) | Kimi 使用官方 Provider 配置，退役 Rovai 私有 env、注入及复用摘要；继承 Pi 目录与思考强度合同 |
 | [Runtime Launch and Verification v55（历史）](runtime-launch-and-verification-v55.md) | Pi 目录观察独立于健康、同模型续接避免重复选模、thinking_level 非破坏性保存与严格执行核验 |
@@ -142,7 +144,8 @@ Architecture 解释组件如何组成，Version 概览记录交付范围；它�
 | [Runtime Launch and Verification v31（历史）](runtime-launch-and-verification-v31.md) | v30 的 Pi wire/安全语义不变；三平台改为明确的可运行 experimental preview，仍不宣称 qualified |
 | [Runtime Launch and Verification v30（历史）](runtime-launch-and-verification-v30.md) | v29 保留；增加 Pi JSONL Host、专属 Ready/exact resume、managed receipt、动态 Skills/MCP、Action/Usage 与三平台未准入边界 |
 | [Runtime Launch and Verification v29（历史）](runtime-launch-and-verification-v29.md) | v28 保留；现有 Check Manager 的 Fast metadata 与单执行原生覆盖 |
-| [Runtime Usage Monitoring v8（当前）](runtime-usage-monitoring-v8.md) | 逐调用归一化、批次无关计数与 Input/Output 部分状态 |
+| [Runtime Usage Monitoring v9（当前）](runtime-usage-monitoring-v9.md) | Run 终态独立于统计刷盘，后台采样与迟到数据去重 |
+| [Runtime Usage Monitoring v8（历史）](runtime-usage-monitoring-v8.md) | 逐调用归一化、批次无关计数与 Input/Output 部分状态 |
 | [Runtime Usage Monitoring v7（历史）](runtime-usage-monitoring-v7.md) | Antigravity 同调用原生 SQLite 数值补充与完整输入分类 |
 | [Runtime Usage Monitoring v6（历史）](runtime-usage-monitoring-v6.md) | DSH 原生完整调用 total 接通，缓存缺失继续保留未知 |
 | [Runtime Usage Monitoring v5（历史）](runtime-usage-monitoring-v5.md) | 按原生格式准入、去除指标版本门槛；TRAE journal 与 Antigravity step 补采 |
@@ -561,7 +564,8 @@ Architecture 解释组件如何组成，Version 概览记录交付范围；它�
 | [ContextManifest Evidence v9 (historical)](context-manifest-evidence-v9.md) | bounded public omission evidence；不作为 Formatter v13 恢复入口 |
 | [Context Delivery Profile v2 (historical)](context-delivery-profile-v2.md) | 公共引用链与历史 budget 的旧当前合同；不选择 self-active Task |
 | [Context Delivery Profile v1 (historical)](context-delivery-profile-v1.md) | AgentRun 公共消息窗口、Unicode scalar 正文截断、历史字符预算与遗漏提示 |
-| [Run Process Detail Surface v49（当前）](run-process-detail-surface-v49.md) | 单行预览首次读取失败的事件驱动恢复、在途更新补拉及新旧 Evidence 合并；不改变 v48 展示与授权规则 |
+| [Run Process Detail Surface v50（当前）](run-process-detail-surface-v50.md) | 每 Run 的发送前固定锚点与成功发送跟随、单行内按原文换行推进及 RunCard 高亮 |
+| [Run Process Detail Surface v49（历史）](run-process-detail-surface-v49.md) | 单行预览首次读取失败的事件驱动恢复、在途更新补拉及新旧 Evidence 合并；不改变 v48 展示与授权规则 |
 | [Run Process Detail Surface v48](run-process-detail-surface-v48.md) | 停止区短竖线分隔、默认中性色停止按钮；按持久化续做 Delivery 恢复已受理重试的收起状态 |
 | [Run Process Detail Surface v47（历史）](run-process-detail-surface-v47.md) | 会话内单行队员占位、V2 确认停止、命令图标与中断重试；复用已有命令和 Evidence |
 | [Run Process Detail Surface v46（历史）](run-process-detail-surface-v46.md) | 继承 v45；继续图标直接提交，取消新会话确认弹窗 |

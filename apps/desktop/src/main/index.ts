@@ -35,6 +35,7 @@ import type {
   LocalAttachmentSourceView,
   RuntimeUsageSnapshot,
   NavigationPin,
+  NavigationPreferencesSnapshot,
   SaveMemberAvatarAssetInput,
   SettingsSection,
   StartupLocationMode,
@@ -1620,6 +1621,20 @@ ipcMain.handle('rovai:window-reset-bounds', (event) => {
   )
 })
 
+function publishNavigationPreferences(snapshot: NavigationPreferencesSnapshot): NavigationPreferencesSnapshot {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) window.webContents.send('rovai:navigation-preferences-changed', snapshot)
+  }
+  return snapshot
+}
+
+ipcMain.handle('rovai:navigation-preferences-register-projects', (_event, paths: string[], completeLegacy: boolean) => {
+  if (typeof completeLegacy !== 'boolean') throw new Error('Invalid project registration request')
+  return projectAccessTransactions.run(async () => publishNavigationPreferences(
+    await requireNavigationPreferences().registerProjects(paths, completeLegacy)
+  ))
+})
+
 ipcMain.handle('rovai:navigation-preferences-set-thread-read-state', (_event, threadId: unknown, state: unknown) => {
   if (typeof threadId !== 'string' || (state !== null && !isNavigationThreadReadState(state))) {
     throw new Error('Invalid Thread read state request')
@@ -1634,23 +1649,11 @@ ipcMain.handle('rovai:navigation-preferences-set-thread-read-state', (_event, th
 })
 
 ipcMain.handle('rovai:navigation-preferences-get', () =>
-  projectAccessTransactions.run(async () => requireNavigationPreferences().get())
+  projectAccessTransactions.run(() => requireNavigationPreferences().reload())
 )
 
 ipcMain.handle('rovai:navigation-preferences-replace-pins', (_event, pins: NavigationPin[]) =>
-  projectAccessTransactions.run(() => requireNavigationPreferences().replacePins(pins))
-)
-
-ipcMain.handle(
-  'rovai:navigation-preferences-synchronize-project-order',
-  (_event, projectKeys: unknown) => {
-    if (!Array.isArray(projectKeys) || !projectKeys.every((projectKey) => typeof projectKey === 'string')) {
-      throw new Error('Invalid Project order synchronization request')
-    }
-    return projectAccessTransactions.run(() =>
-      requireNavigationPreferences().synchronizeProjectOrder(projectKeys)
-    )
-  }
+  projectAccessTransactions.run(() => requireNavigationPreferences().replacePins(pins).then(publishNavigationPreferences))
 )
 
 ipcMain.handle(
@@ -1660,7 +1663,7 @@ ipcMain.handle(
       throw new Error('Invalid Project display name request')
     }
     return projectAccessTransactions.run(() =>
-      requireNavigationPreferences().setProjectName(targetKey, name)
+      requireNavigationPreferences().setProjectName(targetKey, name).then(publishNavigationPreferences)
     )
   }
 )
@@ -1680,7 +1683,7 @@ ipcMain.handle(
       try {
         const result = await requireNavigationPreferences().removeProject(targetKey, relatedThreadIds)
         core.setRemovedSkillProjectRoots(removedProjectRootsFromSnapshot(result))
-        return result
+        return publishNavigationPreferences(result)
       } catch (error) {
         await synchronizeCoreProjectAccessFromNavigation().catch(() => undefined)
         throw error
@@ -1699,6 +1702,7 @@ ipcMain.handle('rovai:navigation-preferences-restore-project', async (_event, ta
     const removedProject = previousSnapshot.removedProjects.find(
       (project) => project.targetKey === targetKey
     )
+    if (!removedProject) return publishNavigationPreferences(await navigationPreferences.registerProjects([executionRoot]))
     return restoreProjectAccessFailClosed({
       previousSnapshot,
       restorationRequired: Boolean(removedProject),
@@ -1715,6 +1719,7 @@ ipcMain.handle('rovai:navigation-preferences-restore-project', async (_event, ta
       },
       publishRemovedRoots: (snapshot) => {
         core.setRemovedSkillProjectRoots(removedProjectRootsFromSnapshot(snapshot))
+        publishNavigationPreferences(snapshot)
       }
     })
   })

@@ -371,6 +371,7 @@ pub struct AgentRunView {
     pub anchor_message_id: Option<String>,
     pub input_summary: Option<String>,
     pub has_accepted_continuation: bool,
+    pub native_session_replaced: bool,
     pub conversation_id: String,
     pub agent_id: String,
     pub task_id: Option<String>,
@@ -3134,7 +3135,11 @@ fn load_agent_runs(
                  CASE WHEN camp_turn.trigger_type = 'camp_message'
                       THEN camp_turn.trigger_id END
                ),
-               continued.source_agent_run_id IS NOT NULL
+               continued.source_agent_run_id IS NOT NULL,
+               EXISTS(SELECT 1 FROM event_log e WHERE e.entity_type='agent_run'
+                 AND e.entity_id=agent_run.id AND e.execution_epoch=agent_run.execution_epoch
+                 AND e.event_type='agent_run.native_session_continuity_lost'
+                 AND json_extract(e.payload_json, '$.continuation')='native_session_replaced')
         FROM agent_run
         LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
         JOIN camp ON camp.id = COALESCE(agent_run.camp_id, camp_turn.camp_id)
@@ -3210,6 +3215,7 @@ fn load_agent_runs(
                 row.get::<_, Option<String>>(39)?,
                 row.get::<_, Option<String>>(40)?,
                 row.get::<_, bool>(41)?,
+                row.get::<_, bool>(42)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3263,6 +3269,7 @@ fn load_agent_runs(
                 anchor_message_id,
                 summary_message_id,
                 has_accepted_continuation,
+                native_session_replaced,
             )| {
                 Ok(AgentRunView {
                     id,
@@ -3273,6 +3280,7 @@ fn load_agent_runs(
                     input_summary: summary_message_id
                         .and_then(|id| summaries.get(&id).cloned().flatten()),
                     has_accepted_continuation,
+                    native_session_replaced,
                     conversation_id,
                     agent_id,
                     task_id,

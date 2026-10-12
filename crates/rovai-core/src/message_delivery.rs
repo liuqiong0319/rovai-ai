@@ -1424,8 +1424,6 @@ fn process_dispatch_attempt(
         trigger_message_delivery_id: &delivery.id,
         effective_config: effective_config.clone(),
         workspace: serde_json::to_value(&workspace)?,
-        runtime_installation_id: Some(runtime.installation_id.as_str()),
-        runtime_binding_compatibility_digest: Some(runtime.binding_compatibility_digest.as_str()),
         charter_delivery_mode,
         max_payload_bytes: DEFAULT_MAX_CONTEXT_PAYLOAD_BYTES,
     };

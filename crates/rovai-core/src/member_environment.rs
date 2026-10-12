@@ -1,6 +1,6 @@
-//! Host-private environment versions. Only opaque, immutable plan references enter Runs.
+//! Private member configuration and ephemeral CLI launch environments.
 use crate::{
-    agent_profile::{AdapterKind, FrozenAgentRuntimeConfig, ModelSelection},
+    agent_profile::{AdapterKind, ModelSelection},
     platform::private_storage,
     runtime_startup::{RuntimeEnvironmentVariable, RuntimeStartupConfiguration},
 };
@@ -41,26 +41,90 @@ pub struct PreparedEnvironment {
     kind: AdapterKind,
 }
 
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct FrozenEnvironment {
-    pub plan_id: String,
-    pub revision: i64,
-    // Read-only compatibility for snapshots written by the unreleased Run-scoped implementation.
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "identity")]
-    pub legacy_identity: Option<String>,
-    #[serde(skip)]
+/// Built only when creating a CLI. Never serialized into a Conversation or Run.
+#[derive(Clone, PartialEq)]
+pub struct LaunchEnvironment {
     pub values: Option<Environment>,
-    #[serde(skip)]
     pub overlay: Option<Environment>,
 }
-impl std::fmt::Debug for FrozenEnvironment {
+impl std::fmt::Debug for LaunchEnvironment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FrozenEnvironment")
-            .field("plan_id", &self.plan_id)
-            .field("revision", &self.revision)
-            .finish_non_exhaustive()
+        f.debug_struct("LaunchEnvironment").finish_non_exhaustive()
     }
+}
+
+/// The existing launch future carries a lookup, not environment values. Fleet's
+/// creation closure invokes it after reuse has been ruled out. Probe launches
+/// outside that future continue to use their existing Adapter configuration.
+#[derive(Clone)]
+pub struct LaunchEnvironmentSource {
+    pub database: std::sync::Arc<tokio::sync::Mutex<crate::db::Database>>,
+    pub member_id: String,
+    pub kind: AdapterKind,
+}
+tokio::task_local! {
+    static LAUNCH_SOURCE: LaunchEnvironmentSource;
+}
+pub async fn with_launch_source<F: std::future::Future>(
+    source: LaunchEnvironmentSource,
+    future: F,
+) -> F::Output {
+    LAUNCH_SOURCE.scope(source, future).await
+}
+pub fn launch_source() -> Option<LaunchEnvironmentSource> {
+    LAUNCH_SOURCE.try_with(Clone::clone).ok()
+}
+pub async fn load_for_launch() -> Result<Option<LaunchEnvironment>> {
+    resolve_for_launch(launch_source(), None).await
+}
+/// The source is explicitly carried into Fleet's spawned creation task; Tokio
+/// task locals are not inherited by child tasks.
+pub async fn resolve_for_launch(
+    source: Option<LaunchEnvironmentSource>,
+    fallback: Option<LaunchEnvironment>,
+) -> Result<Option<LaunchEnvironment>> {
+    match source {
+        Some(source) => {
+            let database = source.database.lock().await;
+            current_for_launch(database.connection(), &source.member_id, source.kind).map(Some)
+        }
+        None => Ok(fallback),
+    }
+}
+
+pub fn current_for_launch(
+    connection: &Connection,
+    member: &str,
+    kind: AdapterKind,
+) -> Result<LaunchEnvironment> {
+    launch_with_host(
+        connection,
+        member,
+        kind,
+        crate::runtime_discovery::capture_host_runtime_environment,
+    )
+}
+fn launch_with_host(
+    connection: &Connection,
+    member: &str,
+    kind: AdapterKind,
+    capture: impl FnOnce() -> Environment,
+) -> Result<LaunchEnvironment> {
+    let overlay = read_version(connection, member, kind, latest(connection, member, kind)?)?;
+    let mut values = capture();
+    for (name, value) in &overlay {
+        if cfg!(windows) {
+            values.retain(|key, _| !key.eq_ignore_ascii_case(name));
+        }
+        values.insert(name.clone(), value.clone());
+    }
+    if kind == AdapterKind::ClaudeCodeCli && claude_routing_override(&overlay) {
+        values.insert("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST".into(), "1".into());
+    }
+    Ok(LaunchEnvironment {
+        values: Some(values),
+        overlay: Some(overlay),
+    })
 }
 
 fn key(connection: &Connection) -> Result<Vec<u8>> {
@@ -76,8 +140,12 @@ fn key(connection: &Connection) -> Result<Vec<u8>> {
     private_storage::prepare_private_directory(&root)?;
     let path = root.join("key");
     if !path.exists() {
-        let has_values: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM member_runtime_environment)
-            OR EXISTS(SELECT 1 FROM runtime_environment_plan) OR EXISTS(SELECT 1 FROM runtime_environment_legacy)", [], |r| r.get(0))?;
+        let has_values: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM member_runtime_environment)
+            OR EXISTS(SELECT 1 FROM runtime_environment_legacy)",
+            [],
+            |r| r.get(0),
+        )?;
         ensure!(
             !has_values,
             "Private environment key is missing; restore the original Host key"
@@ -347,72 +415,6 @@ impl PreparedEnvironment {
     }
 }
 
-fn saved_session(
-    connection: &Connection,
-    conversation: &str,
-    kind: AdapterKind,
-) -> Result<Option<FrozenEnvironment>> {
-    let saved: Option<(String, i64)> = connection.query_row(
-        "SELECT plan_id, revision FROM conversation_runtime_environment WHERE conversation_id=?1 AND runtime_kind=?2",
-        params![conversation, kind.as_str()], |r| Ok((r.get(0)?, r.get(1)?))
-    ).optional()?;
-    if let Some((plan_id, revision)) = saved {
-        let mut environment = FrozenEnvironment {
-            plan_id,
-            revision,
-            legacy_identity: None,
-            values: None,
-            overlay: None,
-        };
-        environment.hydrate(connection)?;
-        return Ok(Some(environment));
-    }
-    // An existing native session must not silently adopt today's Host environment on upgrade.
-    let has_native: bool = connection.query_row(
-        "SELECT native_session_id IS NOT NULL FROM conversation WHERE id=?1",
-        [conversation],
-        |r| r.get(0),
-    )?;
-    if has_native {
-        let raw: Option<String> = connection.query_row(
-            "SELECT json_extract(effective_config_json,'$.runtime.environment') FROM agent_run
-             WHERE conversation_id=?1 AND runtime_adapter_kind=?2 ORDER BY created_at DESC, id DESC LIMIT 1",
-            params![conversation, kind.as_str()], |r| r.get(0)).optional()?.flatten();
-        let mut environment: FrozenEnvironment = serde_json::from_str(raw.as_deref().context(
-            "The session environment is unavailable; reset this member's session to use the current configuration")?)?;
-        environment.hydrate(connection)?;
-        return Ok(Some(environment));
-    }
-    Ok(None)
-}
-
-pub(crate) fn session_values(
-    connection: &Connection,
-    conversation: &str,
-    kind: AdapterKind,
-) -> Result<Option<Environment>> {
-    Ok(saved_session(connection, conversation, kind)?.and_then(|environment| environment.values))
-}
-
-pub fn session_has_values(
-    connection: &Connection,
-    conversation: &str,
-    member: &str,
-    kind: AdapterKind,
-) -> Result<bool> {
-    if let Some(environment) = saved_session(connection, conversation, kind)? {
-        return Ok(environment.overlay.as_ref().is_some_and(|v| !v.is_empty()));
-    }
-    Ok(!read_version(connection, member, kind, latest(connection, member, kind)?)?.is_empty())
-}
-
-pub fn reset_session(connection: &Connection, conversation: &str) -> Result<usize> {
-    Ok(connection.execute(
-        "DELETE FROM conversation_runtime_environment WHERE conversation_id=?1",
-        [conversation],
-    )?)
-}
-
 fn validate_model(kind: AdapterKind, model: &ModelSelection, values: &Environment) -> Result<()> {
     ensure!(
         kind != AdapterKind::ClaudeCodeCli
@@ -443,90 +445,6 @@ pub fn validate_saved_model(
     Ok(())
 }
 
-pub fn freeze(
-    connection: &Connection,
-    conversation: &str,
-    member: &str,
-    runtime: &mut FrozenAgentRuntimeConfig,
-) -> Result<()> {
-    freeze_with_host(
-        connection,
-        conversation,
-        member,
-        runtime,
-        crate::runtime_discovery::capture_host_runtime_environment,
-    )
-}
-
-fn freeze_with_host(
-    connection: &Connection,
-    conversation: &str,
-    member: &str,
-    runtime: &mut FrozenAgentRuntimeConfig,
-    capture: impl FnOnce() -> Environment,
-) -> Result<()> {
-    ensure!(
-        connection.query_row(
-            "SELECT agent_id=?2 FROM conversation WHERE id=?1",
-            params![conversation, member],
-            |r| r.get::<_, bool>(0)
-        )?,
-        "Session environment belongs to another member"
-    );
-    let environment = match saved_session(connection, conversation, runtime.adapter_kind)? {
-        Some(environment) => environment,
-        None => {
-            let revision = latest(connection, member, runtime.adapter_kind)?;
-            let overlay = read_version(connection, member, runtime.adapter_kind, revision)?;
-            let mut values = capture();
-            for (name, value) in &overlay {
-                if cfg!(windows) {
-                    values.retain(|key, _| !key.eq_ignore_ascii_case(name));
-                }
-                values.insert(name.clone(), value.clone());
-            }
-            if runtime.adapter_kind == AdapterKind::ClaudeCodeCli
-                && claude_routing_override(&overlay)
-            {
-                values.insert("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST".into(), "1".into());
-            }
-            // Random snapshot reference, not an environment/credential digest. The old identity
-            // column remains the encryption context for compatibility with encrypted Run plans.
-            let plan_id = uuid::Uuid::new_v4().to_string();
-            let ciphertext = encrypt(
-                connection,
-                &plan_id,
-                &json!({"values":values,"overlay":overlay}),
-            )?;
-            connection.execute(
-                "INSERT INTO runtime_environment_plan(id,identity,ciphertext) VALUES(?1,?1,?2)",
-                params![plan_id, ciphertext],
-            )?;
-            FrozenEnvironment {
-                plan_id,
-                revision,
-                legacy_identity: None,
-                values: Some(values),
-                overlay: Some(overlay),
-            }
-        }
-    };
-    connection.execute("INSERT OR IGNORE INTO conversation_runtime_environment(conversation_id,runtime_kind,plan_id,revision) VALUES(?1,?2,?3,?4)",
-        params![conversation,runtime.adapter_kind.as_str(),environment.plan_id,environment.revision])?;
-    if environment
-        .overlay
-        .as_ref()
-        .is_some_and(|values| !values.is_empty())
-    {
-        runtime.custom_api = None;
-    }
-    runtime.environment = Some(FrozenEnvironment {
-        values: None,
-        overlay: None,
-        ..environment
-    });
-    runtime.refresh_config_digest()
-}
 pub(crate) fn configure_values(command: &mut tokio::process::Command, values: &Environment) {
     // ManagedProcess captures explicit env/remove operations; stable Command APIs
     // do not expose env_clear. Preserve that boundary for both pipes and PTYs.
@@ -559,7 +477,13 @@ fn claude_routing_override(overlay: &Environment) -> bool {
     })
 }
 
-impl FrozenEnvironment {
+impl LaunchEnvironment {
+    pub fn has_overlay(&self) -> bool {
+        self.overlay
+            .as_ref()
+            .is_some_and(|values| !values.is_empty())
+    }
+
     pub fn validate_claude_routing(&self, version: Option<&str>) -> Result<()> {
         if !self.overlay.as_ref().is_some_and(claude_routing_override) {
             return Ok(());
@@ -584,25 +508,12 @@ impl FrozenEnvironment {
         Ok(())
     }
 
-    pub fn hydrate(&mut self, connection: &Connection) -> Result<()> {
-        let (plan_identity,bytes):(String,Vec<u8>)=connection.query_row("SELECT identity,ciphertext FROM runtime_environment_plan WHERE id=?1",params![self.plan_id],|r|Ok((r.get(0)?,r.get(1)?)))
-            .context("Frozen member environment is unavailable; the Run cannot use another configuration")?;
-        #[derive(Deserialize)]
-        struct Plan {
-            values: Environment,
-            overlay: Environment,
-        }
-        let plan: Plan = decrypt(connection, &plan_identity, &bytes)?;
-        self.values = Some(plan.values);
-        self.overlay = Some(plan.overlay);
-        Ok(())
-    }
     pub fn apply(&self, command: &mut tokio::process::Command) -> Result<()> {
         configure_values(
             command,
             self.values
                 .as_ref()
-                .context("Frozen environment was not resolved")?,
+                .context("CLI launch environment was not resolved")?,
         );
         Ok(())
     }

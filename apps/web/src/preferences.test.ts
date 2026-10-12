@@ -1,3 +1,11 @@
+// Unit coverage of mutations; the real IndexedDB cross-tab lock is exercised by
+// the isolated Electron navigation fixture.
+vi.mock('./auth-storage', () => {
+  let tail = Promise.resolve()
+  return { withBrowserPreferenceWrite: (_scope: string, update: () => unknown) => {
+    const next = tail.then(update); tail = next.then(() => undefined, () => undefined); return next
+  } }
+})
 import { afterEach, expect, it, vi } from 'vitest'
 import { browserPreferences } from './preferences'
 import { ConsoleClient } from './client'
@@ -74,4 +82,26 @@ it('persists local unread intent, preserves it across other tab writes, and publ
   expect((await first.get()).threadReadStates[id].manualUnread).toBe(false)
   expect(transport.request).not.toHaveBeenCalled()
   unsubscribe()
+})
+
+it('merges concurrent directory writes and protects removal, completed migration and aliases', async () => {
+  const entries = new Map<string, string>()
+  vi.stubGlobal('localStorage', { getItem: (key: string) => entries.get(key) ?? null, setItem: (key: string, value: string) => entries.set(key, value) })
+  vi.stubGlobal('matchMedia', () => ({ matches: false, addEventListener() {}, removeEventListener() {} }))
+  const transport = { request: vi.fn() } as unknown as ConsoleClient
+  const a = browserPreferences('projects', transport).preferences.navigationPreferences
+  const b = browserPreferences('projects', transport).preferences.navigationPreferences
+  await Promise.all([a.registerProjects(['/a']), b.setProjectName('directory:/a', '名字'), b.registerProjects(['/b']), a.removeProject('directory:/gone', []), b.registerProjects(['/gone', '/legacy'], true)])
+  expect(await a.get()).toMatchObject({ registeredProjects: ['/a', '/b', '/legacy'], legacyProjectsSynced: true, projectNames: { 'directory:/a': '名字' } })
+  await a.registerProjects(['/late'], true)
+  expect((await a.get()).registeredProjects).not.toContain('/late')
+  for (const path of (await a.get()).registeredProjects) await a.removeProject(`directory:${path}`, [])
+  expect(await b.get()).toMatchObject({ registeredProjects: [], legacyProjectsSynced: true })
+  await b.restoreProject('directory:/gone')
+  expect((await a.get()).registeredProjects).toEqual(['/gone'])
+  const key = 'rovai.presentation:projects:navigation'
+  entries.set(key, '{broken')
+  expect((await a.get()).readError).toBeTruthy()
+  await expect(a.registerProjects(['/lost'], true)).rejects.toThrow()
+  expect(entries.get(key)).toBe('{broken')
 })

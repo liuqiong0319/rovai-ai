@@ -2,7 +2,7 @@
 document_type: architecture
 architecture: planned-shutdown
 authority: planned-core-lifecycle-and-cancel-all-settlement
-last_updated: 2026-10-08
+last_updated: 2026-10-12
 ---
 
 # Planned Shutdown
@@ -114,6 +114,16 @@ persist durable cancel-all intent and settle business obligations
 原生 interrupt grace 为 `600ms`；产品事务完成后的 Runtime reap grace 为最多 `2s`；Desktop hard window 仍为
 `10s`。这些常量是一个 hard window 内的控制预算，不是第二个领域结算窗口。reap 超时只能影响
 `deadlineExpired` 与进程强制回收，不能重开 terminal admission 或撤销已提交的 cancel-all transaction。
+
+执行 writer 已停止、最终取消事务结束后，监督器在释放 Database/正文缓冲和返回 report 前，给尚未定稿的
+执行正文一次 best-effort 落盘机会。最多等待 `1s`，且 deadline 不超过当前 hard window 扣除输出 reserve
+后的剩余时间；不额外延长 `10s` 退出窗口。最后一次尝试忽略普通重试退避，逐块检查剩余预算，Blob I/O
+在阻塞工作线程执行，使监督器可以按时停止等待。失败或超时只记诊断，不撤销 Run 取消，也不等待无界重试；
+已进入的系统 I/O 不能强制中断，stdio Runtime 仍沿用既有 `250ms` 有界释放。落盘成功的已接收正文
+在重开后以 interrupted/completed 原有语义可重读。这是退出生命周期的末次机会，普通领域命令继续只通知后台维护。
+
+该等待位于现有 `core.shutdown` 完成之前，复用第 7 节的“正在安全退出”反馈及 `400ms` 防闪烁门槛；
+不增加 Renderer 弹窗、交互或新的取消协议。
 
 若产品事务完成，report 的 `unresolvedExecutions` 为零；未知外部效果不计为非终态执行。若 hard deadline
 或 watchdog 在事务前终止 Core，pending cycle 在下次启动补偿。旧 route 的任何迟到 event 都不能修改 Run。

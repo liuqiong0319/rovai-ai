@@ -361,9 +361,9 @@ impl CodexHost {
         incoming: mpsc::UnboundedSender<CodexIncoming>,
         builtin_tools: Option<BuiltinToolProcessConfig>,
         custom_api: Option<rovai_core::runtime_custom_api::CustomApiSnapshot>,
-        environment: Option<rovai_core::member_environment::FrozenEnvironment>,
+        environment: Option<rovai_core::member_environment::LaunchEnvironment>,
     ) -> Result<Arc<Self>> {
-        rovai_core::runtime_discovery::with_frozen_environment(
+        rovai_core::runtime_discovery::with_launch_environment(
             environment.clone(),
             Self::spawn_in_environment(
                 codex_path,
@@ -383,7 +383,7 @@ impl CodexHost {
         incoming: mpsc::UnboundedSender<CodexIncoming>,
         builtin_tools: Option<BuiltinToolProcessConfig>,
         custom_api: Option<rovai_core::runtime_custom_api::CustomApiSnapshot>,
-        environment: Option<rovai_core::member_environment::FrozenEnvironment>,
+        environment: Option<rovai_core::member_environment::LaunchEnvironment>,
     ) -> Result<Arc<Self>> {
         let mut command = Command::new(codex_path);
         rovai_core::runtime_discovery::configure_runtime_command(
@@ -1436,6 +1436,7 @@ pub struct CodexAgentRunRuntimeRequest<'a> {
     pub execution_epoch: i64,
     pub camp_id: &'a str,
     pub agent_id: &'a str,
+    pub native_binding_id: &'a str,
     pub cwd: &'a Path,
     pub frozen_runtime: &'a FrozenAgentRuntimeConfig,
     pub runtime_compatibility_digest: &'a str,
@@ -1485,6 +1486,7 @@ impl CodexCliRuntimeAdapter {
             execution_epoch,
             camp_id,
             agent_id,
+            native_binding_id,
             cwd,
             frozen_runtime,
             runtime_compatibility_digest,
@@ -1515,15 +1517,13 @@ impl CodexCliRuntimeAdapter {
         let spawn_cwd = cwd.to_path_buf();
         let spawn_incoming = self.incoming.clone();
         let spawn_builtin_tools = builtin_tools.clone();
-        let spawn_custom_api = frozen_runtime.custom_api.clone();
+        let mut spawn_custom_api = frozen_runtime.custom_api.clone();
+        let spawn_environment_source = rovai_core::member_environment::launch_source();
         let spawn_environment = frozen_runtime.environment.clone();
         let compatibility = RuntimeCompatibilityKey::member_session(
             camp_id,
             agent_id,
-            frozen_runtime
-                .environment
-                .as_ref()
-                .map(|env| env.plan_id.as_str()),
+            Some(native_binding_id),
             runtime_compatibility_digest,
         );
         // A different Codex Host can keep the same thread's native writer lock
@@ -1541,6 +1541,17 @@ impl CodexCliRuntimeAdapter {
                     compatibility,
                 },
                 move || async move {
+                    let spawn_environment = rovai_core::member_environment::resolve_for_launch(
+                        spawn_environment_source,
+                        spawn_environment,
+                    )
+                    .await?;
+                    if spawn_environment
+                        .as_ref()
+                        .is_some_and(|env| env.has_overlay())
+                    {
+                        spawn_custom_api = None;
+                    }
                     let host = CodexHost::spawn_uninitialized(
                         &spawn_executable,
                         &spawn_cwd,
@@ -2464,6 +2475,7 @@ mod tests {
                 execution_epoch: 1,
                 camp_id: "camp-process-compatibility",
                 agent_id: "agent-1",
+                native_binding_id: "fixture-binding",
                 cwd: &root,
                 frozen_runtime: &frozen,
                 runtime_compatibility_digest: &legacy_digest,
@@ -2480,6 +2492,7 @@ mod tests {
                 execution_epoch: 1,
                 camp_id: "camp-process-compatibility",
                 agent_id: "agent-1",
+                native_binding_id: "fixture-binding",
                 cwd: &root,
                 frozen_runtime: &frozen,
                 runtime_compatibility_digest: &first_digest,
@@ -2502,6 +2515,7 @@ mod tests {
                 execution_epoch: 1,
                 camp_id: "camp-process-compatibility",
                 agent_id: "agent-1",
+                native_binding_id: "fixture-binding",
                 cwd: &root,
                 frozen_runtime: &next,
                 runtime_compatibility_digest: &next_digest,
@@ -2524,6 +2538,7 @@ mod tests {
                 execution_epoch: 1,
                 camp_id: "camp-process-compatibility",
                 agent_id: "agent-1",
+                native_binding_id: "fixture-binding",
                 cwd: &root,
                 frozen_runtime: &next,
                 runtime_compatibility_digest: &replacement_digest,
@@ -2610,6 +2625,7 @@ for line in sys.stdin:
                         execution_epoch: 1,
                         camp_id: "camp-fixture",
                         agent_id: "agent-fixture",
+                        native_binding_id: "fixture-binding",
                         cwd: &root,
                         frozen_runtime: &frozen,
                         runtime_compatibility_digest: "stable",
@@ -2716,6 +2732,7 @@ for line in sys.stdin:
                     execution_epoch: 1,
                     camp_id: "camp-fixture",
                     agent_id: "agent-fixture",
+                    native_binding_id: "fixture-binding",
                     cwd: &root,
                     frozen_runtime: &frozen,
                     runtime_compatibility_digest: "stable",
@@ -2752,6 +2769,139 @@ for line in sys.stdin:
             fleet.shutdown_all().await;
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    // Fleet/source seam: a healthy Warm Host must not even decrypt the latest
+    // member configuration. A replacement loads it only when Fleet creates it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warm_host_ignores_unreadable_environment_and_new_process_loads_latest() {
+        use rovai_core::member_environment::{
+            EnvironmentEdit, LaunchEnvironmentSource, prepare, with_launch_source,
+        };
+        async fn save(source: &LaunchEnvironmentSource, revision: i64, value: &str) {
+            let database = source.database.lock().await;
+            prepare(
+                database.connection(),
+                &source.member_id,
+                source.kind,
+                &rovai_core::agent_profile::ModelSelection::RuntimeDefault,
+                EnvironmentEdit {
+                    expected_revision: revision,
+                    json: json!({"LAUNCH_VALUE":value}).to_string(),
+                },
+            )
+            .unwrap()
+            .commit(database.connection())
+            .unwrap();
+        }
+        let (database, root) = crate::test_support::seeded_runtime_database_fast();
+        let executable = root.join("codex");
+        make_test_executable(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$LAUNCH_VALUE\" >> \"$0.env\"\nIFS= read -r initialize || exit 1\nprintf '%s\\n' '{\"id\":1,\"result\":{}}'\nIFS= read -r initialized || exit 1\nwhile IFS= read -r ignored; do :; done\n",
+        );
+        let source = LaunchEnvironmentSource {
+            database: Arc::new(Mutex::new(database)),
+            member_id: "agent_1".into(),
+            kind: AdapterKind::CodexCli,
+        };
+        let fleet = Arc::new(AgentRuntimeFleetManager::new(Default::default()));
+        let (incoming, _receiver) = mpsc::unbounded_channel();
+        let adapter = CodexCliRuntimeAdapter::new(incoming, fleet.clone());
+        let frozen = process_compatibility_runtime(&executable);
+        let endpoint = rovai_core::builtin_tool_transport::LocalIpcEndpoint::UnixSocket {
+            path: root.join("builtin.sock").to_string_lossy().into_owned(),
+        };
+        let builtin_tools =
+            BuiltinToolProcessConfig::create(&executable, &endpoint, &root).unwrap();
+        let request = |run, camp| CodexAgentRunRuntimeRequest {
+            agent_run_id: run,
+            execution_epoch: 1,
+            camp_id: camp,
+            agent_id: "agent_1",
+            native_binding_id: "binding-a",
+            cwd: &root,
+            frozen_runtime: &frozen,
+            runtime_compatibility_digest: "unchanged",
+            builtin_tools: &builtin_tools,
+        };
+        save(&source, 0, "A").await;
+        let first = with_launch_source(
+            source.clone(),
+            adapter.ensure_agent_run_runtime(request("run-a", "camp-a")),
+        )
+        .await
+        .unwrap();
+        adapter
+            .complete_agent_run("run-a", 1, FleetReleaseDisposition::Reusable)
+            .await;
+        save(&source, 1, "B").await;
+        let ciphertext: Vec<u8> = {
+            let database = source.database.lock().await;
+            let bytes = database.connection().query_row("SELECT ciphertext FROM member_runtime_environment WHERE member_id='agent_1' AND revision=2", [], |r| r.get(0)).unwrap();
+            database.connection().execute("UPDATE member_runtime_environment SET ciphertext=x'00' WHERE member_id='agent_1' AND revision=2", []).unwrap();
+            bytes
+        };
+        let warm = with_launch_source(
+            source.clone(),
+            adapter.ensure_agent_run_runtime(request("run-warm", "camp-a")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(warm.host_instance_id(), first.host_instance_id());
+        assert_eq!(
+            std::fs::read_to_string(root.join("codex.env")).unwrap(),
+            "A\n"
+        );
+        adapter
+            .complete_agent_run("run-warm", 1, FleetReleaseDisposition::Reusable)
+            .await;
+        let failed = with_launch_source(
+            source.clone(),
+            adapter.ensure_agent_run_runtime(request("run-fail", "camp-cold")),
+        )
+        .await;
+        assert!(failed.is_err());
+        assert!(first.host.is_alive());
+        let other = LaunchEnvironmentSource {
+            member_id: "agent_2".into(),
+            ..source.clone()
+        };
+        let healthy = with_launch_source(
+            other,
+            adapter.ensure_agent_run_runtime(CodexAgentRunRuntimeRequest {
+                agent_id: "agent_2",
+                ..request("run-other", "camp-other")
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(healthy.host.is_alive());
+        adapter
+            .complete_agent_run("run-other", 1, FleetReleaseDisposition::Stop)
+            .await;
+        source.database.lock().await.connection().execute("UPDATE member_runtime_environment SET ciphertext=?1 WHERE member_id='agent_1' AND revision=2", [ciphertext]).unwrap();
+        // Creating a future/claiming intent does not capture values. Saving
+        // after that point but before process creation must be observed.
+        let pending = with_launch_source(
+            source.clone(),
+            adapter.ensure_agent_run_runtime(request("run-next", "camp-a")),
+        );
+        save(&source, 2, "C").await;
+        fleet.invalidate_member("agent_1").await;
+        let next = pending.await.unwrap();
+        assert_ne!(next.host_instance_id(), first.host_instance_id());
+        assert_eq!(
+            std::fs::read_to_string(root.join("codex.env")).unwrap(),
+            "A\n\nC\n"
+        );
+        adapter
+            .complete_agent_run("run-next", 1, FleetReleaseDisposition::Stop)
+            .await;
+        fleet.shutdown_all().await;
+        drop(source);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3051,6 +3201,7 @@ for line in sys.stdin:
                         execution_epoch: 1,
                         camp_id: "camp-fixture",
                         agent_id: "agent-fixture",
+                        native_binding_id: "fixture-binding",
                         cwd: &root,
                         frozen_runtime: &frozen,
                         runtime_compatibility_digest: "launch-fixture",
@@ -3272,6 +3423,7 @@ for line in sys.stdin:
                 execution_epoch: 1,
                 camp_id: "camp-1",
                 agent_id: "agent-1",
+                native_binding_id: "fixture-binding",
                 cwd: &workspace,
                 frozen_runtime: &runtime_config,
                 runtime_compatibility_digest: "test-digest-agent-1",
@@ -3287,6 +3439,7 @@ for line in sys.stdin:
                 execution_epoch: 1,
                 camp_id: "camp-1",
                 agent_id: "agent-2",
+                native_binding_id: "fixture-binding",
                 cwd: &workspace,
                 frozen_runtime: &runtime_config,
                 runtime_compatibility_digest: "test-digest-agent-2",
@@ -3382,6 +3535,7 @@ for line in sys.stdin:
                 execution_epoch: 1,
                 camp_id: "camp-1",
                 agent_id: "agent-1",
+                native_binding_id: "fixture-binding",
                 cwd: &workspace,
                 frozen_runtime: &runtime_config,
                 runtime_compatibility_digest: "test-digest-agent-1",

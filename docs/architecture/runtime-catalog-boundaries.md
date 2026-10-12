@@ -3,7 +3,7 @@ document_type: architecture
 architecture: runtime-catalog-boundaries
 authority: runtime-catalog-and-preview-boundaries
 status: accepted
-last_updated: 2026-10-10
+last_updated: 2026-10-12
 ---
 
 # Runtime Catalog Boundaries
@@ -132,12 +132,13 @@ Runtime Startup Settings 只保存本机程序路径。环境覆盖属于当前 
 由 Core 私有存储管理；Host 环境与队员环境同名覆盖、不同名追加，删除队员条目恢复继承。
 已启动进程不受保存影响，旧 Agents 环境不再参与启动/检查，独立只读归档由诊断提供人工迁移参考。
 
-首次建立队员会话时冻结 Host＋队员环境；后续运行、重试、进程重建和冷恢复读取原私有快照。
-仅新建或显式重置会话后读取最新配置；配置透传，不新增环境摘要、凭据配对或组合确认。
+新建 CLI 时合并当时的 Host＋队员环境，领取 Run 不读取；健康 Warm 复用不读取或解密最新配置。
+活着的 CLI 及其工具子进程保持启动环境，重建/冷恢复使用当前配置。环境不进入会话或 Run 历史，
+旧快照缺失或损坏不阻断执行；真实队员配置错误只失败对应任务，数据库整体错误仍上报。
 进程只在同一 Camp、同一队员的当前会话内复用，继续遵循各 Adapter 的工作目录、恢复与停止策略。
 值不进入成员资料、公开命令、工具、事件或诊断导出；Owner 管理面使用遮蔽读取及显式查看。
 程序绝对路径仍属于安装发现，不由队员 PATH 偷换。详细字段、CAS、凭据保护、CLI 资格与迁移见
-[Runtime Launch v58](../contracts/runtime-launch-and-verification-v58.md)。
+[Runtime Launch v59](../contracts/runtime-launch-and-verification-v59.md)。
 
 ### Claude Code 与 Codex 原生配置
 
@@ -147,7 +148,7 @@ Runtime Startup Settings 只保存本机程序路径。环境覆盖属于当前 
 
 执行仍保留只读连接摘要、凭据来源引用和输出脱敏，以保持旧快照与 Host/binding 兼容隔离；
 内部历史快照名不代表可编辑 API 配置。队员模型选择使用原生目录及能力，不附加编辑器允许名单或
-推理强度 fallback。边界由 [Runtime Launch v58](../contracts/runtime-launch-and-verification-v58.md)拥有。
+推理强度 fallback。边界由 [Runtime Launch v59](../contracts/runtime-launch-and-verification-v59.md)拥有。
 
 ### 受管执行的原生自动记忆
 
@@ -558,8 +559,8 @@ Runtime-managed AgentRun 通过标准 ACP `session/set_config_option` 投递冻�
 `default`、`auto` 或 `plan` 不由 discovery、升级或 migration 静默扩权。十二种 Runtime 的 exact 默认矩阵见
 [Runtime Launch and Verification v55](../contracts/runtime-launch-and-verification-v55.md)。
 复用 Kimi Host 时从当前 AgentRun 的冻结配置设置 Session 模式，不继承原 Host 创建时的模式。
-Host＋队员环境按 [v58](../contracts/runtime-launch-and-verification-v58.md) 固定于会话；保存配置不替换
-当前 Host，显式重置后使用新会话快照。既有原生配置与协议兼容判断继续保留，不新增环境摘要。
+Host＋队员环境按 [v59](../contracts/runtime-launch-and-verification-v59.md) 在进程创建时读取；保存配置不替换
+当前 Host。会话重置通过既有 native binding 身份隔离，原生配置与协议兼容判断继续保留，不新增环境摘要。
 CodeBuddy 的显式模型通过 Host 启动参数 `--model` 选择，因此它参与进程兼容；Runtime-default
 不传该参数，Session/Turn 选项变化不因完整 Run 配置摘要而重启 Host。
 

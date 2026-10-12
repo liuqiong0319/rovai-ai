@@ -58,7 +58,7 @@ impl Default for AgentRuntimeFleetConfig {
 struct RuntimeReuseScope {
     camp_id: String,
     agent_id: String,
-    // Session snapshot reference fences explicit reset; never a hash of its values.
+    // The existing native binding identity fences explicit session reset.
     session_id: Option<String>,
 }
 

@@ -461,8 +461,10 @@ pub struct ResolvedModelSelection {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrozenAgentRuntimeConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub environment: Option<crate::member_environment::FrozenEnvironment>,
+    // Historical environment references are ignored, including malformed ones.
+    // The in-memory launch map never participates in Run or Fleet identity.
+    #[serde(skip)]
+    pub environment: Option<crate::member_environment::LaunchEnvironment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_api: Option<crate::runtime_custom_api::CustomApiSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1643,6 +1645,7 @@ impl AgentProfileService {
                 permissions: frozen.permissions.clone(),
             },
             Some(frozen.custom_api.clone()),
+            None,
         )? {
             Ok(runtime) => runtime,
             Err(blocker) => return Ok(Err(blocker)),
@@ -4514,7 +4517,9 @@ pub fn resolve_frozen_runtime(
                    agent_profile.default_runtime_installation_id,
                    agent_profile.default_model_selection_json,
                    agent_profile.default_permission_config_json,
-                   conversation.provider_override, conversation.model_override
+                   conversation.provider_override, conversation.model_override,
+                   CASE WHEN conversation.native_session_id IS NOT NULL
+                        THEN conversation.native_binding_compatibility_digest END
             FROM conversation
             JOIN agent_profile ON agent_profile.id = conversation.agent_id
             WHERE conversation.id = ?1 AND conversation.agent_id = ?2
@@ -4529,6 +4534,7 @@ pub fn resolve_frozen_runtime(
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             },
         )
@@ -4541,6 +4547,7 @@ pub fn resolve_frozen_runtime(
         permissions_json,
         provider_override,
         model_override,
+        native_binding_compatibility_digest,
     )) = profile
     else {
         return Ok(Err(runtime_blocker(
@@ -4592,12 +4599,24 @@ pub fn resolve_frozen_runtime(
             )));
         }
     };
-    let binding = ResolvedRuntimeBinding {
-        adapter_kind: AdapterKind::from_str(&selected_runtime_adapter_kind)?,
-        installation_id: installation_id.clone(),
-        model: serde_json::from_str(&model_json).context("invalid saved model selection")?,
-        permissions: serde_json::from_str(&permissions_json)
-            .context("invalid saved permission configuration")?,
+    // A malformed member record is a lane failure; SQL/storage errors above
+    // remain outer errors so a database outage cannot be mistaken for bad input.
+    let binding = (|| -> Result<ResolvedRuntimeBinding> {
+        Ok(ResolvedRuntimeBinding {
+            adapter_kind: AdapterKind::from_str(&selected_runtime_adapter_kind)?,
+            installation_id: installation_id.clone(),
+            model: serde_json::from_str(&model_json)?,
+            permissions: serde_json::from_str(&permissions_json)?,
+        })
+    })();
+    let binding = match binding {
+        Ok(binding) => binding,
+        Err(_) => {
+            return Ok(Err(runtime_blocker(
+                "runtime_configuration_invalid",
+                json!({"agentId": agent_id}),
+            )));
+        }
     };
     if binding.permissions.adapter_kind != binding.adapter_kind {
         return Ok(Err(runtime_blocker(
@@ -4608,29 +4627,13 @@ pub fn resolve_frozen_runtime(
             }),
         )));
     }
-    let member_environment = crate::member_environment::session_has_values(
+    let mut result = resolve_frozen_runtime_binding_with_snapshot(
         transaction,
-        conversation_id,
-        agent_id,
-        binding.adapter_kind,
+        &binding,
+        None,
+        native_binding_compatibility_digest.as_deref(),
     )?;
-    let mut result = if member_environment {
-        resolve_frozen_runtime_binding_with_snapshot(transaction, &binding, Some(None))?
-    } else {
-        let environment = crate::member_environment::session_values(
-            transaction,
-            conversation_id,
-            binding.adapter_kind,
-        )?;
-        let snapshot = crate::runtime_startup::snapshot_from_connection_with_environment(
-            transaction,
-            binding.adapter_kind,
-            environment.as_ref(),
-        )?;
-        resolve_frozen_runtime_binding_with_snapshot(transaction, &binding, Some(snapshot))?
-    };
     if let Ok(runtime) = &mut result {
-        crate::member_environment::freeze(transaction, conversation_id, agent_id, runtime)?;
         crate::camp_fast::freeze(transaction, conversation_id, agent_id, runtime)?;
     }
     Ok(result)
@@ -4641,20 +4644,15 @@ pub(crate) fn resolve_frozen_runtime_binding(
     transaction: &Connection,
     binding: &ResolvedRuntimeBinding,
 ) -> Result<std::result::Result<FrozenAgentRuntimeConfig, RuntimeConfigurationBlocker>> {
-    resolve_frozen_runtime_binding_with_snapshot(transaction, binding, None)
+    resolve_frozen_runtime_binding_with_snapshot(transaction, binding, None, None)
 }
 
 fn resolve_frozen_runtime_binding_with_snapshot(
     transaction: &Connection,
     binding: &ResolvedRuntimeBinding,
     frozen_api: Option<Option<crate::runtime_custom_api::CustomApiSnapshot>>,
+    native_binding_compatibility_digest: Option<&str>,
 ) -> Result<std::result::Result<FrozenAgentRuntimeConfig, RuntimeConfigurationBlocker>> {
-    let custom_api = match frozen_api {
-        Some(snapshot) => snapshot,
-        None => {
-            crate::runtime_startup::snapshot_from_connection(transaction, binding.adapter_kind)?
-        }
-    };
     let installation_id = binding.installation_id.clone();
     let installation = transaction
         .query_row(
@@ -4779,6 +4777,21 @@ fn resolve_frozen_runtime_binding_with_snapshot(
                     "detail": error.to_string(),
                 }),
             )));
+        }
+    };
+    let custom_api = match frozen_api {
+        Some(snapshot) => snapshot,
+        // Existing sessions that excluded the default Host connection (notably
+        // pre-upgrade member-env sessions) keep that identity only when today's
+        // installation/protocol/permission projection still matches exactly.
+        // Do not read member env or historical environment plans to decide this.
+        None if native_binding_compatibility_digest
+            == Some(projection.binding_compatibility_digest.as_str()) =>
+        {
+            None
+        }
+        None => {
+            crate::runtime_startup::snapshot_from_connection(transaction, binding.adapter_kind)?
         }
     };
     let mut frozen = FrozenAgentRuntimeConfig {
@@ -7036,6 +7049,7 @@ mod slow_tests {
             &transaction,
             &runtime_binding,
             Some(Some(api.clone())),
+            None,
         )
         .unwrap()
         .unwrap();
@@ -7051,6 +7065,7 @@ mod slow_tests {
             &transaction,
             &runtime_binding,
             Some(Some(rotated.clone())),
+            None,
         )
         .unwrap()
         .unwrap();
@@ -7072,6 +7087,7 @@ mod slow_tests {
                 &transaction,
                 &runtime_binding,
                 Some(custom.custom_api.clone()),
+                None,
             )
             .unwrap()
             .unwrap()
@@ -7083,6 +7099,7 @@ mod slow_tests {
                 &transaction,
                 &runtime_binding,
                 Some(frozen.custom_api.clone()),
+                None,
             )
             .unwrap()
             .unwrap()
@@ -8021,6 +8038,114 @@ mod slow_tests {
                 model: selected,
                 permissions: defaults.permissions,
             };
+            if matches!(kind, AdapterKind::ClaudeCodeCli | AdapterKind::CodexCli) {
+                // The existing admission owner also covers legacy member-env
+                // bindings. Only an exact current projection may retain the
+                // absence of a default Host connection; other guards remain.
+                let old = resolve_frozen_runtime_binding_with_snapshot(
+                    database.connection(),
+                    &binding,
+                    Some(None),
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+                let context = crate::runtime_custom_api::native::NativeContext::resolve(
+                    kind,
+                    &Default::default(),
+                    database.path(),
+                )
+                .unwrap();
+                std::fs::create_dir_all(&context.directory).unwrap();
+                std::fs::write(
+                    context.path(),
+                    if kind == AdapterKind::CodexCli {
+                        "model_provider = \"fixture\"\n[model_providers.fixture]\nname = \"Fixture\"\nbase_url = \"https://host.invalid/v1\"\nwire_api = \"responses\"\nenv_key = \"FIXTURE_KEY\"\n"
+                    } else {
+                        r#"{"env":{"ANTHROPIC_BASE_URL":"https://host.invalid","ANTHROPIC_API_KEY":"fixture-host-key"}}"#
+                    },
+                )
+                .unwrap();
+                let hosted = resolve_frozen_runtime_binding(database.connection(), &binding)
+                    .unwrap()
+                    .unwrap();
+                assert!(hosted.custom_api.is_some(), "default Host must be readable");
+                assert_ne!(
+                    hosted.binding_compatibility_digest,
+                    old.binding_compatibility_digest
+                );
+                for previous in [
+                    &old.binding_compatibility_digest,
+                    &hosted.binding_compatibility_digest,
+                    "unknown-binding",
+                ] {
+                    let current = resolve_frozen_runtime_binding_with_snapshot(
+                        database.connection(),
+                        &binding,
+                        None,
+                        Some(previous),
+                    )
+                    .unwrap()
+                    .unwrap();
+                    if previous == old.binding_compatibility_digest {
+                        assert!(current.custom_api.is_none());
+                        assert_eq!(current.binding_compatibility_digest, previous);
+                        assert_eq!(current.host_config_digest, old.host_config_digest);
+                    } else {
+                        assert!(current.custom_api.is_some());
+                        assert_eq!(
+                            current.binding_compatibility_digest,
+                            hosted.binding_compatibility_digest
+                        );
+                    }
+                }
+                let mut changed = binding.clone();
+                if kind == AdapterKind::CodexCli {
+                    changed.permissions.values["sandbox_mode"] =
+                        if binding.permissions.values["sandbox_mode"] == "read-only" {
+                            json!("workspace-write")
+                        } else {
+                            json!("read-only")
+                        };
+                } else {
+                    changed.permissions.values["permission_mode"] = json!("plan");
+                }
+                let incompatible = resolve_frozen_runtime_binding_with_snapshot(
+                    database.connection(),
+                    &changed,
+                    None,
+                    Some(&old.binding_compatibility_digest),
+                )
+                .unwrap()
+                .unwrap();
+                if kind == AdapterKind::CodexCli {
+                    assert!(incompatible.custom_api.is_some());
+                    assert_ne!(
+                        incompatible.binding_compatibility_digest,
+                        old.binding_compatibility_digest
+                    );
+                } else {
+                    // Claude permissions remain Run-scoped: keep the session,
+                    // while the process compatibility digest still changes.
+                    assert_eq!(
+                        incompatible.binding_compatibility_digest,
+                        old.binding_compatibility_digest
+                    );
+                    assert_ne!(incompatible.host_config_digest, old.host_config_digest);
+                }
+                changed.permissions.schema_version += 1;
+                assert!(
+                    resolve_frozen_runtime_binding_with_snapshot(
+                        database.connection(),
+                        &changed,
+                        None,
+                        Some(&old.binding_compatibility_digest),
+                    )
+                    .unwrap()
+                    .is_err(),
+                    "legacy identity cannot bypass permission validation"
+                );
+            }
             let frozen = resolve_frozen_runtime_binding(database.connection(), &binding)
                 .unwrap()
                 .unwrap();

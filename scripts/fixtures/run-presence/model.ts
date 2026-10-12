@@ -12,15 +12,15 @@ export const scenarios: Record<string, { name: string; steps: string[]; descript
   stream: { name: '流式正文与命令', steps: ['流式正文', '执行命令', '首次回复', '继续流式', '执行结束'],
     descriptions: ['正文逐字更新，满一行后省略，不横向滚动。', '命令保持单行，点击查看完整过程。', '紧接同一个 Run 的回复，不重复头像。', '继续处理仍在当前回复下方，单行展示。', '执行结束，占位直接收起。'] },
   parallel: { name: '两位队员并行', steps: ['已发送', '处理中', '一位回复', '两位回复', '全部结束'],
-    descriptions: ['输入已发送，排队阶段不占位。', '爱丽丝已开始执行，奥黛丽仍排队，不占位。', '奥黛丽先回复；爱丽丝的占位跟到新消息下面。', '爱丽丝继续处理，与同一个 Run 的最新回复衔接。', '所有执行结束，占位收起。'] },
+    descriptions: ['输入已发送，排队阶段不占位。', '爱丽丝已开始执行，奥黛丽仍排队，不占位。', '奥黛丽先回复；爱丽丝的占位仍留在原处。', '爱丽丝继续处理，与同一个 Run 的最新回复衔接。', '所有执行结束，占位收起。'] },
   single: { name: '同一队员连续回复', steps: ['已发送', '处理中', '首次回复', '再次回复', '执行结束'],
     descriptions: ['排队不占位。', '执行卡正文逐字流出，保持单行。', '首次回复下方另起一行显示执行命令。', '第二条回复追加，执行正文跟随最新回复。', '结束后不留下完成行。'] },
   interleaved: { name: '其他队员插入消息', steps: ['已发送', '处理中', '首次回复', '他人插话', '再次回复', '执行结束'],
-    descriptions: ['等待期间不预占会话。', '执行内容显示在最新消息下面。', '同一 Run 的回复和占位衔接，不重复头像。', '另一位队员插话后，占位移动到其下方，重新显示头像。', '本 Run 再次回复后，收起重复头像，继续向下展示。', '执行结束，占位收起。'] },
+    descriptions: ['等待期间不预占会话。', '执行内容显示在最新消息下面。', '同一 Run 的回复和占位衔接，不重复头像。', '另一位队员插话后，本 Run 的占位仍留在自己回复下方。', '本 Run 再次回复后，收起重复头像，继续向下展示。', '执行结束，占位收起。'] },
   same_member: { name: '同一队员不同 Run', steps: ['处理中', '首次回复', '另一 Run 回复', '本 Run 再回复', '执行结束'],
-    descriptions: ['本次执行正在进行。', '本 Run 已回复，后续占位无需头像。', '另一 Run 的回复插入，即使同一队员也重新显示头像。', '本 Run 再次回复，重新衔接为无头像的占位。', '不留下完成行。'] },
+    descriptions: ['本次执行正在进行。', '本 Run 已回复，后续占位无需头像。', '另一 Run 的回复插入，本 Run 的占位保持原位。', '本 Run 再次回复，重新衔接为无头像的占位。', '不留下完成行。'] },
   followup: { name: '运行中追加两条输入', steps: ['正在处理', '追加输入', '继续追加', '领取新输入', '全部结束'],
-    descriptions: ['前一次执行仍在进行。', '新输入排队，已有占位移到新消息下面。', '继续追加也不重复占位。', '下一次执行实际开始后才出现占位。', '两次执行分别结束，占位收起。'] },
+    descriptions: ['前一次执行仍在进行。', '新输入排队，已有占位保持原位。', '继续追加也不重复占位。', '下一次执行实际开始后才出现占位。', '两次执行分别结束，占位收起。'] },
   failed: { name: '执行异常', steps: ['已发送', '处理中', '执行中断'],
     descriptions: ['先确认本次输入已经被接受。', '处理中的状态不承诺完成时间。', '中断后可查看原因，也可以直接重试本次请求。'] },
   silent: { name: '结束但没有公开回复', steps: ['已发送', '处理中', '执行结束'],
@@ -52,7 +52,7 @@ function delivery(id: string, messageId: string, agentId: string, targetAgentRun
 }
 function makeRun(id: string, agent = 0, status = 'running', inputs = ['request-main'], seconds = 48): any {
   return { ...structuredClone(runTemplate), id, agentId: aid(agent), status, inputMessageIds: inputs,
-    anchorMessageId: inputs[0], inputSummary: '按现在的界面做一版队员占位，保留群聊的消息顺序。',
+    anchorMessageId: inputs.at(-1), inputSummary: '按现在的界面做一版队员占位，保留群聊的消息顺序。',
     purpose: '核对队员占位方案', threadTurnId: null, invocationKind: 'batch',
     a2aRootAgentRunId: id, runtimeModel: { modelId: null },
     createdAt: at(31), startedAt: at(34), updatedAt: at(seconds), endedAt: ['succeeded', 'failed', 'cancelled'].includes(status) ? at(seconds) : null,
@@ -75,7 +75,7 @@ function evidence(run: any, published = false): any[] {
       contentBlobId: null, contentByteCount: 0, isTruncated: false, occurredAt: at(38) },
     { id: `e-${run.id}-3`, agentRunId: run.id, executionEpoch: 1, sequence: 3,
       eventType: 'agent.text.delta', kind: 'narration', phase: 'updated',
-      payload: { itemId: `n2-${run.id}`, delta: run.status === 'failed' ? '运行连接中断。保留本次执行记录。' : finish ? '本次检查结束。' : published ? '继续检查消息衔接。刚才已经发出一条回复，接下来确认其他队员插话时，占位能移动到最新消息之后。\n\n我会按 Run 判断是否重复头像，再检查原有复制和回复按钮、键盘操作以及窄窗口下的表现。' : '我先看看现在的消息结构，确认队员回复和执行内容怎样衔接。\n\n这行正文会随着处理持续更新，满一行后省略，不横向滚动；完整内容仍然保留在执行台里。接下来检查多个队员同时处理时的消息顺序。' },
+      payload: { itemId: `n2-${run.id}`, delta: run.status === 'failed' ? '运行连接中断。保留本次执行记录。' : finish ? '本次检查结束。' : published ? '继续检查消息衔接。刚才已经发出一条回复，接下来确认其他队员插话时，占位仍留在自己的消息之后。\n\n我会按 Run 判断是否重复头像，再检查原有复制和回复按钮、键盘操作以及窄窗口下的表现。' : '我先看看现在的消息结构，确认队员回复和执行内容怎样衔接。\n\n这行正文会随着处理持续更新，满一行后省略，不横向滚动；完整内容仍然保留在执行台里。接下来检查多个队员同时处理时的消息顺序。' },
       contentBlobId: null, contentByteCount: 0, isTruncated: false, occurredAt: at(43) }
   ]
   return commandActive ? events.slice(0, 2) : events
@@ -125,7 +125,7 @@ function snapshot() {
       value.agentRuns.push(makeRun('run-audrey', 1, s >= 3 ? 'succeeded' : 'running'))
       addReply('reply-audrey', 4, '建议沿用队员自己的头像和姓名，下面只放一行执行内容。\n\n回复出现后，继续使用现在的消息气泡。', 1, 'run-audrey')
     }
-    if (s >= 3) addReply('reply-alice', 5, '我核对了现有组件。正在处理的占位会跟着最新消息向下移动；谁先回复，就先显示谁的消息。')
+    if (s >= 3) addReply('reply-alice', 5, '我核对了现有组件。正在处理的占位只会跟随自己发出的消息；谁先回复，就先显示谁的消息。')
     if (s >= 4) addReply('reply-alice-2', 6, '交互稿已整理好。正文流式、并行、连续回复和插话状态都能切换查看。')
   } else if (kind === 'stream') {
     if (s >= 2) addReply('reply-alice', 4, '先确认了一点：保留现在的消息和操作按钮，只把执行中的内容接到会话末尾。')
@@ -253,6 +253,11 @@ export const model = {
   },
   get: () => state, subscribe: (fn: () => void) => { listeners.add(fn); return () => listeners.delete(fn) },
   note: (note: string) => update({ note }),
+  showNarration(text: string) {
+    const evidence = state.snapshot.executionEvidence.map((item: any) => item.id === 'e-run-alice-3'
+      ? { ...item, revision: (item.revision || 0) + 1, payload: { ...item.payload, delta: text } } : item)
+    update({ streamPaused: true, snapshot: { ...state.snapshot, executionEvidence: evidence } })
+  },
   setStage(stage: number) { halt(); streams.clear(); update({ streamPaused: false, stage: Math.max(0, Math.min(scenarios[state.scenario].steps.length - 1, stage)) }); refresh() },
   setScenario(scenario: string) {
     if (!scenarios[scenario]) return

@@ -5,16 +5,18 @@ import { NavigationShell } from '../../../apps/desktop/src/renderer/src/Navigati
 import { createDesktopNavigation } from '../../../apps/desktop/src/renderer/src/desktop-navigation'
 import { ThreadNavigation } from '../../../apps/desktop/src/renderer/src/ThreadNavigation'
 import { AppHeader } from '../../../apps/desktop/src/renderer/src/AppHeader'
-import { ThreadWorkspace } from '../../../apps/desktop/src/renderer/src/ThreadWorkspace'
+import { ThreadWorkspace, campConversationTimeline } from '../../../apps/desktop/src/renderer/src/ThreadWorkspace'
 import { ThreadClientProvider } from '../../../apps/desktop/src/renderer/src/camp-client'
 import { FilePreviewProvider } from '../../../apps/desktop/src/renderer/src/FilePreviewContext'
 import { CurrentUserProfileContext } from '../../../apps/desktop/src/renderer/src/CurrentUserProfile'
 import { MobileLayoutProvider } from '../../../apps/desktop/src/renderer/src/MobileLayout'
 import { AppDialogBody, AppDialogContent, AppDialogFooter, AppDialogHeader } from '../../../apps/desktop/src/renderer/src/AppDialog'
 import { model, profiles, scenarios, installations } from './model'
-import { conversationRunPresence } from '../../../apps/desktop/src/renderer/src/conversation-run-presence'
+import { conversationRunPresenceTimeline } from '../../../apps/desktop/src/renderer/src/conversation-run-presence'
 import { liveRuntimeEventFromExecutionEvidence } from '../../../apps/desktop/src/renderer/src/ui-model'
-const projectedPresence = (snapshot: any) => conversationRunPresence(snapshot.agentRuns, snapshot.messages, new Set()).map(slot => ({ ...slot, status: slot.run.status }))
+const projectedTimeline = (snapshot: any) => conversationRunPresenceTimeline(campConversationTimeline(snapshot.messages,
+  snapshot.turns, snapshot.agentRuns, snapshot.tasks, snapshot.agentRunFileChanges, snapshot.agentRunImages, snapshot.memberCreations), snapshot.agentRuns)
+const projectedPresence = (snapshot: any) => projectedTimeline(snapshot).flatMap(item => item.kind === 'run_presence' ? [{ ...item.slot, status: item.slot.run.status }] : [])
 import '../../../apps/desktop/src/renderer/src/styles.css'
 import './fixture.css'
 
@@ -82,20 +84,21 @@ function Workbench() {
         ...['消息投递与恢复', '会话工作区优化', '发布前检查'].map((title, i) => ({ ...current, id: `demo-thread-${i}`, title, marker: 'none' }))] }] }
   useEffect(() => {
     Object.assign(window, { __presence: { setScenario: model.setScenario, setStage: model.setStage, setTheme, setProposal,
-      getState: model.get, controls: model.controls, resync: model.resync, stop: model.stop, retry: model.retry, failRun: model.failRun, verify: () => {
+      getState: model.get, showNarration: model.showNarration, controls: model.controls, resync: model.resync, stop: model.stop, retry: model.retry, failRun: model.failRun, verify: () => {
         const s = model.get().snapshot
         const ids = [...document.querySelectorAll<HTMLElement>('[data-message-id]')].map(e => e.dataset.messageId)
         const positions = ids.map(id => s.messages.findIndex((m: any) => m.id === id)).filter(i => i >= 0)
         const slots = projectedPresence(s), rows = [...document.querySelectorAll<HTMLElement>('[data-presence-run]')]
         const messages = [...document.querySelectorAll<HTMLElement>('[data-message-id]')]
-        const last = messages.at(-1)
+        const actualOrder = [...document.querySelectorAll<HTMLElement>('[data-message-id],[data-presence-run]')].map(e => e.dataset.messageId ?? 'run-presence:' + e.dataset.presenceRun)
+        const expectedOrder = projectedTimeline(s).filter(item => item.kind === 'camp_message' || item.kind === 'run_presence').map(item => item.id)
         return { allMessagesPresent: s.messages.every((m: any) => ids.includes(m.id)),
           messagesInOrder: positions.every((n, i) => !i || n > positions[i - 1]), uniqueMessages: ids.length === new Set(ids).size,
           slotsAreNotMessages: !document.querySelector('.conversation-run-presence[data-message-id]'),
           noQueuedPlaceholders: slots.every((x: any) => x.status !== 'queued'),
           noCompletedRows: slots.every((x: any) => !['succeeded','cancelled'].includes(x.status)),
           uniqueRuns: rows.length === new Set(rows.map(e => e.dataset.presenceRun)).size,
-          allAfterLatestMessage: rows.every(e => !last || Boolean(last.compareDocumentPosition(e) & Node.DOCUMENT_POSITION_FOLLOWING)),
+          anchoredOrder: JSON.stringify(actualOrder) === JSON.stringify(expectedOrder),
           independentActivityRows: rows.every(e => !e.closest('.message-actions')),
           compactRows: rows.every((e, i) => e.querySelectorAll('button').length === (slots[i].run.status === 'failed' && slots[i].run.failure?.retryable === false ? 1 : 2) && !e.querySelector('.presence-elapsed')),
           commandIconsMatchContent: rows.every(e => Boolean(e.querySelector('.tool-call-icon')) === (e.querySelector('.run-presence-open')?.getAttribute('data-preview-kind') === 'command')),
@@ -161,8 +164,8 @@ function Workbench() {
     <Dialog.Root open={info} onOpenChange={setInfo}><AppDialogContent className="app-dialog prototype-info-dialog">
       <AppDialogHeader title="跟着消息向下，继续处理" description="群聊中的队员占位 · 停止区分隔" />
       <AppDialogBody>
-        <p>占位始终在最新消息后面。上一条属于同一个 Run，就沿用上方身份；被其他消息隔开，或属于另一个 Run，就重新显示头像和姓名。</p>
-        <div className="prototype-info-rule"><strong>进行中标识、单行内容、停止</strong><p>正文从开头逐字显示，满一行后省略，不横向滚动；命令带有终端图标，同样单行省略。右侧短竖线分隔停止区，按钮默认中性色、悬浮变红，点击后确认。点击内容打开现有执行台，查看全文与耗时。</p></div>
+        <p>发送前固定在本次输入锚点；自己的公开消息发送成功后，才接到这条消息下面。其他人的消息和追加输入不移动这个位置。紧接同一 Run 的消息或产物时沿用身份。</p>
+        <div className="prototype-info-rule"><strong>RunCard 高亮、单行正文、停止</strong><p>正文按原文已有换行在同一行内逐行推进，未换行的长内容静态省略。运行中复用 RunCard 文字高亮，命令保留原工具图标。右侧短竖线分隔停止区，按钮默认中性色、悬浮变红，点击后确认。点击内容打开现有执行台，查看全文与耗时。</p></div>
         <div className="prototype-info-rule"><strong>中断可重试，结束就收起</strong><p>中断行保留原因入口和重试按钮。重试受理后收起旧提示，切群和刷新也保持收起；新执行开始后恢复占位，再失败时重试新执行。原失败记录与继续执行按钮保留在执行台。排队不占位，结束不保留完成行。复制／回复继续使用现有规则。</p></div>
         <div className="prototype-info-rule"><strong>直接复用当前前端</strong><p>侧栏、顶栏、消息气泡、头像、Composer、队员列表与执行台均由当前仓库的生产 React 组件渲染。日夜主题使用原有 token。</p>
           <code>ThreadWorkspace · ThreadNavigation · NavigationShell<br />AppHeader · MemberAvatar · styles.css · theme.css</code>

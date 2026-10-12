@@ -103,8 +103,11 @@ Core event 和本地 Notify 只负责提早唤醒，不承担不丢失保证，�
 payload；`attempting` 时只推进 console 的 `latest_sequence/digest`，不得创建第二条 Delivery。原 Delivery 成功 settle
 后，若 `delivered_sequence < latest_sequence`，必须在同一 settlement 事务只创建或合并一次 latest-sequence follow-up。
 该 latest-wins 流控独立于 500ms Main debounce；终态 quiet window 也不得被 live debounce 吞并。
-首次发现时已终态且结束时间早于 quiet window 的 A2A 后续 Run，可以在同一次 Core tick 冻结终态快照并投递卡片；
-仍处于 quiet window 的 Run 保留 `terminal_pending`，等待窗口结束后再封存。
+封存还要求该 Run 的持久正文块已定稿：`agent.text.block` 仍为 `streaming` 时，其正文可能只在内存／临时文件，
+不得以终态、digest 不变或 quiet window 代替定稿完成。`terminal_pending` 保持 outstanding work，后台定稿的
+既有 live event 可唤醒刷新，恢复 watchdog 继续兜底；Host tick 只请求异步维护，不同步写正文。
+首次发现时已终态、正文已定稿且结束时间早于 quiet window 的 A2A 后续 Run，可以在同一次 Core tick 冻结终态快照并投递卡片；
+其他终态 Run 保留 `terminal_pending`，等待正文和窗口都就绪后再封存。Run 终态提交不等待渠道封存。
 
 ## 3. 十分钟恢复 watchdog
 

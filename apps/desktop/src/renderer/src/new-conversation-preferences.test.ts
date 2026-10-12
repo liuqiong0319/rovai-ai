@@ -1,3 +1,4 @@
+import { EMPTY_SNAPSHOT } from '../../shared/navigation-preferences-model'
 import { describe, expect, it } from 'vitest'
 import type {
   AgentProfile,
@@ -10,18 +11,11 @@ import {
   currentProjectForThread,
   currentProjectWorkspace,
   defaultsNeedInvalidation,
-  forgetOpenedProject,
   navigationIncludingCurrentWorkspace,
-  navigationWithOpenedProjects,
-  navigationWithProjectAuthority,
+  navigationWithProjectDirectories,
   navigationWithProjectOrder,
-  navigationWithoutRemovedProjects,
   parseCurrentProject,
-  parseKnownProjects,
-  persistKnownProjects,
   projectTargetKey,
-  readKnownProjects,
-  rememberOpenedProject,
   resolveNewConversationDefaults,
   resolveAvailableNewConversationDefaults,
   shouldInvalidateNewConversationDefaults
@@ -88,9 +82,9 @@ describe('new conversation preferences', () => {
       ]
     }
 
-    const displayed = navigationWithoutRemovedProjects(
+    const displayed = navigationWithProjectDirectories(
       navigation,
-      new Set([projectTargetKey('/repo/a')])
+      { ...EMPTY_SNAPSHOT, removedProjects: [{ targetKey: projectTargetKey('/repo/a'), removedAt: '2026-10-01T00:00:00Z' }] }
     )
 
     expect(displayed?.quickChat).toBe(navigation.quickChat)
@@ -135,7 +129,7 @@ describe('new conversation preferences', () => {
       .toEqual(['/repo/existing', '/repo/new'])
   })
 
-  it('keeps Project navigation hidden until removed authority is ready', () => {
+  it('keeps legacy projects visible until preferences load and honors known removals', () => {
     const navigation: NavigationSnapshot = {
       schemaVersion: 3,
       throughGlobalSequence: 7,
@@ -143,11 +137,10 @@ describe('new conversation preferences', () => {
       projects: [project('/repo/a'), project('/repo/b')]
     }
 
-    expect(navigationWithProjectAuthority(navigation, new Set(), false)?.projects).toEqual([])
-    expect(navigationWithProjectAuthority(
+    expect(navigationWithProjectDirectories(navigation, null)?.projects).toEqual(navigation.projects)
+    expect(navigationWithProjectDirectories(
       navigation,
-      new Set([projectTargetKey('/repo/a')]),
-      true
+      { ...EMPTY_SNAPSHOT, removedProjects: [{ targetKey: projectTargetKey('/repo/a'), removedAt: '2026-10-01T00:00:00Z' }] }
     )?.projects.map((candidate) => candidate.projectPath)).toEqual(['/repo/b'])
   })
 
@@ -234,76 +227,6 @@ describe('new conversation preferences', () => {
     expect(shouldInvalidateNewConversationDefaults(preferences, [], false)).toBe(false)
     expect(shouldInvalidateNewConversationDefaults(preferences, [], true)).toBe(true)
   })
-
-  it('parses the persisted opened-project list leniently and de-duplicates', () => {
-    expect(parseKnownProjects(null)).toEqual([])
-    expect(parseKnownProjects('{broken')).toEqual([])
-    expect(parseKnownProjects(JSON.stringify([
-      { projectPath: '/repo/a', name: 'A', openedAt: '2026-01-01' },
-      { projectPath: '/repo/a', name: 'A-dup', openedAt: '2026-01-02' },
-      { projectPath: '', name: 'x', openedAt: '' },
-      { name: 'missing-path' }
-    ]))).toEqual([
-      { projectPath: '/repo/a', name: 'A', openedAt: '2026-01-01' }
-    ])
-  })
-
-  it('promotes every remembered empty Project, not just the current one', () => {
-    const navigation: NavigationSnapshot = {
-      schemaVersion: 3,
-      throughGlobalSequence: 7,
-      quickChat: { totalCount: 0, recentThreads: [] },
-      projects: [project('/repo/existing')]
-    }
-    const displayed = navigationWithOpenedProjects(navigation, [
-      { projectPath: '/repo/a', name: 'a', openedAt: '2026-01-01T00:00:00.000Z' },
-      { projectPath: '/repo/b', name: 'b', openedAt: '2026-01-02T00:00:00.000Z' }
-    ], new Set())
-
-    expect(displayed?.projects.map((candidate) => candidate.projectPath))
-      .toEqual(['/repo/existing', '/repo/a', '/repo/b'])
-    expect(displayed?.projects[1]).toMatchObject({
-      projectKey: 'directory:/repo/a',
-      name: 'a',
-      projectPath: '/repo/a',
-      totalCount: 0,
-      recentThreads: []
-    })
-  })
-
-  it('does not resurrect removed or already-listed empty Projects', () => {
-    const navigation: NavigationSnapshot = {
-      schemaVersion: 3,
-      throughGlobalSequence: 7,
-      quickChat: { totalCount: 0, recentThreads: [] },
-      projects: [project('/repo/a')]
-    }
-    expect(navigationWithOpenedProjects(navigation, [
-      { projectPath: '/repo/a', name: 'a', openedAt: 'x' },
-      { projectPath: '/repo/removed', name: 'removed', openedAt: 'x' }
-    ], new Set([projectTargetKey('/repo/removed')]))).toBe(navigation)
-  })
-
-  it('remembers opened projects durably and forgets them on removal', () => {
-    const values = new Map<string, string>()
-    globalThis.window = {
-      localStorage: {
-        getItem: (key: string) => values.get(key) ?? null,
-        setItem: (key: string, value: string) => { values.set(key, value) }
-      }
-    } as unknown as Window & typeof globalThis
-
-    rememberOpenedProject({ name: 'a', projectPath: '/repo/a' })
-    rememberOpenedProject({ name: 'b', projectPath: '/repo/b' })
-    rememberOpenedProject({ name: 'a', projectPath: '/repo/a' })
-    expect(readKnownProjects().map((entry) => entry.projectPath)).toEqual(['/repo/a', '/repo/b'])
-
-    forgetOpenedProject('/repo/a')
-    expect(readKnownProjects().map((entry) => entry.projectPath)).toEqual(['/repo/b'])
-
-    persistKnownProjects([])
-    delete (globalThis as { window?: unknown }).window
-  })
 })
 
 function configuredPreferences(): GeneralPreferencesSnapshot {
@@ -364,3 +287,13 @@ function project(projectPath: string): NavigationSnapshot['projects'][number] {
     recentThreads: []
   }
 }
+
+it('uses the saved directory list after completion and legacy groups only before completion', () => {
+  const group = (path: string) => ({ projectKey: `directory:${path}`, projectPath: path, name: path, totalCount: 0, recentThreads: [], lastActivityAt: '', lastActivityGlobalSequence: 0 })
+  const navigation: NavigationSnapshot = { schemaVersion: 3, throughGlobalSequence: 0, quickChat: { totalCount: 0, recentThreads: [] }, projects: [group('/old'), group('/removed')] }
+  const preferences = { ...EMPTY_SNAPSHOT, registeredProjects: ['/empty'], removedProjects: [{ targetKey: 'directory:/removed', removedAt: '2026-10-01T00:00:00Z' }] }
+  expect(navigationWithProjectDirectories(navigation, preferences)?.projects.map(p => p.projectPath)).toEqual(['/empty', '/old'])
+  preferences.legacyProjectsSynced = true
+  expect(navigationWithProjectDirectories(navigation, preferences)?.projects.map(p => p.projectPath)).toEqual(['/empty'])
+  expect(navigationWithProjectDirectories(navigation, { ...preferences, registeredProjects: [] })?.projects).toEqual([])
+})

@@ -3,6 +3,7 @@ export { groupExecutionEventsByRunId } from './execution-events'
 import { MemberSessionReset } from './MemberSessionReset'
 import { ContinueAgentRunButton } from './ContinueAgentRunButton'
 import { ConversationRunPresence } from './ConversationRunPresence'
+import { conversationRunPresenceTimeline } from './conversation-run-presence'
 import { PendingThreadDraftPersistence } from './pending-thread-draft'
 import { MessageModelSummary, ModelSummaryText, ProfileModelFields } from './ThreadModelInformation'
 import { memberRuntimeConfigurationPresentation, modelSummary, runtimeAdapterLabel } from './runtime-model-presentation'
@@ -2463,6 +2464,9 @@ export function ThreadWorkspace({
       visibleThreadMessages
     ]
   )
+  const presenceTimeline = useMemo(() => conversationRunPresenceTimeline(
+    conversationTimeline, snapshot.agentRuns, workspaceEntrySnapshotReady
+  ), [conversationTimeline, snapshot.agentRuns, workspaceEntrySnapshotReady])
   const historyBoundaryId = anchorWindowBeforeNormal
     ? conversationTimeline.find(item => item.kind === 'camp_message' && item.message.sequence >= normalStart!)?.id : null
   const latestAgentMessageId = useMemo(() => {
@@ -4910,12 +4914,25 @@ export function ThreadWorkspace({
                 const items: JSX.Element[] = []
                 let lastDayKey = ''
                 let previousMessageAuthorKey: string | null = null
-                for (let timelineIndex = 0; timelineIndex < conversationTimeline.length; timelineIndex += 1) {
-                  const timelineItem = conversationTimeline[timelineIndex]
+                for (let timelineIndex = 0; timelineIndex < presenceTimeline.length; timelineIndex += 1) {
+                  const timelineItem = presenceTimeline[timelineIndex]
                   if (timelineItem.id === historyBoundaryId) {
                     if (hasAnchorGap) items.push(<div className="camp-history-gap" role="status" key="anchor-history-gap">{uiAttribute('中间消息尚未加载')}</div>)
                     if (historyLoader) items.push(historyLoader)
                     previousMessageAuthorKey = null
+                  }
+                  if (timelineItem.kind === 'run_presence') {
+                    previousMessageAuthorKey = null
+                    items.push(<ConversationRunPresence key={timelineItem.id} snapshot={snapshot}
+                      slot={timelineItem.slot} profiles={agents} eventsByRunId={executionEventsByRunId}
+                      windowedEvidence={openCoverage !== null}
+                      stopState={run => agentRunStopViewState(run, snapshot.turns.find(turn => turn.id === run.threadTurnId) ?? null, {
+                        cancelling: cancellingRunIds.has(run.id) || run.cancelRequestedAt !== null,
+                        confirming: confirmingRunIds.has(run.id),
+                        turnCancelling: run.threadTurnId !== null && cancellingTurnIds.has(run.threadTurnId)
+                      })}
+                      onStop={onCancelAgentRun} onOpen={openExecutionProcess} onError={notifyError} />)
+                    continue
                   }
                   const dayKey = localDayKey(timelineItem.createdAt)
                   if (dayKey && dayKey !== lastDayKey) {
@@ -5092,8 +5109,8 @@ export function ThreadWorkspace({
                     : null
                   const followsSameAuthor = messageAuthorKey !== null
                     && previousMessageAuthorKey === messageAuthorKey
-                  const previousItem = conversationTimeline[timelineIndex - 1]
-                  const nextItem = conversationTimeline[timelineIndex + 1]
+                  const previousItem = presenceTimeline[timelineIndex - 1]
+                  const nextItem = presenceTimeline[timelineIndex + 1]
                   const groupingMessage = (message: ThreadMessageView): ThreadMessageView => ({
                     ...message,
                     threadTurnId: message.threadTurnId
@@ -5132,10 +5149,10 @@ export function ThreadWorkspace({
                   if (campMessage.authorType === 'agent' && campMessage.sourceAgentRunId) {
                     for (
                       let nextIndex = timelineIndex + 1;
-                      nextIndex < conversationTimeline.length;
+                      nextIndex < presenceTimeline.length;
                       nextIndex += 1
                     ) {
-                      const candidate = conversationTimeline[nextIndex]
+                      const candidate = presenceTimeline[nextIndex]
                       const candidateRunId = candidate.kind === 'run_file_changes' ? candidate.changes.agentRunId
                         : candidate.kind === 'member_joined' ? candidate.receipt.sourceAgentRunId : null
                       if (candidateRunId !== campMessage.sourceAgentRunId
@@ -5455,23 +5472,6 @@ export function ThreadWorkspace({
                   if (hasAnchorGap) items.push(<div className="camp-history-gap" role="status" key="anchor-history-gap">{uiAttribute('中间消息尚未加载')}</div>)
                   if (historyLoader) items.push(historyLoader)
                 }
-                const precedingOutput = conversationTimeline.at(-1)
-                const precedingOutputRunId = precedingOutput?.kind === 'run_artifacts' ? precedingOutput.run.id
-                  : precedingOutput?.kind === 'run_file_changes' ? precedingOutput.changes.agentRunId
-                  : precedingOutput?.kind === 'run_images' ? precedingOutput.images.agentRunId
-                  : precedingOutput?.kind === 'member_joined' ? precedingOutput.receipt.sourceAgentRunId
-                  : precedingOutput?.kind === 'camp_message' ? undefined : null
-                items.push(<ConversationRunPresence key={`run-presence:${snapshot.thread.id}`} snapshot={snapshot}
-                  snapshotReady={workspaceEntrySnapshotReady}
-                  precedingOutputRunId={precedingOutputRunId}
-                  messages={visibleThreadMessages} profiles={agents} eventsByRunId={executionEventsByRunId}
-                  windowedEvidence={openCoverage !== null}
-                  stopState={run => agentRunStopViewState(run, snapshot.turns.find(turn => turn.id === run.threadTurnId) ?? null, {
-                    cancelling: cancellingRunIds.has(run.id) || run.cancelRequestedAt !== null,
-                    confirming: confirmingRunIds.has(run.id),
-                    turnCancelling: run.threadTurnId !== null && cancellingTurnIds.has(run.threadTurnId)
-                  })}
-                  onStop={onCancelAgentRun} onOpen={openExecutionProcess} onError={notifyError} />)
                 return items
               })()}
               {!missionBoard && conversationTimeline.length === 0 && snapshot.agentRuns.length === 0 && (
@@ -10623,6 +10623,7 @@ function RunExecutionContent({
       {cancelling && nonTerminal && (
         <div className="process-action cancelling" role="status"><UiText zh={"正在提交停止请求，完成后即可继续发送。"} /></div>
       )}
+      {run.nativeSessionReplaced && <p className="process-copy" role="status"><UiText zh="原生会话未能恢复，已新建会话继续。Camp 中的消息保留。" /></p>}
       {publicFailure && <RuntimeFailureNotice failure={publicFailure} presentation="agent-run" />}
     </div>
     </ExecutionContentContext.Provider>

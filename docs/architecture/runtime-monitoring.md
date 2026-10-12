@@ -3,12 +3,12 @@ document_type: architecture
 architecture: runtime-monitoring
 authority: runtime-usage-metering-and-read-boundaries
 status: accepted
-last_updated: 2026-10-05
+last_updated: 2026-10-12
 ---
 
 # Runtime Monitoring 架构
 
-精确字段与方法见 [Runtime Usage Monitoring v8](../contracts/runtime-usage-monitoring-v8.md)；执行台的原生用量与上下文另见 [Runtime Execution Metrics v7](../contracts/runtime-execution-metrics-v7.md)。长期最小化、
+精确字段与方法见 [Runtime Usage Monitoring v9](../contracts/runtime-usage-monitoring-v9.md)；执行台的原生用量与上下文另见 [Runtime Execution Metrics v7](../contracts/runtime-execution-metrics-v7.md)。长期最小化、
 稀疏语义、clean break 与 Cost grain 由
 [Evidence 与 Usage 不变量](foundational-invariants.md#evidence-usage)拥有。本架构只说明 Usage Transport、内存归一化、
 Projection/Rollup、Read Side 和 Renderer 如何组合。
@@ -18,12 +18,12 @@ Projection/Rollup、Read Side 和 Renderer 如何组合。
 | Component | Responsibility |
 | --- | --- |
 | Runtime adapter parser | 从已证明的 Runtime wire path 提取稀疏 Token/Cache/Cost；不估算缺失值 |
-| Native Usage reader | 在 prompt 发送前冻结当前根 Session cursor，按已验证字段结构只读本地数值元数据；不保存正文或历史回填 |
+| Native Usage reader | 在后台建立当前根 Session cursor，按已验证字段结构只读本地数值元数据；不保存正文或历史回填 |
 | Usage buffer | 按调用归一化并以 source identity 去重；保留有序数值帧与 cumulative/gauge baseline |
 | Usage flush service | 周期最多每 4 秒一次；一个短事务更新 checkpoint、Run summary 与 hourly rollup |
 | Pricing catalog | 按 model key、service tier 与 effective date 提供版本化公开费率；不访问网络 |
-| AgentRun terminal boundary | 在结算前等待该 Run pending Usage Flush；权威状态 transition finalizes summary 并删除 checkpoint |
-| Retention worker | 每天低频、分批删除超过 45 天的 derived rows 与超过 72 小时的 abandoned checkpoint |
+| AgentRun terminal boundary | 仅在内存标记采集结束；结算与后继执行不等待 Usage，迟到数值由周期任务落盘 |
+| Retention worker | 每天低频、分批删除超过 45 天的 derived rows 与超过 72 小时且 Run 已非活动态的 checkpoint |
 | Snapshot read side | 一次短查询组装 summary/trend/breakdown/Coverage；不访问 Evidence、Blob、Transcript 或网络 |
 | Provider reconciliation writer | 在独立后台任务中保存 aggregate billing bucket；不由页面刷新触发 |
 | Renderer | 一个 Usage 页面，single-flight Snapshot、可见时有界刷新、未知值与 Coverage 并列展示 |
@@ -40,7 +40,7 @@ Runtime event/result
   -> adapter/format parser
   -> sparse normalized Usage in memory
   -> source-identity dedupe + ordered per-source numeric buffer
-  -> 4s periodic flush OR terminal forced flush
+  -> 4s periodic background flush (also after Run settlement)
   -> one short SQLite transaction
        runtime_usage_checkpoint
        runtime_usage_run_summary
@@ -57,7 +57,7 @@ Execution Evidence。
 原始 input/read/write 不跨独立调用合并。请求命中计数在已验证的单调用边界生成，
 summary/hourly 只加已归一的 contribution；缺 Input/Output 的 contribution 会将 summary 标为部分，
 终态不会把部分和升级为完整总量。失败恢复保留旧数值帧在新帧之前，累计首次基线与 reset 不能被
-“只保留最后一帧”覆盖。Delta checkpoint 按调用身份暂存，仍遵守 terminal 删除与 72 小时上限。
+“只保留最后一帧”覆盖。Delta checkpoint 按调用身份暂存，终态后仍保留，现有过期清理任务在 72 小时后分批删除。
 执行台根据新完整性字段决定是否能显示 Input＋Output，四项已观测值继续可读。
 
 指标层没有 CLI 版本白名单或私设最低版本。实际字段、来源身份和计量语义决定准入；产品本身的
@@ -76,15 +76,15 @@ ACP `usage_update.cost` 的 Session 累计不进入 Run summary。Codex 完整 b
 CodeBuddy、Kimi Code、Qoder 与 TRAE 使用当前 workspace／Session 下的 JSONL cursor；OpenCode V1
 使用只读 SQLite 中的根 Session assistant 元数据，读取根与所选 Runtime 的有效环境一致。
 OpenCode V2 停用 V1 reader，使用本轮终态 usage，缺响应时保持缺失；不能从两个来源重复累计。
-代际选择数据语义，不形成补丁版本白名单。prompt 发送前建立历史 offset 与身份 baseline；之后
-最多每 4 秒在既有 Flush 锁内读取、buffer、落盘，terminal 强制 Flush 保持同一 Run cursor，增加 400ms
-尾读后才允许后继 prompt 建立 baseline。整个过程在 blocking pool 读取，不持有 Core Database Mutex
-等待原生磁盘。部分行等待完整换行；文件换代、缺口、超限停止采集且不重扫历史。
+代际选择数据语义，不形成补丁版本白名单。prompt 启动时发起后台历史 offset 与身份 baseline 初始化；
+发送不等待初始化，晚建立的 baseline 可以漏掉早期统计。之后最多每 4 秒读取、buffer、落盘；
+Run 结算不等待 Flush，也不进行 400ms 尾读。跨越完成边界的原生日志读取结果丢弃，避免后继用量
+归到旧 Run。本地 journal 贡献显示部分统计。原生磁盘读取不持有 Core Database Mutex。部分行等待完整换行；文件换代、缺口、超限停止采集且不重扫历史。
 
 这些 reader 只保留有界调用身份、offset、文件身份和必要数值。JSONL 的非 Usage 字段由封闭 DTO 跳过，
 SQLite 不读取 part／正文；原始行只在本次解析缓冲中存在，不进入 Evidence、Blob、日志或 Renderer。
 选定本地 Token 来源后不再混加 ACP Token；Gauge 和 Cost 独立处理。最新版本与字段语义由
-[Usage v8](../contracts/runtime-usage-monitoring-v8.md)及其继承的原生来源合同拥有。
+[Usage v9](../contracts/runtime-usage-monitoring-v9.md)及其继承的原生来源合同拥有。
 
 Antigravity 在当前根 DONE step 进入 buffer 前，只读对应原生 SQLite 的同调用数值，
 交叉核对 stream 与本地身份/计数后替换稀疏观测；Context 读取同一 generator 的原生窗口估计。
@@ -130,7 +130,7 @@ cost 缺少安全的跨 Run baseline，按现有 OpenCode 边界保持 Run 费�
 Codex Run summary 可记录实际 service tier；费用投影先用原生观察、再用冻结/发送时请求档位。未知不套
 Standard 价，实际回退 Standard 不按请求 Fast 计价；失去档位依据时撤回旧目录估价。这个小型 metadata
 写入不新增计费系统，也不替代 Claude 等 Runtime 的原生 reported cost。精确行为由
-[Runtime Usage Monitoring v8](../contracts/runtime-usage-monitoring-v8.md) 拥有。
+[Runtime Usage Monitoring v9](../contracts/runtime-usage-monitoring-v9.md) 拥有。
 
 ```text
 visible Settings page
@@ -158,8 +158,8 @@ visible Settings page
 
 ## Retention and clean break
 
-Run summary、hourly 与 reconciliation 保存 45 天。active checkpoint 受保护；terminal transition 立即删除，
-遗留 checkpoint 72 小时到期。清理每天一次、每批不超过 1,000 行，不在页面请求中执行，也不自动完整
+Run summary、hourly 与 reconciliation 保存 45 天。active checkpoint 受保护；terminal 后保留短期基线，
+非活动 Run 的 checkpoint 72 小时到期。清理每天一次、每批不超过 1,000 行，不在页面请求中执行，也不自动完整
 `VACUUM`。
 
 Migration 92 是破坏性的 Monitoring clean break：删除 v1 Monitoring schema，建立 schema 2 五表、新 collection
@@ -168,7 +168,7 @@ epoch、Database contract `v0.99` 与 projection schema `47`。不存在回填�
 ## References
 
 - [Evidence 与 Usage 不变量](foundational-invariants.md#evidence-usage)
-- [Runtime Usage Monitoring v8](../contracts/runtime-usage-monitoring-v8.md)
+- [Runtime Usage Monitoring v9](../contracts/runtime-usage-monitoring-v9.md)
 - [v0.99 implementation plan](../versions/v0.99/implementation-plan.md)
 - [Runtime monitoring feasibility audit](../research/runtime-monitoring/README.md)
 - [Core 受管内容不变量](foundational-invariants.md#core-managed-content)
@@ -184,3 +184,7 @@ ZCode 当前根模型调用结束/压缩完成通过合并的待读序号唤醒�
 reader 不被查询阻塞。live、terminal 和 background snapshot 串行读取；仅 live 返回消息数限制为 1，终态沿用原参数，
 只把数值投递到 Core；旧 input 的回读丢弃。无通用新定时器或正文保存。Pi/Antigravity 的独立
 used/window 不再互为入口条件。支持时机与真实 App 范围见[可用性验收](../research/runtime-monitoring/live-context-usability-2026-10-04.md)。
+
+Run 终态只确认业务已结束，`finalized_at` 不代表统计冻结。Migration 194（schema 144）保留终态去重
+checkpoint，不改写已有数值；失败的后台批次保留待重试。此取舍与正文后台收尾见
+[V1.72-D36](../versions/v1.72/decisions.md#v1-72-d36)。

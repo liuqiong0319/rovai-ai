@@ -429,6 +429,7 @@ export function SingleChatRunHistory({
             <span className="single-chat-disclosure" aria-hidden="true"><ChevronGlyph /></span>
           </summary>
           <div className="single-chat-execution-content process-content">
+            {run.nativeSessionReplaced && <p className="single-chat-process-note" role="status"><UiText zh="原生会话未能恢复，已新建会话继续。Camp 中的消息保留。" /></p>}
             {grouped.map(renderItem)}
             {!terminal && !stopping && (!hasActiveTool || showThinking) && !hasActiveCompaction && liveTailKey === null && feedback && (
               <div className="process-action current" role="status">

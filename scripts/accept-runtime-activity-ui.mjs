@@ -900,22 +900,21 @@ try {
       && Math.abs((drawer?.getBoundingClientRect().height ?? 0) - now) <= 1
   })()`)
   await evaluate(app.cdp, `(() => {
-    const timeline = document.querySelector('.camp-timeline')
-    if (timeline) timeline.scrollTop = timeline.scrollHeight
-    return timeline?.scrollTop ?? 0
+    const row = document.querySelector('[data-presence-run="${activeRunId}"]')
+    row?.scrollIntoView({ block: 'center', behavior: 'instant' })
   })()`)
   await wait(200)
   const compactPresence = await evaluate(app.cdp, `(() => {
     const timeline = document.querySelector('.camp-timeline').getBoundingClientRect()
-    const row = [...document.querySelectorAll('.conversation-run-presence')].at(-1)?.getBoundingClientRect()
+    const row = document.querySelector('[data-presence-run="${activeRunId}"]')?.getBoundingClientRect()
     return { visible: Boolean(row && row.top >= timeline.top - 1 && row.bottom <= timeline.bottom + 1),
       contained: Boolean(row && row.left >= timeline.left - 1 && row.right <= timeline.right + 1) }
   })()`)
   assert(compactPresence.visible && compactPresence.contained,
-    `The live tail escaped the compact timeline: ${JSON.stringify(compactPresence)}`)
+    `The active Run row escaped the compact timeline: ${JSON.stringify(compactPresence)}`)
   await capture(app.cdp, join(outputDir, 'run-presence-compact.png'))
-  // The live tail now follows the last message. Inspect that message's footer
-  // at its own reading position, rather than assuming it is the timeline tail.
+  // Run rows stay at their own input/output anchors. Inspect the message footer
+  // at its own reading position independently of the active Run row.
   await evaluate(app.cdp, `(() => {
     const timeline = document.querySelector('.camp-timeline')
     timeline.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -120 }))
@@ -5168,7 +5167,7 @@ function assertCampWorldMapLayout(layout, label, expectedAgentCount) {
 }
 
 async function verifyExecutionBackgrounds(cdp) {
-  const colors = await evaluate(cdp, `(() => {
+  const readColors = () => evaluate(cdp, `(() => {
     const background = (selector) => {
       const element = document.querySelector(selector)
       return element ? getComputedStyle(element).backgroundColor : null
@@ -5183,16 +5182,27 @@ async function verifyExecutionBackgrounds(cdp) {
       conversation: background('.conversation-controls')
     }
   })()`)
-  const expected = {
-    day: { selectedViewButton: 'rgb(233, 238, 243)' },
-    night: { selectedViewButton: 'rgb(34, 48, 58)' }
-  }[colors.theme]
-  assert(expected && colors.conversation
-    && colors.selectedViewButton === expected.selectedViewButton
-    && colors.header === colors.conversation
-    && colors.runningRun === colors.conversation
-    && colors.historicalRun === colors.conversation
-    && colors.canvas === colors.conversation,
+  const matches = (colors) => {
+    const expected = {
+      day: { selectedViewButton: 'rgb(233, 238, 243)' },
+      night: { selectedViewButton: 'rgb(34, 48, 58)' }
+    }[colors.theme]
+    return expected && colors.conversation
+      && colors.selectedViewButton === expected.selectedViewButton
+      && colors.header === colors.conversation
+      && colors.runningRun === colors.conversation
+      && colors.historicalRun === colors.conversation
+      && colors.canvas === colors.conversation
+  }
+  // Theme propagation and paint can span more than the marker's first frame.
+  // Keep the same color assertions, allowing the actual surfaces to settle.
+  let colors = await readColors()
+  const deadline = Date.now() + 2_000
+  while (!matches(colors) && Date.now() < deadline) {
+    await wait(50)
+    colors = await readColors()
+  }
+  assert(matches(colors),
   `Execution backgrounds diverged from the shared conversation surface: ${JSON.stringify(colors)}`)
   return colors
 }
@@ -5701,16 +5711,32 @@ async function mouseClickSelector(cdp, selector) {
   })()`)
   // Timeline layout can settle on the following frame; measure after it moves.
   await evaluate(cdp, 'new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))', true)
-  const point = await evaluate(cdp, `(() => {
-    const target = [...document.querySelectorAll(${JSON.stringify(selector)})]
-      .find((candidate) => candidate instanceof HTMLElement && candidate.getClientRects().length > 0)
-    if (!(target instanceof HTMLElement)) return null
-    const rect = target.getBoundingClientRect()
-    const x = rect.left + (rect.width / 2)
-    const y = rect.top + (rect.height / 2)
-    return target.contains(document.elementFromPoint(x, y)) ? { x, y } : null
-  })()`)
-  assert(point, `Could not locate an unobscured pointer target: ${selector}`)
+  let point = null
+  const deadline = Date.now() + 2_000
+  while (!point && Date.now() < deadline) {
+    point = await evaluate(cdp, `(() => {
+      const target = [...document.querySelectorAll(${JSON.stringify(selector)})]
+        .find((candidate) => candidate instanceof HTMLElement && candidate.getClientRects().length > 0)
+      if (!(target instanceof HTMLElement)) return null
+      const rect = target.getBoundingClientRect()
+      const x = rect.left + (rect.width / 2)
+      const y = rect.top + (rect.height / 2)
+      return target.contains(document.elementFromPoint(x, y)) ? { x, y } : null
+    })()`)
+    if (!point) await wait(50)
+  }
+  if (!point) {
+    const hit = await evaluate(cdp, `(() => {
+      const target = [...document.querySelectorAll(${JSON.stringify(selector)})]
+        .find((candidate) => candidate instanceof HTMLElement && candidate.getClientRects().length > 0)
+      if (!target) return { missing: true }
+      const rect = target.getBoundingClientRect()
+      const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2)
+      return { rect: rect.toJSON(), target: target.outerHTML, pointerEvents: getComputedStyle(target).pointerEvents,
+        hit: hit?.outerHTML.slice(0, 1_000) }
+    })()`)
+    throw new Error(`Could not locate an unobscured pointer target: ${selector}: ${JSON.stringify(hit)}`)
+  }
   await cdp.send('Input.dispatchMouseEvent', {
     type: 'mouseMoved', x: point.x, y: point.y, button: 'none', buttons: 0
   })

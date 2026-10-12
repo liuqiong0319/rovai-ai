@@ -3,10 +3,62 @@ document_type: implementation-plan
 version: v1.72
 authority: version-implementation-and-acceptance
 status: in_progress
-last_updated: 2026-10-11
+last_updated: 2026-10-12
 ---
 
 # v1.72 实施与验收
+
+## 项目目录 JSON 保存（2026-10-12）
+
+基线主线 `bab6034df3459269a4a15628dc436d660716f1ac`，分支 `rovai/json-project-navigation`，复用原隔离
+worktree `rovai-ai-sqlite-project-registry`。User 明确撤回未发布的 SQLite 登记方案，不保留实验表迁移或读取兼容。
+旧分支的项目建表／迁移、Core 接口、Web 身份、业务事务自动登记、持续观察与补登全部退出；生产数据库代码
+与所接入主线一致，保留主线现有 schema 与支持来源。实验 schema 不作为发布过的升级来源，日常数据不作修改。
+
+schema 6 导航偏好保存规范路径集合与 `legacyProjectsSynced`。成功完整启动读取只尝试一次补齐；晚到结果在
+统一写入入口重新应用最新移除记录。实际写入后才更新内存并展示新目录，失败不误标记、不覆盖损坏文件。
+完成后直接使用登记清单，普通导航刷新不再补缺、重读偏好或写目录。目录增删与别名等共用原安全写入口。
+Web 复用现有 IndexedDB 的短事务串行保护原 localStorage JSON，没有新目录库、持久队列、锁轮询或自动重试。
+
+按 User 后续要求，从 `4b1fae539` 收敛保存失败反馈：删除专属横幅、重试闭包与临时路径状态，失败只走已有
+短提示／表单错误，不改变当前目录；再次添加即可重新保存。旧补齐失败等下次启动，可选登记失败不阻止会话。
+
+Rust 测试退役：实验生产合同同时退出，删除 `project_registry::tests` 三项（目录生命周期、初始化失败、
+登记附加事务故障）及 `db::project_registry::tests` 一项实验迁移 owner；原业务事务、路径权限、Main 项目访问恢复、
+主线数据库准入／升级测试保留。目录持久化语义由真实文件 `navigation-preferences.test.ts`、Web 偏好 owner、
+真实双窗口导航 fixture 与生产 App 启动 fixture 接替；不以降低测试数量为目标。
+
+初版验证结果（反馈收敛后的定向结果另记）：
+
+- `pnpm test`：242 个 Vitest 文件、2,643 项通过；后续 Node 339 项通过、2 项平台跳过；文档、Skill 与 Electron 能力门禁通过。
+- `pnpm test:rust:pr`：465 项通过、1 项既有 ignored。首次运行的 detached child 回收测试超时，定向重跑及第二次完整 workspace 均通过；未修改该测试。
+- Main 真实文件、Web 与目录投影定向 32 项通过。生产 App 目录专项 4 组通过：空目录切换／重启、完成后零补齐、主动移除后的空清单、失败降级／显式重试与后续保存失败不重置标记。
+- 真实 Electron 双窗口并发登记／别名写入与移除优先通过；普通导航原生操作及 contextBridge 回归通过。
+- `pnpm typecheck`、`pnpm build:desktop`（含 Web）、带上述 base 的文档 CI 门禁与 diff 检查通过；前端机械扫描无发现，截图修正并复核失败提示栏。
+- 完整启动 fixture 仍在 `Leaving the loaded empty Camp must initiate cleanup before the race is tested` 失败。
+  在 `bab6034df` 独立临时 checkout 上复现相同失败；双方仅把 darwin fixture 的 Windows-only `windowClose` 能力按真实 preload 设为 undefined，基线生产代码未改。
+  该既有空会话清理断言未删除或跳过；目录专项另外执行并通过，不把完整启动套件记为通过。
+
+反馈收敛验证：类型检查及目录专项 4 组通过，验证失败不显示／选中目录、普通提示自动消失、再次添加成功、
+下次启动补齐以及完成标记保持。`pnpm test` 重跑 2,643 项 Vitest 和后续 Node 339 项通过、2 项平台跳过。
+首次全量中 CoreClient 的 Supervisor 等待超时，其文件 21 项定向及完整重跑均通过，未改该测试。
+前端机械扫描无发现，截图确认使用普通短提示。持久化、并发与 Rust 代码未修改，沿用初版验证。
+
+未安装日常 App、不启动真实 Runtime、不操作用户数据库；临时基线 checkout 已清理，任务 worktree 保留供评审。
+
+## Charter 与 Memory 入口精简（2026-10-12）
+
+User 消息 `ed8ae499-ebbe-44ae-a6ba-e0b588e04912` 已确认
+[R2 文案及兼容边界](model-context-change-charter-memory-concision.md)并授权 PR 合入 main。
+分支 `rovai/charter-concision-r2` 从 `bab6034df3459269a4a15628dc436d660716f1ac` 创建，
+先合入此前尚未进入 main 的 Codex 专属提示删除，再实施共享精简。
+本次只替换固定文案、维护 revision 与既有测试；共享兼容摘要不变，无数据库或动态 Context 变化。
+
+实施已完成。生产文案与确认 R2 逐字一致；复用既有 Charter／Bootstrap／Single Chat／Binding／Codex
+Adapter owner，定向 29 项通过，未新增、删除或禁用独立 Rust 测试。
+`pnpm test:rust:pr` 465 项通过、1 项既有 ignored；文档 10 项测试、普通及基于上述 base 的
+diff-aware 文档门禁、Rust 格式和 diff 检查通过。未运行真实模型行为评测，
+不把字符缩减或确定性测试表述为模型行为改善。
 
 ## CJK Markdown 与引用投影（2026-10-11）
 
@@ -1717,3 +1769,133 @@ refresh 不再请求；首次 page 在途期间收到更新也被丢弃。User �
 慢首读后无须新通知即可追上、补拉延迟时新实时正文不回退；原 37 个场景阶段与按钮／重试回归通过。
 `execution-state-transition` 浏览器回归、`pnpm build:desktop` 及文档通用门禁通过。
 本次没有运行桌面包或真实 Runtime；验证不依赖启动或修改日常 App。
+
+## 队员环境按进程启动读取（2026-10-12）
+
+按 User 方案 A 实施。领取/执行准备不再读取历史环境；现有 Fleet 创建分支携带私有配置读取来源，
+创建 CLI 时组装一次内存映射，Warm 命中不读取配置。Codex/ACP/Pi 使用既有 native binding 身份限制
+会话复用；Claude/Antigravity 在独立进程启动路径读取。派生工具进程保持 ManagedProcess 的父 CLI 环境。
+新环境映射不序列化入 Run，不改变既有 Run 身份、执行代次或输入确认。Migration 193/schema 143
+无需旧密钥/快照解密即退役两张历史环境表；队员配置与原生历史保留。
+
+单队员配置解析失败接入现有 lane 失败结算，SQL/数据库错误仍返回外层。环境读取错误发生于新 CLI
+创建，沿既有单 Run 失败路径展示；保存 env 不引入停止、重置或环境版本失效行为。
+界面采用约定的一句进程启动说明，重置文案仅解释原生上下文重启。
+
+测试归属、旧测试退役理由与命令见[测试指南](../../development/testing.md#队员运行环境-owner2026-10-11)。
+本机 macOS 验证结果：
+
+- `pnpm test:rust:pr`：workspace 465 项通过，1 项已有人工测试忽略。
+- `cargo test -p rovai-core --features extended-tests --lib` 按上述 owner、Codex/ACP/Pi/Claude/Antigravity、
+  Fleet、Runtime startup、Delivery queue、迁移准入、v163/continuation 迁移过滤运行：212 项通过。
+  加强后的 193 历史消息/原生 Session 保留案例通过；既有原生会话重置 slow owner 1 项通过。
+- `cargo check --workspace`、`cargo fmt --all --check`、`pnpm typecheck` 通过；Vitest 242 文件、2639 项通过。
+- `node scripts/smoke-member-environment.mjs` 与 `node scripts/smoke-member-environment-ui.mjs` 通过，
+  覆盖 Core 私有接口、重启/加密/并发写保护和双语界面；数据、Skill Library 与 MCP 均使用临时目录。
+- `pnpm docs:test`、`pnpm docs:check` 与基于 PR base 的 `pnpm docs:check:ci` 通过。
+
+未安装或重启日用 App，未修改真实聊天数据库；未运行真实 Provider/模型或 Windows 真机验收。
+UI 仅修改已确认文案；设计扫描提示的旧 surface 路径与平台元数据漂移不属于本次改动。
+
+### 升级后原生绑定续接修正（2026-10-12）
+
+已有 Session 的绑定摘要与当前安装、协议、Session 权限投影精确一致时，保持原先未纳入默认 Host
+连接的身份；不为决定 Warm/续接资格读取队员 env 或历史环境。原先包含默认连接身份的绑定仍执行
+连接兼容检查；未知摘要、安装与权限不兼容仍按既有规则处理。
+
+从 PR 之前的 `7973c7ffd1b0a360dea02c936458fb69f591c11e` 构建 Core，使用正式私有配置与消息执行
+建立 schema 142 的 Claude/Codex 原生绑定，再通过新 Core 重启升级至 schema 143。
+`smoke-member-environment-upgrade.mjs` 在 `d8726819` 复现两者错误地发送 `start`/`thread/start`；
+修复后实际发送 `--resume`/`thread/resume` 并携带原 ID，绑定身份/代次保持，前后两个 Run 均成功。
+两次启动之间只改变 Host 继承值，队员配置未修改；新 CLI 收到当前 Host 值与原队员覆盖，证明未恢复旧环境。
+此验收使用两个实际 Core 版本与合成原生 CLI，不代表真实 Provider 恢复成功率。
+
+摘要/权限矩阵扩展原 `discovered_entry_configures_and_freezes_without_health_evidence` owner 并通过；
+Rust 测试函数数量不变。最小命令、隔离目录和跨版本 fixture 归属见上述测试指南。
+
+## 同类 CLI 优先恢复原生会话（2026-10-12）
+
+基线 `bab6034df3459269a4a15628dc436d660716f1ac`；分支 `codex/native-session-resume`。
+User 明确要求整套已确认方案一并完成。规范见 [Runtime Launch v60](../../contracts/runtime-launch-and-verification-v60.md)，
+取舍见 [V1.72-D37](decisions.md#v1-72-d37)。
+
+- 当前 Conversation 的类型由既有安装/历史 Run 解析；同类 CLI 保留 exact-ID Resume 资格，历史摘要、安装代次和受控恢复记录不提前否决。
+- Adapter 在恢复调用处提供可靠结论；退役全局文本及 Claude/Antigravity/Pi 的日志猜测。Command Code 继续精确核验完整目录，Pi 区分精确目标不存在与普通 IO 错误。
+- 新建前保留旧目标，当前输入 dispatch/accepted/unknown、取消与 epoch 仍阻止自动降级。成功替换与提示事件在绑定事务一同提交；公开/私聊执行详情显示一句提示。
+- 新 Run 正常装配 Bootstrap，不依赖旧 Blob。Migration 195/schema 145 保留所有历史行与引用，仅解除 Binding/generation 唯一约束；同一 Run 已准备输入保持不可变。
+- 进程丢失或重启时，未知输入正常失败并保留清理/防重证据，同时保留原生目标。用户显式续做的未知执行隔离机制不变。
+
+验收 owner 扩展现有 `scripts/smoke-member-environment-upgrade.mjs`：从 `7973c7ffd1b0a360dea02c936458fb69f591c11e`
+构建 schema 142 Core，正式建立 Claude/Codex 原生绑定与队员 env；在隔离 fixture 中改变旧安装/连接/上下文元数据、
+破坏旧 Bootstrap digest，然后用候选 Core 重启。实际 `--resume`/`thread/resume` 携带原 ID，新进程读取当前
+Host＋队员环境，第二条输入只提交一次，两个 Run 均成功。TRAE 模拟 ACP 验证能力缺失的一次新建、
+新建失败保留旧目标、初始化/恢复/模型误导文本报错、真实取消与恢复超时，输入后进程退出只提交一次并保留原 ID。
+Codex 的 MCP / 认证反例分别触发实际 `config/read` / `account/read` RPC 错误，并验证零新建、零业务输入；
+成功提示只随已绑定替代会话出现。
+所有目录、Home、MCP 和凭据均为临时 fixture，无真实模型调用。
+
+Rust owner 与准入说明见[测试记录](../../development/testing.md#原生会话恢复-owner2026-10-12)。
+审查已修复 Claude 重复绑定、Pi 缺目录分类、迁移外键/索引准入与提示原子性；两个审查轴复核无剩余核心发现。
+
+本机 macOS 验证结果：
+
+- `cargo test --workspace`：465 项通过、1 项既有人工测试忽略；`cargo check --workspace` 和格式检查通过。
+- `slow-tests` 定向恢复、Bootstrap、替换回滚、Pi 精确目标、主动重置、启动恢复、坏配置调度隔离和 Warm
+  环境 owner 通过。曾启动完整扩展/慢速组合，发现未修改的 `acp_runtime_classification_covers_every_acp_backed_adapter`
+  中 Command Code/Cline 顺序断言失败后停止该整套运行；本次不宣称完整 slow suite 通过，也未禁用该测试。
+- `pnpm typecheck`、Vitest 全部 242 文件 / 2639 项通过；文档测试 10 项及相对上述基线的通用治理门禁通过。
+- 上述跨版本 + 合成 CLI 执行验收通过，包括旧 ID 的实际恢复请求、当前启动环境、有界降级、错误来源和输入次数。
+
+验证范围为隔离 Core/合成 CLI，未运行真实 Provider/模型或 Windows 真机，未安装或重启日常 App。
+状态：保留 `codex/native-session-resume` worktree 供 PR 评审，未合并。
+
+### Pi 定位范围与 ACP 恢复拒绝接线（PR #714 补充审查）
+
+以 `896b4d55e980901c5f3e5ef74a5fd9ad7b9cc5ac` 二进制运行新增的正式 Core 协议场景，复现两项遗漏：
+同 Camp/队员的 Pi 公聊 S1 → 单聊 S2 → 公聊 S1 在第三步报 locator 身份错配；ACP 广告支持 load、
+实际返回 `-32601` 后没有调用一次新建。前者是已有定位文件范围过粗，后者是 RPC 传递时丢弃结构化错误。
+
+修复仍在现有 Adapter 内：Pi 按 canonical Session UUID 保存独立定位文件，旧 locator 仅在 ID 匹配时回读，
+不把错配改判为缺历史；ACP 用原 `AcpRpcError` 跨请求通道传递脱敏机器字段，只在恢复调用处解释 `-32601`。
+resume 方法不可用时，若广告且 Adapter 允许 load，则以原 ID 尝试一次 load；可用恢复方式均明确不可用
+才回到既有的一次新建。初始化/模型/目录请求错误不获得该结论，没有新数据库状态、迁移或历史扫描。
+
+回归复用原 Core smoke 和 Rust owner，详见[测试说明](../../development/testing.md#原生会话恢复-owner2026-10-12)。
+Spec 与 Standards 静态复核均无剩余核心问题。
+
+修复后的 `--adapter-regressions` 执行验收通过：Pi 在 Warm/重启两轮交替恢复公聊、单聊的原 ID 和文件路径，
+8 条输入各提交一次；ACP 覆盖 load 拒绝后新建成功/失败、resume 拒绝后 load 成功及两者都不支持的有界降级，
+并验证初始化/模型同码、取消、超时和输入未知不会降级或重复发送。ACP/Pi 定向扩展测试分别 66/14 项通过，
+各有 2/1 项既有人工测试忽略；`cargo test --workspace` 重新通过 465 项、1 项既有人工测试忽略。
+格式、生产编译及文档治理门禁通过。验收仍使用隔离 Core 与合成 CLI。
+
+## 执行行固定位置、原文逐行与 RunCard 高亮（2026-10-12）
+
+User 确认 v12 并要求实施；基线为 `1edacb5348ae22f9a34d404b4a0f18adde197de1`，
+分支 `rovai/conversation-presence-stability`。Renderer 增量，不改变 Core、数据库或模型上下文；
+当前边界见 [Run Process Detail Surface v50](../../contracts/run-process-detail-surface-v50.md)。
+
+- 每 Run 使用既有已领取输入锚点，只有自己的已提交公开消息推进位置；消息／产物顺序保持。
+  分页与切群使用现有投影恢复，行组件按 Run ID 保持身份，停止确认和读取窗口不因移动重建。
+- 正文只按原文换行在一个物理行内推进，保留空行间的最后非空内容；完整原文仍在执行详情。
+- 复用 RunningText 扫光并去掉左侧运行圈，保留工具图标、停止区和失败／等待状态；
+  减少动态效果和强制颜色仍显示实时文字。时间线预留滚动条空间，避免停止目标横向移动。
+- 更新已有浏览器夹具与 owner 测试，没有引入演示依赖或新的动画库。
+
+已通过类型检查、7 项投影／正文单测及 30 项既有产物测试，生产组件浏览器回归通过 37 个阶段、
+原始 LF／CRLF／空行、单行几何、高亮、停止／重试、草稿、重入读取和 6 组主题尺寸、
+200% 等效布局及粗指针检查。截图位于本地忽略目录 `docs/prototypes/run-presence-v12-implementation/`。
+完整 `pnpm test` 已在提交 `4709bf3b` 的干净检出通过：242 个 Vitest 文件／2641 项用例，
+Node 脚本 339 项通过、2 项平台跳过，文档与 Skill 门禁通过。主 checkout 的旧本地原型 Markdown
+坏链接保持原样；验证检出只复用同一锁定依赖，关闭 pnpm 自动重装，不跳过任何测试。
+
+`pnpm package:mac` 与 `pnpm accept:runtime-activity-ui` 通过。后者为生产桌面包／Core 的
+13 Runtime 受控数据验收，覆盖执行行恢复、三种执行台位置、两主题、2K 居中、紧凑窗口、
+200% 布局、滚动、工具详情与停止。App 使用一次性 `userData` 和独立 Skill Library／MCP config；
+不代表真实 Provider 请求验收。最终报告在上述目录的 `native/runtime-activity-acceptance.json`，
+隔离路径与代码提交记在 `isolation.json`。
+
+浏览器补充验证自己发送后 DOM／焦点保持，以及完整重载确实进入新文档。桌面验收保持原有
+点击命中与主题色断言，改为等实际布局／主题传播完成后检查；紧凑窗口按当前 Run 的真实锚点
+定位。验收发现的滚动条 6px 中心偏差已通过两侧对称预留消除；首次发送前的中间产物、
+未加载输入锚点与时钟倒退均不会把执行行带到新消息后。

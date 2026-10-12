@@ -28,9 +28,19 @@ pub(crate) fn verify_restore_target(catalog: &Value, session_id: &str, cwd: &str
     }) {
         return Ok(());
     }
+    anyhow::ensure!(
+        catalog.get("nextCursor").is_none_or(Value::is_null)
+            && sessions
+                .iter()
+                .all(|session| session["sessionId"].is_string() && session["cwd"].is_string()),
+        "command_code_restore_catalog_incomplete"
+    );
     // A future paginated catalog requires fresh qualification; absence from
     // an incomplete response cannot prove an exact restore of the old Session.
-    bail!("command_code_restore_target_missing: session not found in exact native catalog");
+    Err(anyhow::anyhow!(
+        "command_code_restore_target_missing: session not found in exact native catalog"
+    )
+    .context(crate::runtime::NativeSessionResumeFailure::Incompatible))
 }
 
 /// Native ACP sends the proposed edit only on tool_call. Its old/new strings

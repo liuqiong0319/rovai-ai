@@ -128,10 +128,9 @@ pub(crate) fn can_replace_session_before_dispatch(
 ) -> Result<bool> {
     Ok(connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM agent_run AS run
-         JOIN agent_run_input AS input ON input.agent_run_id=run.id
-         JOIN camp_run_continuation ON camp_run_continuation.delivery_id=input.delivery_id
          WHERE run.id=?1 AND run.execution_epoch=?2 AND run.status IN ('running','waiting')
            AND run.cancel_requested_at IS NULL
+           AND run.runtime_recovery_required=0
            AND NOT EXISTS(SELECT 1 FROM runtime_input_delivery AS delivery
                WHERE delivery.agent_run_id=run.id
                  AND (delivery.status IN ('accepted','delivery_unknown')

@@ -113,6 +113,25 @@ app.whenReady().then(async () => {
     assert.equal(hoverStatus.titleX,defaultStatus.titleX)
     assert.equal(hoverStatus.rowRight-hoverStatus.menuRight,1,'Ellipsis is at the far right')
     await capture('sidecar-v3-hover')
+    const second = new BrowserWindow({ show: false, webPreferences: { contextIsolation: true, sandbox: true, nodeIntegration: false, backgroundThrottling: false } })
+    await second.loadFile(renderer)
+    await second.webContents.executeJavaScript('window.navigationTest.settle()', true)
+    const other = source => second.webContents.executeJavaScript(source, true)
+    await Promise.all([
+      run("window.navigationTest.projectPreferences.registerProjects(['/a'])"),
+      other("window.navigationTest.projectPreferences.registerProjects(['/b'])")
+    ])
+    await Promise.all([
+      run("window.navigationTest.projectPreferences.setProjectName('directory:/a', 'A')"),
+      other("window.navigationTest.projectPreferences.setProjectName('directory:/b', 'B')")
+    ])
+    await run("window.navigationTest.projectPreferences.removeProject('directory:/a', [])")
+    await other("window.navigationTest.projectPreferences.registerProjects(['/a', '/b'], true)")
+    const projects = await run('window.navigationTest.projectPreferences.get()')
+    assert.deepEqual(projects.registeredProjects, ['/b'])
+    assert.equal(projects.legacyProjectsSynced, true)
+    assert.deepEqual(projects.projectNames, { 'directory:/a': 'A', 'directory:/b': 'B' })
+    second.destroy()
     const opensBefore=await run('window.navigationTest.actions.length')
     const p=await context(runningSelector)
     assert.deepEqual(await menuLabels(),['置顶','标记已读','重命名','复制会话 ID','删除'])

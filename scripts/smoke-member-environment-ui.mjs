@@ -56,8 +56,7 @@ app.whenReady().then(async()=>{
  const click=async s=>{await run('document.querySelector('+JSON.stringify(s)+').click()');await sleep(60)};
  await w.loadFile(join(root,'renderer/index.html'));await wait('!!window.fixture && !document.querySelector("textarea").disabled');
  await click('summary');
- assert.ok(await run('document.body.innerText.includes("未配置的变量会继承宿主环境")'));
- assert.ok(await run('document.body.innerText.includes("新建或重置该队员会话后生效")'));
+ assert.ok(await run('document.body.innerText.includes("环境变量在智能体进程启动时读取")'));
  assert.equal(await run('document.querySelectorAll("input[type=checkbox]").length'),0);
  assert.equal(await run('document.querySelector("textarea").getBoundingClientRect().height'),104);
  await run('document.querySelector("textarea").focus()');
@@ -69,14 +68,13 @@ app.whenReady().then(async()=>{
  await click('.danger-button');await wait('!document.querySelector("[role=dialog]")');
  const call=await run('window.fixture.calls.find(c=>c.method==="conversations.restartNativeSession")');
  assert.equal(call.command.conversationId,'camp-member-session');assert.equal(call.command.expectedVersion,7);
- assert.ok(await run('window.fixture.notice().includes("下次启动")'));
+ assert.ok(await run('window.fixture.notice().includes("已重置")'));
  await run('window.fixture.scenario("active")');await click('[data-reset]');await wait('document.body.innerText.includes("队员正在执行任务")');
  assert.ok(await run('document.querySelector(".danger-button").disabled'));await click('[role=dialog] .quiet-button');
  await run('window.fixture.scenario("conflict")');await click('[data-reset]');await wait('!document.querySelector(".danger-button").disabled');await click('.danger-button');
  await wait('document.body.innerText.includes("会话已发生变化")');await click('[role=dialog] .quiet-button');
  w.setContentSize(390,844);await run('window.fixture.language("en")');await sleep(200);
- assert.ok(await run('document.body.innerText.includes("Unconfigured variables inherit")'));
- assert.ok(await run('document.body.innerText.includes("Existing sessions remain unchanged")'));
+ assert.ok(await run('document.body.innerText.includes("Saving does not affect running processes")'));
  assert.equal(await run('getComputedStyle(document.querySelector("textarea")).fontSize'),'16px');
  assert.ok(await run('document.documentElement.scrollWidth<=innerWidth'));
  writeFileSync(join(root,'mobile-en.png'),(await w.webContents.capturePage()).toPNG());
@@ -84,7 +82,7 @@ app.whenReady().then(async()=>{
  assert.ok(await run('document.body.innerText.includes("Reset Alice")'));
  assert.ok(await run('document.documentElement.scrollWidth<=innerWidth'));
  writeFileSync(join(root,'mobile-reset-en.png'),(await w.webContents.capturePage()).toPNG());
- console.log(JSON.stringify({ok:true,checks:['saved-marker','no-combination-confirmation','session-timing-copy','reset-exact-conversation-version','active-work-block','conflict-retains-dialog','mobile-english','no-overflow','short-editor-no-focus-ring']}));app.exit(0);
+ console.log(JSON.stringify({ok:true,checks:['saved-marker','no-combination-confirmation','process-start-timing-copy','reset-exact-conversation-version','active-work-block','conflict-retains-dialog','mobile-english','no-overflow','short-editor-no-focus-ring']}));app.exit(0);
 }).catch(e=>{console.error(e);app.exit(1)});
 `)
 let child, closed, passed = false

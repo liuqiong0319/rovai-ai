@@ -102,8 +102,8 @@ try {
   // The Core is stopped. Convert only this disposable fixture to the exact prior schema.
   const legacy = new DatabaseSync(join(data, 'rovai.sqlite'))
   legacy.exec(`BEGIN;
-    DROP TABLE conversation_runtime_environment; DROP TABLE member_runtime_environment; DROP TABLE runtime_environment_plan; DROP TABLE runtime_environment_legacy;
-    DELETE FROM schema_migration WHERE version IN (191,192);
+    DROP TABLE IF EXISTS conversation_runtime_environment; DROP TABLE member_runtime_environment; DROP TABLE IF EXISTS runtime_environment_plan; DROP TABLE runtime_environment_legacy;
+    DELETE FROM schema_migration WHERE version IN (191,192,193,194);
     UPDATE rovai_data_contract SET projection_schema_version=140 WHERE singleton=1;`)
   legacy.prepare('INSERT INTO runtime_startup_setting(runtime_kind,revision,configuration_json,updated_at) VALUES(?,1,?,datetime(\'now\'))').run(kind,
     JSON.stringify({ programPath: null, environment: [{ name: 'ANTHROPIC_API_KEY', value: secret }] }))

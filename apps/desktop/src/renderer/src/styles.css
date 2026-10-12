@@ -2555,7 +2555,7 @@ button.file-preview-html-feedback:hover,
 }
 .timeline-scroll, .tab-scroll { min-height: 0; overflow: auto; }
 .timeline-scroll { flex: 1 1 auto; padding: 22px 27px 30px; }
-.camp-timeline { overflow-anchor: none; }
+.camp-timeline { overflow-anchor: none; scrollbar-gutter: stable both-edges; }
 .return-to-latest-layer { position: absolute; z-index: 5; bottom: 8px; left: 0; right: 0; display: flex; justify-content: center; pointer-events: none; }
 .return-to-latest { display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: 0; color: var(--ink); background: transparent; box-shadow: none; cursor: pointer; appearance: none; pointer-events: auto; }
 .return-to-latest:active:not(:disabled) { transform: none; }

@@ -33,16 +33,16 @@ export function MemberSessionReset({ campId, member, onClose, onNotify }: {
       })
       if (result.status !== 'applied') throw new Error(result.code === 'conversation.active_run'
         ? t('队员正在执行任务，请结束后再重置会话。') : t('会话已发生变化，请关闭后重新打开。'))
-      onNotify(t('已重置{0}的会话，下次启动将使用最新环境配置。', member.displayName)); onClose()
+      onNotify(t('已重置{0}的会话。', member.displayName)); onClose()
     } catch (error) { setError(readErrorMessage(error)) } finally { setPending(false) }
   }
   return <Dialog.Root open onOpenChange={open => { if (!open && !pending) onClose() }}>
     <Dialog.Portal><Dialog.Overlay className="dialog-overlay app-dialog-overlay"/>
       <AppDialogContent aria-describedby="member-session-reset-description">
         <AppDialogHeader title={t('重置{0}的会话', member.displayName)} descriptionId="member-session-reset-description"
-          description={t('下次启动将建立新的队员会话并使用最新环境配置，不再续接原生会话历史。Camp 中的消息保留。')}/>
+          description={t('下次启动将建立新的队员会话，不再续接原生会话历史。Camp 中的消息保留。')}/>
         {loading ? <p>{t('正在读取会话…')}</p> : session?.active ? <p>{t('队员正在执行任务，请结束后再重置会话。')}</p>
-          : !session && !error ? <p>{t('该队员尚未建立会话，下次启动将使用最新环境配置。')}</p> : null}
+          : !session && !error ? <p>{t('该队员尚未建立会话。')}</p> : null}
         {error && <p className="environment-error" role="alert">{error}</p>}
         <AppDialogFooter>
           <button type="button" className="quiet-button" disabled={pending} onClick={onClose}>{t('取消')}</button>

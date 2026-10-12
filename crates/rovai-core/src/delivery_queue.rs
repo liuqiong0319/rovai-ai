@@ -2923,6 +2923,67 @@ mod tests {
         assert_eq!(recall_state, "recallable");
     }
 
+    // Regression owner for lane isolation. The existing query-failure owner
+    // above continues to require whole-transaction rollback for storage faults.
+    #[cfg(feature = "extended-tests")]
+    #[test]
+    fn malformed_member_configuration_fails_its_lane_without_blocking_other_camps() {
+        let mut fixture = Fixture::with_members(&["agent_1", "agent_2"]);
+        let other = fixture.add_camp_lane("healthy");
+        fixture.enqueue("bad-member", "must fail visibly");
+        fixture.database.connection().execute("UPDATE camp_message_delivery SET recipient_agent_id='agent_2' WHERE message_id='bad-member'", []).unwrap();
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE agent_profile SET selected_runtime_adapter_kind='codex-cli',
+            default_runtime_installation_id='adapter-test-codex', default_model_selection_json='{}',
+            default_permission_config_json='{}' WHERE id='agent_2'",
+                [],
+            )
+            .unwrap();
+        fixture.enqueue_for(&other, "healthy-member", "must still run");
+        // Upgrade-era native Sessions have no environment record. They should
+        // continue through normal native recovery, without changing context here.
+        fixture
+            .database
+            .connection()
+            .execute(
+                "UPDATE conversation SET native_session_id='native-existing' WHERE camp_id=?1",
+                [&other],
+            )
+            .unwrap();
+        let claimed = claim_waiting_delivery_batches(&mut fixture.database, 100).unwrap();
+        assert_eq!(claimed.len(), 2);
+        let row = |message: &str| {
+            fixture.database.connection().query_row(
+            "SELECT r.status,r.last_error_code FROM agent_run r JOIN camp_message_delivery d ON d.claimed_agent_run_id=r.id WHERE d.message_id=?1",
+            [message], |r| Ok((r.get::<_, String>(0)?,r.get::<_, Option<String>>(1)?))).unwrap()
+        };
+        assert_eq!(
+            row("bad-member"),
+            (
+                "failed".into(),
+                Some("runtime_configuration_invalid".into())
+            )
+        );
+        assert_eq!(row("healthy-member"), ("queued".into(), None));
+        assert_eq!(
+            fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT native_session_id FROM conversation WHERE camp_id=?1",
+                    [&other],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "native-existing"
+        );
+        let snapshots: i64 = fixture.database.connection().query_row("SELECT COUNT(*) FROM agent_run WHERE json_type(effective_config_json,'$.runtime.environment') IS NOT NULL", [], |r|r.get(0)).unwrap();
+        assert_eq!(snapshots, 0);
+    }
+
     #[test]
     fn history_query_accepts_selected_ids_beyond_sqlite_parameter_limit() {
         let mut fixture = Fixture::new();

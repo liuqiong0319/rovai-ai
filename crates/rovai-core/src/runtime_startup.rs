@@ -550,10 +550,7 @@ mod tests {
         )
         .unwrap();
         assert!(overlay.contains_key("ANTHROPIC_BASE_URL"));
-        let mut frozen = crate::member_environment::FrozenEnvironment {
-            plan_id: "fixture".into(),
-            revision: 1,
-            legacy_identity: None,
+        let mut frozen = crate::member_environment::LaunchEnvironment {
             values: Some(overlay.clone()),
             overlay: Some(overlay),
         };

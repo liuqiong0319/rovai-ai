@@ -383,12 +383,15 @@ impl ClaudeCodeCliRuntimeAdapter {
         let (result_sender, result_receiver) = oneshot::channel();
         let tracked_control = control.clone();
         let worker = tokio::spawn(async move {
-            let result = Self::run_process(
-                &private_runtime_dir,
-                &tracked_control,
-                &request,
-                interrupted,
-                launch_handoff,
+            let result = rovai_core::runtime_discovery::with_launch_environment(
+                request.runtime.environment.clone(),
+                Self::run_process(
+                    &private_runtime_dir,
+                    &tracked_control,
+                    &request,
+                    interrupted,
+                    launch_handoff,
+                ),
             )
             .await;
             tracked_control
@@ -942,16 +945,9 @@ impl ClaudeCodeCliRuntimeAdapter {
                     }
                     _ => protocol.redact_text(&format!("{error:#}")),
                 };
-                // This diagnostic is only considered before send_prompt. A
-                // later error, even with identical text, cannot authorize retry.
-                let missing = request
-                    .resumable_native_session_id
-                    .as_ref()
-                    .is_some_and(|id| {
-                        detail.lines().any(|line| {
-                            line.trim() == format!("No conversation found with session ID: {id}")
-                        })
-                    });
+                // This CLI has no qualified machine-readable unavailable-target
+                // result here. Initialization/stderr text cannot authorize replacement.
+                let missing = false;
                 let failure = claude_public_failure(
                     request,
                     private_runtime_dir,
@@ -3242,7 +3238,7 @@ mod tests {
                     .downcast_ref::<ClaudeCodeInputNotSent>()
                     .unwrap()
                     .session_unavailable,
-                missing
+                false
             );
             assert!(
                 format!("{error:#}").contains("Claude Code stdin")
@@ -3818,10 +3814,7 @@ mod tests {
                 values.insert("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST".into(), "1".into());
                 request.runtime.reported_version = Some("2.1.287".into());
                 request.runtime.environment =
-                    Some(rovai_core::member_environment::FrozenEnvironment {
-                        plan_id: "fixture".into(),
-                        revision: 1,
-                        legacy_identity: None,
+                    Some(rovai_core::member_environment::LaunchEnvironment {
                         values: Some(values),
                         overlay: Some(overlay),
                     });

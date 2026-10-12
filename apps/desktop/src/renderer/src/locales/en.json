@@ -1,4 +1,5 @@
 {
+  "原生会话未能恢复，已新建会话继续。Camp 中的消息保留。": "The native session could not be restored. A new session was created; messages in this Camp are preserved.",
   "已保存": "Saved",
   "启动设置已保存，连接更改尚未保存。": "Startup settings saved; connection changes are still unsaved.",
   "待邀请": "Pending invitation",
@@ -3695,15 +3696,16 @@
   "{0} 项旧配置仍保留，可按需查阅。": "The {0} saved variables are retained for reference.",
   "已处理的旧环境配置": "Handled legacy environment configurations",
   "环境变量总长度超过限制。": "Environment variables exceed the total size limit.",
-  "未配置的变量会继承宿主环境。修改服务地址时，请核对同时使用的凭据。": "Unconfigured variables inherit the host environment. When changing the service URL, check the credentials used with it.",
-  "环境配置将在新建或重置该队员会话后生效，已有会话保持不变。": "Environment changes apply when this teammate starts a new session or their session is reset. Existing sessions remain unchanged.",
+  "环境变量在智能体进程启动时读取。保存不会影响已运行的进程，后续新启动的进程使用最新配置。": "Environment variables are read when the agent process starts. Saving does not affect running processes; newly started processes use the latest configuration.",
   "重置队员会话": "Reset teammate session",
   "重置{0}的会话": "Reset {0}’s session",
-  "下次启动将建立新的队员会话并使用最新环境配置，不再续接原生会话历史。Camp 中的消息保留。": "The next launch will start a new teammate session with the latest environment configuration. Native session history will not resume. Messages in this Camp are kept.",
+  "下次启动将建立新的队员会话，不再续接原生会话历史。Camp 中的消息保留。": "The next launch will start a new teammate session without resuming native session history. Messages in this Camp are kept.",
   "正在读取会话…": "Loading session…",
   "队员正在执行任务，请结束后再重置会话。": "This teammate has active work. Wait for it to finish before resetting the session.",
-  "该队员尚未建立会话，下次启动将使用最新环境配置。": "This teammate has no session yet. The next launch will use the latest environment configuration.",
+  "该队员尚未建立会话。": "This teammate has no session yet.",
   "会话已发生变化，请关闭后重新打开。": "The session has changed. Close this dialog and open it again.",
-  "已重置{0}的会话，下次启动将使用最新环境配置。": "{0}’s session was reset. The next launch will use the latest environment configuration.",
-  "重置会话": "Reset session"
+  "已重置{0}的会话。": "{0}’s session was reset.",
+  "重置会话": "Reset session",
+  "项目目录未保存，请重新添加。": "The project folder was not saved. Please add it again.",
+  "项目目录未保存，现有会话仍可正常使用。": "Project folders were not saved. Existing conversations remain available."
 }

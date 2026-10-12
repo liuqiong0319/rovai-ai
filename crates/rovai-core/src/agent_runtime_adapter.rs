@@ -24,10 +24,7 @@ use crate::{
     },
     builtin_tool_transport::BUILTIN_TOOL_RUNTIME_CAPABILITY,
     command::canonical_json_digest,
-    context_contract::{
-        CODEX_SESSION_GUIDANCE_REVISION,
-        native_binding_compatibility_context_contract as native_binding_context_contract,
-    },
+    context_contract::native_binding_compatibility_context_contract as native_binding_context_contract,
     mcp::McpServerDefinition,
     platform::HostPlatformKey,
     runtime_platform_admission::{
@@ -1762,7 +1759,6 @@ impl AgentRuntimeAdapter for CodexCliAdapterPolicy {
             "permissionSchemaVersion": input.permissions.schema_version,
             "sessionPermissions": scoped_values(RuntimeOptionScope::Session)?,
             "contextContract": native_binding_context_contract(),
-            "codexSessionGuidanceRevision": CODEX_SESSION_GUIDANCE_REVISION,
         }))?;
         let host_config_digest = canonical_json_digest(&json!({
             "adapterKind": self.kind(),
@@ -4243,7 +4239,6 @@ mod tests {
             "permissionSchemaVersion": 1,
             "sessionPermissions": {"sandbox_mode": "value"},
             "contextContract": native_binding_context_contract(),
-            "codexSessionGuidanceRevision": CODEX_SESSION_GUIDANCE_REVISION,
         }))
         .unwrap();
         let legacy_contract_digest = canonical_json_digest(&json!({
@@ -4253,6 +4248,7 @@ mod tests {
             "permissionSchemaVersion": 1,
             "sessionPermissions": {"sandbox_mode": "value"},
             "contextContract": native_binding_context_contract(),
+            "codexSessionGuidanceRevision": 1,
         }))
         .unwrap();
         assert_eq!(
@@ -4260,12 +4256,6 @@ mod tests {
             current_contract_digest
         );
         assert_ne!(current_contract_digest, legacy_contract_digest);
-        assert!(
-            native_binding_context_contract()
-                .get("codexSessionGuidanceRevision")
-                .is_none(),
-            "Codex guidance revision must not enter the shared Adapter context contract"
-        );
     }
 
     #[test]

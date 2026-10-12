@@ -328,6 +328,7 @@ const PLANNED_SHUTDOWN_GUARD_GRACE: Duration = Duration::from_millis(250);
 const PLANNED_SHUTDOWN_FENCE_SETTLEMENT_RESERVE: Duration = Duration::from_secs(1);
 const PLANNED_SHUTDOWN_INTERRUPT_GRACE: Duration = Duration::from_millis(600);
 const PLANNED_SHUTDOWN_RUNTIME_REAP_GRACE: Duration = Duration::from_secs(2);
+const PLANNED_SHUTDOWN_TEXT_GRACE: Duration = Duration::from_secs(1);
 const RUNTIME_USAGE_FLUSH_INTERVAL: Duration = Duration::from_secs(4);
 const RUNTIME_EVIDENCE_DELTA_BATCH_WINDOW: Duration = Duration::from_millis(25);
 const RUNTIME_EVIDENCE_DELTA_BATCH_MAX_ITEMS: usize = 32;
@@ -2361,7 +2362,7 @@ struct ClaudeInputAcceptanceTarget<'a> {
 struct Core {
     execution_wake: crate::execution_wake::ExecutionWake,
     non_batch_retry_at: Mutex<Option<tokio::time::Instant>>,
-    database: Mutex<Database>,
+    database: Arc<Mutex<Database>>,
     subsystems: CoreSubsystems,
     subsystem_initialization: Mutex<SubsystemInitialization>,
     removed_skill_project_roots: RemovedSkillProjectRoots,
@@ -12888,14 +12889,6 @@ impl Core {
                     &mut launch_permit,
                 )
                 .await;
-            if launch_result.is_err() {
-                let mut database = core.database.lock().await;
-                if let Err(error) = ExecutionRuntimeService::default()
-                    .retain_session_after_failed_replacement(&mut database, &execution)
-                {
-                    eprintln!("failed to retain previous Native Session reference: {error:#}");
-                }
-            }
             launch_permit.finish_launch();
             let launch_cancelled = launch_permit.check_cancelled().is_err();
             // New Runs carry only a Camp-scoped root proof. Their terminal path may wake legacy
@@ -14543,13 +14536,13 @@ impl Core {
                         agent_run_id: execution.agent_run_id.clone(),
                         expected_conversation_version: credential.conversation_version,
                         expected_execution_epoch: execution.execution_epoch,
-                        previous_adapter_installation_id: Some(
-                            credential.adapter_installation_id.clone(),
-                        ),
-                        previous_native_session_id: credential.native_session_id.clone(),
-                        previous_binding_compatibility_digest: Some(
-                            credential.binding_compatibility_digest.clone(),
-                        ),
+                        previous_adapter_installation_id: credential
+                            .previous_adapter_installation_id
+                            .clone(),
+                        previous_native_session_id: credential.previous_native_session_id.clone(),
+                        previous_binding_compatibility_digest: credential
+                            .previous_binding_compatibility_digest
+                            .clone(),
                         proposed_binding_id: Some(credential.native_binding_id.clone()),
                         adapter_installation_id: credential.adapter_installation_id.clone(),
                         native_session_id: native_session_id.to_string(),
@@ -14771,32 +14764,6 @@ impl Core {
     }
 
     async fn prepare_runtime_for_dispatch(
-        &self,
-        candidate: &rovai_core::runtime::QueuedAgentRunCandidate,
-        runtime: FrozenAgentRuntimeConfig,
-        workspace: &AgentRunWorkspace,
-    ) -> std::result::Result<(FrozenAgentRuntimeConfig, i64), RuntimeDispatchFailure> {
-        let mut runtime = runtime;
-        let environment = runtime.environment.as_mut().ok_or_else(|| RuntimeDispatchFailure {
-            code: "runtime_environment_unavailable".into(),
-            error: anyhow::anyhow!("The session environment is unavailable; reset this member's session to use the current configuration"),
-            effective_version: None,
-        })?;
-        environment
-            .hydrate(self.database.lock().await.connection())
-            .map_err(|error| RuntimeDispatchFailure {
-                code: "runtime_environment_unavailable".into(),
-                error,
-                effective_version: None,
-            })?;
-        rovai_core::runtime_discovery::with_frozen_environment(
-            runtime.environment.clone(),
-            self.prepare_runtime_for_dispatch_in_environment(candidate, runtime, workspace),
-        )
-        .await
-    }
-
-    async fn prepare_runtime_for_dispatch_in_environment(
         &self,
         candidate: &rovai_core::runtime::QueuedAgentRunCandidate,
         runtime: FrozenAgentRuntimeConfig,
@@ -15185,14 +15152,14 @@ impl Core {
         output: &mpsc::UnboundedSender<String>,
         launch_permit: &mut ExecutionLaunchPermit,
     ) -> Result<()> {
-        let mut resolved = execution.clone();
-        resolved.runtime.environment.as_mut().context("The session environment is unavailable; reset this member's session to use the current configuration")?
-            .hydrate(self.database.lock().await.connection())?;
-        let environment = resolved.runtime.environment.clone();
-        rovai_core::runtime_discovery::with_frozen_environment(
-            environment,
+        rovai_core::member_environment::with_launch_source(
+            rovai_core::member_environment::LaunchEnvironmentSource {
+                database: self.database.clone(),
+                member_id: execution.agent_id.clone(),
+                kind: execution.runtime.adapter_kind,
+            },
             self.launch_agent_run_in_environment(
-                &resolved,
+                execution,
                 attachment_admission,
                 attachment_authorization,
                 output,
@@ -15351,6 +15318,7 @@ impl Core {
                 execution_epoch: execution.execution_epoch,
                 camp_id: &execution.camp_id,
                 agent_id: &execution.agent_id,
+                native_binding_id: &initial_binding.native_binding_id,
                 cwd: &execution_root,
                 frozen_runtime: &execution.runtime,
                 runtime_compatibility_digest: &runtime_compatibility_digest,
@@ -15453,7 +15421,7 @@ impl Core {
         let thread_id = match thread {
             Ok(thread_id) => thread_id,
             Err(error) => {
-                let failure = classify_native_resume_failure(&error);
+                let failure = native_resume_failure(&error);
                 let may_replace = {
                     let mut database = self.database.lock().await;
                     if resumable_session_id.is_some()
@@ -15466,6 +15434,7 @@ impl Core {
                         )?;
                     }
                     resumable_session_id.is_some()
+                        && failure == NativeSessionResumeFailure::Incompatible
                         && crate::run_continuation::can_replace_session_before_dispatch(
                             database.connection(),
                             &execution.agent_run_id,
@@ -15480,15 +15449,6 @@ impl Core {
                 // User's new continuation permits one replacement, never a replay
                 // after turn/start or an unbounded retry on the replacement error.
                 launch_permit.check_cancelled()?;
-                {
-                    let mut database = self.database.lock().await;
-                    ExecutionRuntimeService::default().record_native_session_continuity_lost(
-                        &mut database,
-                        execution,
-                        "codex_thread_resume",
-                        failure,
-                    )?;
-                }
                 binding_credential = self.prepare_builtin_tool_binding(execution, true).await?;
                 let replacement_bootstrap = {
                     let mut database = self.database.lock().await;
@@ -15730,7 +15690,19 @@ impl Core {
                     && pi::activation_failure_kind(&error)
                         == Some(pi::PiActivationFailureKind::ResumeContinuityLost) =>
             {
-                let failure = classify_native_resume_failure(&error);
+                let failure = NativeSessionResumeFailure::Incompatible;
+                launch_permit.check_cancelled()?;
+                {
+                    let database = self.database.lock().await;
+                    anyhow::ensure!(
+                        crate::run_continuation::can_replace_session_before_dispatch(
+                            database.connection(),
+                            &execution.agent_run_id,
+                            execution.execution_epoch,
+                        )?,
+                        "Pi replacement cannot replay an input whose delivery has started"
+                    );
+                }
                 {
                     let mut database = self.database.lock().await;
                     if resume_disposition == NativeSessionResumeDisposition::Controlled {
@@ -15740,12 +15712,6 @@ impl Core {
                             failure,
                         )?;
                     }
-                    ExecutionRuntimeService::default().record_native_session_continuity_lost(
-                        &mut database,
-                        execution,
-                        "pi_exact_session_file",
-                        failure,
-                    )?;
                 }
                 launch_permit.check_cancelled()?;
                 let replacement_binding =
@@ -16003,6 +15969,18 @@ impl Core {
         let (runtime_event_sender, mut runtime_event_receiver) = mpsc::unbounded_channel();
         let (launch_handoff_sender, mut launch_handoff_receiver) = oneshot::channel();
         let (input_ready_sender, mut input_ready_receiver) = mpsc::unbounded_channel();
+        let mut launch_execution = execution.clone();
+        launch_execution.runtime.environment =
+            rovai_core::member_environment::load_for_launch().await?;
+        if launch_execution
+            .runtime
+            .environment
+            .as_ref()
+            .is_some_and(|env| env.has_overlay())
+        {
+            launch_execution.runtime.custom_api = None;
+        }
+        let execution = &launch_execution;
         // Keep the display scrubber with the consumer until its queue is drained,
         // including events delivered after the CLI process has already exited.
         let output_redactor = execution
@@ -16088,15 +16066,6 @@ impl Core {
                     return Err(error).context(
                         "Claude Code cleanup is not confirmed; replacement was not started",
                     );
-                }
-                {
-                    let mut database = self.database.lock().await;
-                    ExecutionRuntimeService::default().record_native_session_continuity_lost(
-                        &mut database,
-                        execution,
-                        "claude_session_initialize",
-                        NativeSessionResumeFailure::Incompatible,
-                    )?;
                 }
                 return Box::pin(self.launch_claude_code_agent_run(PreparedRuntimeLaunch {
                     execution,
@@ -16600,19 +16569,8 @@ impl Core {
         cleanup_required: bool,
         output: &mpsc::UnboundedSender<String>,
     ) -> Result<()> {
-        if let Err(error) = flush_runtime_monitoring_run(
-            self,
-            &execution.agent_run_id,
-            execution.execution_epoch,
-            "terminal_flush",
-        )
-        .await
-        {
-            eprintln!(
-                "failed to flush Runtime monitoring before terminal settlement for AgentRun {}: {error:#}",
-                execution.agent_run_id
-            );
-        }
+        finish_runtime_monitoring_run(self, &execution.agent_run_id, execution.execution_epoch)
+            .await;
         let mut runtime_route_permit = self
             .planned_shutdown
             .enter_runtime_route()
@@ -16831,6 +16789,18 @@ impl Core {
         let (runtime_event_sender, mut runtime_event_receiver) = mpsc::unbounded_channel();
         let (launch_handoff_sender, mut launch_handoff_receiver) = oneshot::channel();
         let (input_ready_sender, mut input_ready_receiver) = mpsc::unbounded_channel();
+        let mut launch_execution = execution.clone();
+        launch_execution.runtime.environment =
+            rovai_core::member_environment::load_for_launch().await?;
+        if launch_execution
+            .runtime
+            .environment
+            .as_ref()
+            .is_some_and(|env| env.has_overlay())
+        {
+            launch_execution.runtime.custom_api = None;
+        }
+        let execution = &launch_execution;
         let run = self.antigravity_app.run(AntigravityRunRequest {
             agent_run_id: execution.agent_run_id.clone(),
             execution_epoch: execution.execution_epoch,
@@ -16892,15 +16862,6 @@ impl Core {
                     return Err(error).context(
                         "Antigravity cleanup is not confirmed; replacement was not started",
                     );
-                }
-                {
-                    let mut database = self.database.lock().await;
-                    ExecutionRuntimeService::default().record_native_session_continuity_lost(
-                        &mut database,
-                        execution,
-                        "antigravity_session_initialize",
-                        NativeSessionResumeFailure::Incompatible,
-                    )?;
                 }
                 return Box::pin(self.launch_antigravity_agent_run(PreparedRuntimeLaunch {
                     execution,
@@ -17343,6 +17304,7 @@ impl Core {
                 execution.execution_epoch,
                 &execution.camp_id,
                 &execution.agent_id,
+                &initial_binding.native_binding_id,
                 &execution.workspace,
                 execution.permission_semantics,
                 &execution.runtime,
@@ -17365,6 +17327,18 @@ impl Core {
         if binding_credential.native_session_id.is_some()
             && session_continuation == acp::AcpSessionContinuation::New
         {
+            launch_permit.check_cancelled()?;
+            {
+                let database = self.database.lock().await;
+                anyhow::ensure!(
+                    crate::run_continuation::can_replace_session_before_dispatch(
+                        database.connection(),
+                        &execution.agent_run_id,
+                        execution.execution_epoch,
+                    )?,
+                    "ACP capability fallback cannot replay a dispatched input"
+                );
+            }
             binding_credential = self.prepare_builtin_tool_binding(execution, true).await?;
             if execution.runtime.adapter_kind == AdapterKind::ClineCli {
                 let digest = acp::runtime_compatibility_digest(
@@ -17391,6 +17365,7 @@ impl Core {
                             execution.execution_epoch,
                             &execution.camp_id,
                             &execution.agent_id,
+                            &binding_credential.native_binding_id,
                             &execution.workspace,
                             execution.permission_semantics,
                             &execution.runtime,
@@ -17441,15 +17416,22 @@ impl Core {
             Ok(session_id) => session_id,
             Err(error)
                 if resumable_session_id.is_some()
-                    && error
-                        .downcast_ref::<acp::AcpSessionRestoreError>()
-                        .is_some()
-                    && error
-                        .downcast_ref::<AcpLiveModelValidationError>()
-                        .is_none()
-                    && error.downcast_ref::<RuntimeFailureError>().is_none() =>
+                    && native_resume_failure(&error)
+                        == NativeSessionResumeFailure::Incompatible =>
             {
-                let failure = classify_native_resume_failure(&error);
+                let failure = native_resume_failure(&error);
+                launch_permit.check_cancelled()?;
+                {
+                    let database = self.database.lock().await;
+                    anyhow::ensure!(
+                        crate::run_continuation::can_replace_session_before_dispatch(
+                            database.connection(),
+                            &execution.agent_run_id,
+                            execution.execution_epoch,
+                        )?,
+                        "ACP replacement cannot replay an input whose delivery has started"
+                    );
+                }
                 eprintln!(
                     "{} Native Session {:?} failed for AgentRun {}; continuity is lost and a new Session will be created: {error:#}",
                     execution.runtime.adapter_kind.as_str(),
@@ -17465,20 +17447,6 @@ impl Core {
                             failure,
                         )?;
                     }
-                }
-                {
-                    let mut database = self.database.lock().await;
-                    ExecutionRuntimeService::default().record_native_session_continuity_lost(
-                        &mut database,
-                        execution,
-                        match session_continuation {
-                            acp::AcpSessionContinuation::ReuseSameHost => "same_host_reuse",
-                            acp::AcpSessionContinuation::Resume => "acp_session_resume",
-                            acp::AcpSessionContinuation::HistoryRestore => "acp_history_restore",
-                            acp::AcpSessionContinuation::New => "new_session",
-                        },
-                        failure,
-                    )?;
                 }
                 adapter
                     .forget_agent_run(&execution.agent_run_id, execution.execution_epoch)
@@ -17513,6 +17481,7 @@ impl Core {
                         execution.execution_epoch,
                         &execution.camp_id,
                         &execution.agent_id,
+                        &replacement_binding.native_binding_id,
                         &execution.workspace,
                         execution.permission_semantics,
                         &execution.runtime,
@@ -17780,19 +17749,8 @@ impl Core {
             // routed Runtime file event waiting in Core's ingress queue.
             None => true,
         };
-        if let Err(flush_error) = flush_runtime_monitoring_run(
-            self,
-            &execution.agent_run_id,
-            execution.execution_epoch,
-            "terminal_flush",
-        )
-        .await
-        {
-            eprintln!(
-                "failed to flush Runtime monitoring before failing AgentRun {}: {flush_error:#}",
-                execution.agent_run_id
-            );
-        }
+        finish_runtime_monitoring_run(self, &execution.agent_run_id, execution.execution_epoch)
+            .await;
         let ending_git_observation = self
             .observe_run_git(&execution.project_binding_kind, &execution.project_path)
             .await;
@@ -18293,33 +18251,11 @@ fn runtime_attempt_precedes(attempt: &AdapterProbeAttempt, timestamp: &str) -> b
     attempted_at < last_successful_at
 }
 
-fn classify_native_resume_failure(error: &anyhow::Error) -> NativeSessionResumeFailure {
-    let diagnostic = error
-        .chain()
-        .map(|cause| cause.to_string().to_ascii_lowercase())
-        .collect::<Vec<_>>()
-        .join(" ");
-    const EXPLICIT_INCOMPATIBILITY_MARKERS: [&str; 8] = [
-        "unknown session",
-        "session not found",
-        "thread not found",
-        "invalid session",
-        "invalid thread",
-        "session/load is not supported",
-        "method not found",
-        "incompatible",
-    ];
-    if EXPLICIT_INCOMPATIBILITY_MARKERS
-        .iter()
-        .any(|marker| diagnostic.contains(marker))
-    {
-        NativeSessionResumeFailure::Incompatible
-    } else {
-        // A timeout, transport failure, malformed reply, or other uncertain
-        // outcome may have delivered input. The persistent fence prevents a
-        // second controlled Resume for the same Installation generation.
-        NativeSessionResumeFailure::Ambiguous
-    }
+fn native_resume_failure(error: &anyhow::Error) -> NativeSessionResumeFailure {
+    error
+        .downcast_ref::<NativeSessionResumeFailure>()
+        .copied()
+        .unwrap_or(NativeSessionResumeFailure::Ambiguous)
 }
 
 fn probe_authentication_status(status: health::AgentRuntimeProbeStatus) -> &'static str {
@@ -18787,7 +18723,7 @@ async fn run_core(
         delivery_batch_scheduler_notify: database.execution_wake.delivery.clone(),
         agent_run_cancellation_notify: database.execution_wake.cancellation.clone(),
         non_batch_retry_at: Mutex::new(None),
-        database: Mutex::new(database),
+        database: Arc::new(Mutex::new(database)),
         subsystems: CoreSubsystems::new(),
         subsystem_initialization: Mutex::new(SubsystemInitialization::default()),
         removed_skill_project_roots,
@@ -19605,6 +19541,17 @@ async fn run_core(
             }
         }
 
+        if fence_prerequisites_quiesced {
+            execution_drivers::persist_shutdown_text(
+                core.database.clone(),
+                std::cmp::min(
+                    output_deadline,
+                    tokio::time::Instant::now() + PLANNED_SHUTDOWN_TEXT_GRACE,
+                ),
+            )
+            .await;
+        }
+
         deadline_expired |= tokio::time::Instant::now() >= deadline
             || !launch_quiesced
             || !terminal_drained
@@ -20364,12 +20311,7 @@ async fn process_agent_run_pi_message(
         .await?;
     }
     if message_type == "agent_settled" {
-        if let Err(error) =
-            flush_runtime_monitoring_run(core, agent_run_id, execution_epoch, "terminal_flush")
-                .await
-        {
-            eprintln!("failed to flush Pi monitoring for AgentRun {agent_run_id}: {error:#}");
-        }
+        finish_runtime_monitoring_run(core, agent_run_id, execution_epoch).await;
         persist_pi_prompt_completion(
             core,
             output,
@@ -20675,13 +20617,7 @@ async fn process_pi_agent_run_exit(
     if core.planned_shutdown.shutdown_started() {
         return;
     }
-    if let Err(error) =
-        flush_runtime_monitoring_run(core, agent_run_id, execution_epoch, "host_exit_flush").await
-    {
-        eprintln!(
-            "failed to flush Pi monitoring after Host exit for AgentRun {agent_run_id}: {error:#}"
-        );
-    }
+    finish_runtime_monitoring_run(core, agent_run_id, execution_epoch).await;
     if core
         .pi
         .get_agent_run_on_host(host_instance_id, agent_run_id, execution_epoch)
@@ -21888,11 +21824,7 @@ async fn process_agent_run_acp_message(
     if method != "rovai/acp_prompt_completed" {
         return;
     }
-    if let Err(error) =
-        flush_runtime_monitoring_run(core, agent_run_id, execution_epoch, "terminal_flush").await
-    {
-        eprintln!("failed to flush ACP monitoring for AgentRun {agent_run_id}: {error:#}");
-    }
+    finish_runtime_monitoring_run(core, agent_run_id, execution_epoch).await;
     if let Err(error) = persist_acp_prompt_completion(
         core,
         output,
@@ -23521,13 +23453,7 @@ async fn process_acp_agent_run_exit(
     {
         return;
     }
-    if let Err(error) =
-        flush_runtime_monitoring_run(core, agent_run_id, execution_epoch, "host_exit_flush").await
-    {
-        eprintln!(
-            "failed to flush ACP monitoring after Host exit for AgentRun {agent_run_id}: {error:#}"
-        );
-    }
+    finish_runtime_monitoring_run(core, agent_run_id, execution_epoch).await;
     if acp_runtime_on_host(
         core,
         adapter_kind,
@@ -23588,11 +23514,11 @@ async fn flush_runtime_usage(
     target: RuntimeUsageFlushTarget,
     reason: &'static str,
 ) -> Result<usize> {
-    // A terminal flush must observe the result of any periodic flush that
-    // already drained this Run before deciding that its bookkeeping is idle.
+    // Only background collection and shutdown serialize here. Run settlement
+    // only marks an in-memory owner finished and never waits for this lock.
     let _flush_guard = core.runtime_usage_flush.lock().await;
-    // Poll under the same serialization as drain/persist. A terminal cannot
-    // finish this Run between advancing the native cursor and buffering it.
+    // Discard a native read that overlaps completion: a successor may already
+    // be appending to the same journal. Missing tail metrics are acceptable.
     for kind in [
         AdapterKind::CodebuddyCli,
         AdapterKind::ClineCli,
@@ -23605,25 +23531,26 @@ async fn flush_runtime_usage(
             continue;
         };
         for (agent_run_id, execution_epoch, runtime) in adapter.native_usage_runs().await {
-            if let RuntimeUsageFlushTarget::Run {
-                agent_run_id: target_id,
-                execution_epoch: target_epoch,
-            } = &target
-                && (&agent_run_id != target_id || execution_epoch != *target_epoch)
+            if !core
+                .runtime_usage
+                .lock()
+                .await
+                .accepts_native_poll(&agent_run_id, execution_epoch)
             {
                 continue;
             }
-            let prompt_end =
-                reason == "terminal_flush" && matches!(target, RuntimeUsageFlushTarget::Run { .. });
-            for item in runtime.poll_native_usage(prompt_end).await {
-                buffer_runtime_usage(
-                    core,
-                    &agent_run_id,
-                    execution_epoch,
-                    &item.source_identity,
-                    &[item.usage],
-                )
-                .await?;
+            let observations = runtime.poll_native_usage().await;
+            let mut usage = core.runtime_usage.lock().await;
+            if usage.accepts_native_poll(&agent_run_id, execution_epoch) {
+                for item in observations {
+                    usage.observe_registered_run(
+                        &agent_run_id,
+                        execution_epoch,
+                        &item.source_identity,
+                        &[item.usage],
+                        Instant::now(),
+                    )?;
+                }
             }
         }
     }
@@ -23666,21 +23593,11 @@ async fn flush_runtime_usage(
     }
 }
 
-async fn flush_runtime_monitoring_run(
-    core: &Core,
-    agent_run_id: &str,
-    execution_epoch: i64,
-    reason: &'static str,
-) -> Result<usize> {
-    flush_runtime_usage(
-        core,
-        RuntimeUsageFlushTarget::Run {
-            agent_run_id: agent_run_id.to_string(),
-            execution_epoch,
-        },
-        reason,
-    )
-    .await
+async fn finish_runtime_monitoring_run(core: &Core, agent_run_id: &str, execution_epoch: i64) {
+    core.runtime_usage
+        .lock()
+        .await
+        .finish_run(agent_run_id, execution_epoch);
 }
 
 async fn process_runtime_usage_flusher(core: Arc<Core>, mut shutdown: oneshot::Receiver<()>) {
@@ -24222,11 +24139,7 @@ async fn process_agent_run_codex_message(
             "failed to persist interrupted Runtime Activities for AgentRun {agent_run_id}: {error:#}"
         );
     }
-    if let Err(error) =
-        flush_runtime_monitoring_run(core, agent_run_id, execution_epoch, "terminal_flush").await
-    {
-        eprintln!("failed to flush Codex monitoring for AgentRun {agent_run_id}: {error:#}");
-    }
+    finish_runtime_monitoring_run(core, agent_run_id, execution_epoch).await;
     let completed_message = completed
         .final_agent_message
         .as_deref()
@@ -24859,13 +24772,7 @@ async fn process_agent_run_exit(
     if core.planned_shutdown.shutdown_started() {
         return;
     }
-    if let Err(error) =
-        flush_runtime_monitoring_run(core, agent_run_id, execution_epoch, "host_exit_flush").await
-    {
-        eprintln!(
-            "failed to flush Codex monitoring after Host exit for AgentRun {agent_run_id}: {error:#}"
-        );
-    }
+    finish_runtime_monitoring_run(core, agent_run_id, execution_epoch).await;
     if core
         .codex_cli
         .get_agent_run_on_host(host_instance_id, agent_run_id, execution_epoch)
@@ -26875,7 +26782,7 @@ mod tests {
             delivery_batch_scheduler_notify: database.execution_wake.delivery.clone(),
             agent_run_cancellation_notify: database.execution_wake.cancellation.clone(),
             non_batch_retry_at: Mutex::new(None),
-            database: Mutex::new(database),
+            database: Arc::new(Mutex::new(database)),
             automation_scheduler_control: RwLock::new(None),
             subsystems: CoreSubsystems::ready_for_test(),
             subsystem_initialization: Mutex::new(SubsystemInitialization::default()),
@@ -29997,7 +29904,7 @@ done
     }
 
     #[test]
-    fn controlled_native_resume_classifies_only_explicit_rejection_as_incompatible() {
+    fn native_resume_consumes_only_adapter_evidence() {
         let missing = crate::command_code_acp::verify_restore_target(
             &json!({"sessions": []}),
             "missing-session",
@@ -30005,7 +29912,7 @@ done
         )
         .unwrap_err();
         assert_eq!(
-            classify_native_resume_failure(&missing),
+            native_resume_failure(&missing),
             NativeSessionResumeFailure::Incompatible
         );
         let invalid = crate::command_code_acp::verify_restore_target(
@@ -30015,21 +29922,23 @@ done
         )
         .unwrap_err();
         assert_eq!(
-            classify_native_resume_failure(&invalid),
+            native_resume_failure(&invalid),
             NativeSessionResumeFailure::Ambiguous
         );
-        assert_eq!(
-            classify_native_resume_failure(&anyhow::anyhow!("session not found")),
-            NativeSessionResumeFailure::Incompatible
-        );
-        assert_eq!(
-            classify_native_resume_failure(&anyhow::anyhow!("resume timed out")),
-            NativeSessionResumeFailure::Ambiguous
-        );
-        assert_eq!(
-            classify_native_resume_failure(&anyhow::anyhow!("malformed provider reply")),
-            NativeSessionResumeFailure::Ambiguous
-        );
+        for detail in [
+            "session not found",
+            "initialize: incompatible",
+            "set_model: method not found",
+            "MCP: incompatible method not found",
+            "cancelled",
+            "resume timed out",
+            "malformed provider reply",
+        ] {
+            assert_eq!(
+                native_resume_failure(&anyhow::anyhow!(detail)),
+                NativeSessionResumeFailure::Ambiguous
+            );
+        }
     }
 
     #[test]
@@ -32009,6 +31918,7 @@ for line in sys.stdin:
                     execution_epoch: epoch,
                     camp_id: &camp_id,
                     agent_id: &execution.agent_id,
+                    native_binding_id: "fixture-binding",
                     cwd: &workspace,
                     frozen_runtime: &frozen,
                     runtime_compatibility_digest: "fixture",
@@ -32037,7 +31947,7 @@ for line in sys.stdin:
                 .unwrap();
             let host_id = runtime.host_instance_id().to_string();
             core.database.lock().await.connection().execute(
-                "UPDATE conversation SET native_session_id = 'native-fixture' WHERE id = (SELECT conversation_id FROM agent_run WHERE id = ?1)", [&run_id],
+                "UPDATE conversation SET native_session_id = 'native-fixture', native_adapter_installation_id = (SELECT runtime_installation_id FROM agent_run WHERE id=?1) WHERE id = (SELECT conversation_id FROM agent_run WHERE id = ?1)", [&run_id],
             ).unwrap();
             // Intermediate error notifications cannot release even willRetry=false.
             for will_retry in [true, false] {
@@ -32057,16 +31967,23 @@ for line in sys.stdin:
                 "error": if native_status == "failed" { json!({"message":"opaque","codexErrorInfo":"unauthorized"}) } else { Value::Null }
             }}});
             let mut route = core.planned_shutdown.enter_runtime_route().await.unwrap();
-            process_agent_run_codex_message(
-                &core,
-                &core.output,
-                &host_id,
-                &run_id,
-                epoch,
-                terminal.clone(),
-                &mut route,
+            // Simulate a periodic collector stuck in native I/O. Terminal
+            // settlement and the successor lease must be independent of it.
+            let usage_flush = core.runtime_usage_flush.lock().await;
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                process_agent_run_codex_message(
+                    &core,
+                    &core.output,
+                    &host_id,
+                    &run_id,
+                    epoch,
+                    terminal.clone(),
+                    &mut route,
+                ),
             )
-            .await;
+            .await
+            .expect("Usage cannot gate native completion");
             drop(route);
             {
                 let database = core.database.lock().await;
@@ -32112,6 +32029,7 @@ for line in sys.stdin:
                     execution_epoch: 1,
                     camp_id: &camp_id,
                     agent_id: &execution.agent_id,
+                    native_binding_id: "fixture-binding",
                     cwd: &workspace,
                     frozen_runtime: &frozen,
                     runtime_compatibility_digest: "fixture",
@@ -32120,6 +32038,7 @@ for line in sys.stdin:
                 .await
                 .unwrap();
             assert_eq!(next.host_instance_id() == host_id, reusable);
+            drop(usage_flush);
             // A duplicate old terminal cannot change or stop the successor lease.
             let mut route = core.planned_shutdown.enter_runtime_route().await.unwrap();
             process_agent_run_codex_message(
@@ -32542,6 +32461,7 @@ for line in sys.stdin:
                     execution_epoch: 1,
                     camp_id: "cleanup-camp",
                     agent_id: "cleanup-agent",
+                    native_binding_id: "fixture-binding",
                     cwd: &root,
                     frozen_runtime: &runtime_config,
                     runtime_compatibility_digest: "cleanup-compatible",

@@ -3,7 +3,7 @@ document_type: architecture
 architecture: builtin-tool-runtime
 authority: builtin-tool-component-boundaries
 status: accepted
-last_updated: 2026-10-07
+last_updated: 2026-10-12
 ---
 
 # Built-in Tool Runtime Architecture
@@ -209,9 +209,9 @@ CLI、Runtime Adapter、Bootstrap 与 Skill 都不重写正文或教学该 gramm
 该 schema 继续进入当前 catalog digest。
 当前 Contract/CLI 为 36、Agent Output 为 9、capability 为 `builtin_cli.transport.v36`，IPC 仍为 2。
 [Thread Runs v1](../contracts/thread-runs-v1.md) 复用公开读取范围，用一个事务组合实际 Run 和按队员聚合的等待消息；不进入调度写路径。
-Camp History 当前使用 v11。新 Charter revision 为 20；Binding compatibility 保持 16 及原冻结 context tuple，
+Camp History 当前使用 v11。Charter revision 为 22；Binding compatibility 保持 16 及原冻结 context tuple，
 Antigravity 继续使用既有固定工具兼容身份。当前目录变化不轮换旧 Session；恢复和压缩补发复用原 Bootstrap。
-新 Binding 使用 Bootstrap v5/Formatter 5，新公开批次 Formatter/Manifest 32、非批次 28 保持。
+新 Binding 使用 Bootstrap v5/Formatter 5，新公开批次 Formatter/Manifest 33、非批次 28 保持。
 Skill 正文与 reference 通过现有受管同步更新原路径；旧、新 Session 后续读取均可使用新版。
 
 Operation-specific errors use the same catalog entry both for discovery and for the emitted invocation recovery.
@@ -456,8 +456,8 @@ Session Charter 只说明：
   Task 责任、当前证据和已有用户工作保护；引用本身不产生执行请求；
 - CLI contract 标题固定为 `Rovai Built-in CLI Contract`，不显示应用 release/version；
 - 使用 bundled `rovai`；
-- 本地 `rovai` CLI 中的完整固定业务命令 catalog；operation 不清楚时使用根帮助，本次 invocation 所需
-  syntax 不清楚时查询具体 operation 的精确 `--help`，尽量复用当前 Native Session 已有 help，且不假设 family help；
+- 本地 `rovai` CLI 的稳定入口；用根帮助发现命令，用具体 operation 的精确 `--help` 查询 syntax，
+  复用当前上下文中的 help，不在 Charter 维护业务命令枚举或介绍内部 Session 生命周期；
 - `camp.message.send` 使用当前 Run Camp，不能传入 Camp ID；
 - 对 `explicit_send_only` Runtime，narration/final response 只是私有执行证据；当前责任需要在 Camp
   公开 answer/result/status/summary 时必须在结束前调用 `rovai send`，只有成功 send 才发布该回复；
@@ -477,8 +477,17 @@ Session Charter 只说明：
 - public `RUN_FACTS` v5 字段化表达附件输出位置以及可选 Mission、Task、Session continuity 和真实
   external effect；不包含 Gather、delegation 或替代预算字段。命令特定教学不回填 Charter。
 
+公开 Charter 使用各 Runtime 共用的发送规则，不按 Adapter 追加最终答复提示。Codex binding compatibility
+不再包含专属最终答复指导版本字段；历史冻结 evidence 保持原样。
+
+Charter revision 22 按已确认的 [R2](../versions/v1.72/model-context-change-charter-memory-concision.md)
+精简公共、Single Chat 及 Memory 入口教学。模型文案不要求理解 Core 内部组件；
+发送成功不证明接收者执行的解释留在 `rovai send --help`。Single Chat 仍以当前请求、显式修改条件、
+封闭操作白名单和冻结读取范围约束行为。Memory 索引只提供 locator，依赖条目前用完整 CLI 读取；
+空索引描述启动时点并引导按需搜索，不更改筛选、预算或授权。
+
 创建 Bootstrap evidence 时，Core 仅为存在 active 飞书 conversation binding 的 Camp，在静态 CLI Charter
-最后一条后、Adapter 指导前追加一条文件交付提示。Quick Chat/Project 共用该 Camp 级判断；普通、钉钉、
+最后一条后、可选 Mission 约定前追加一条文件交付提示。Quick Chat/Project 共用该 Camp 级判断；普通、钉钉、
 closed 或尚未绑定的会话不追加。已有 Binding 从 Blob 复用冻结 Charter，不重新查询渠道，因此关闭绑定或
 从本地继续聊天不改写提示，也不触发 Session rotation。下一次正常新 Binding 才读取当前关系。
 精确文本见 [Send v22](../contracts/camp-message-send-v22.md)。
@@ -563,7 +572,7 @@ AgentRun Formatter/Manifest binding contract，并由 Migration 89 clean break �
 v1.23 不修改 Bootstrap wrapper、Formatter 或数据库，而是在 Native Binding context contract 中加入
 `sessionCharterRevision: 2`；该字段只进入每个 Adapter 的 Binding compatibility digest，使新 Run 轮换旧
 Native Session 并投递完整新 Charter，历史 Bootstrap Evidence 保留原 bytes/digest。
-当前 Charter revision 为 20，User 通知主 flag 为 `--to-user`，结构化用户提及投影为 `@User`。
+当前 Charter revision 为 22，User 通知主 flag 为 `--to-user`，结构化用户提及投影为 `@User`。
 这些兼容教学更新保留 Binding compatibility 16；既有 Session 继续使用自身冻结的 Bootstrap，不因新 Charter
 revision 轮换。新 Session 才冻结新模板，既有 Evidence 保持原 bytes/digest。
 `MEMBER_IDENTITY` 是该 Native Session 唯一的 self identity，包含最新已提交的完整六字段；它只在

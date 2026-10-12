@@ -766,6 +766,9 @@ mod tests {
 
     fn binding() -> BuiltinToolBindingCredential {
         BuiltinToolBindingCredential {
+            previous_adapter_installation_id: None,
+            previous_native_session_id: None,
+            previous_binding_compatibility_digest: None,
             native_binding_id: uuid::Uuid::new_v4().to_string(),
             native_binding_generation: 1,
             binding_credential: "binding-secret".to_string(),

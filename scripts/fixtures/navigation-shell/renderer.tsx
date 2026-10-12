@@ -74,6 +74,7 @@ function Fixture(): React.JSX.Element {
   Object.assign(window, { navigationTest: {
     renders: () => renders, setSettings, setPlatform, setDisabled, setBrowser, navigation, target, actions, setRunning,
     threadReadStates, preferences,
+    projectPreferences: browserPreferences('project-concurrency-fixture', { request: async () => undefined } as unknown as ConsoleClient).preferences.navigationPreferences,
     hostNavigation: (direction: 'back' | 'forward') => navigationListeners.forEach(listener => listener(direction)),
     hostListenerCount: () => navigationListeners.size,
     settle: () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 150))))

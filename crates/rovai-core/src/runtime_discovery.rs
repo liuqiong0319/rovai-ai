@@ -59,7 +59,7 @@ static ACTIVE_RUNTIME_ENVIRONMENT: OnceLock<
 > = OnceLock::new();
 tokio::task_local! {
     static SCOPED_RUNTIME_COMMAND_PATH: OsString;
-    static FROZEN_ENVIRONMENT: Option<crate::member_environment::FrozenEnvironment>;
+    static LAUNCH_ENVIRONMENT: Option<crate::member_environment::LaunchEnvironment>;
     static SCOPED_RUNTIME_ENVIRONMENT: (AdapterKind, crate::runtime_startup::RuntimeStartupConfiguration);
 }
 
@@ -716,7 +716,7 @@ pub fn resolve_active_command_path(name: &str) -> Option<PathBuf> {
 }
 
 pub fn configure_active_runtime_command(command: &mut TokioCommand) {
-    if FROZEN_ENVIRONMENT
+    if LAUNCH_ENVIRONMENT
         .try_with(|snapshot| {
             if let Some(values) = snapshot
                 .as_ref()
@@ -794,7 +794,7 @@ fn configured_environment_variable(kind: AdapterKind, key: &str) -> Option<OsStr
 /// Native configuration readers use the same Runtime-local overlay as child commands.
 /// Neither this function nor command configuration writes the process environment.
 pub fn runtime_environment_variable(kind: AdapterKind, key: &str) -> Option<OsString> {
-    if let Ok(Some(values)) = FROZEN_ENVIRONMENT.try_with(|snapshot| {
+    if let Ok(Some(values)) = LAUNCH_ENVIRONMENT.try_with(|snapshot| {
         snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.values.clone())
@@ -820,7 +820,7 @@ pub fn runtime_home_directory(kind: AdapterKind) -> Option<PathBuf> {
 }
 
 pub fn runtime_environment(kind: AdapterKind) -> BTreeMap<String, String> {
-    if let Ok(Some(values)) = FROZEN_ENVIRONMENT.try_with(|snapshot| {
+    if let Ok(Some(values)) = LAUNCH_ENVIRONMENT.try_with(|snapshot| {
         snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.values.clone())
@@ -839,7 +839,7 @@ pub fn runtime_environment(kind: AdapterKind) -> BTreeMap<String, String> {
     environment
 }
 
-/// Admission always starts from Host state, even when called from a Run-scoped future.
+/// New CLI launches start from Host state, never another CLI's scoped environment.
 pub fn capture_host_runtime_environment() -> BTreeMap<String, String> {
     let mut values: BTreeMap<String, String> = env::vars_os()
         .filter_map(|(name, value)| {
@@ -865,7 +865,7 @@ pub fn capture_host_runtime_environment() -> BTreeMap<String, String> {
 }
 
 pub fn configure_runtime_command(kind: AdapterKind, command: &mut TokioCommand) {
-    if FROZEN_ENVIRONMENT
+    if LAUNCH_ENVIRONMENT
         .try_with(|snapshot| {
             if let Some(values) = snapshot
                 .as_ref()
@@ -3038,11 +3038,11 @@ mod windows_tests {
     }
 }
 
-/// Task-local native readers; process entrypoints additionally carry an explicit snapshot
+/// Task-local native readers; process entrypoints additionally carry a launch environment
 /// because Tokio tasks do not inherit task locals.
-pub async fn with_frozen_environment<F: Future<Output = T>, T>(
-    environment: Option<crate::member_environment::FrozenEnvironment>,
+pub async fn with_launch_environment<F: Future<Output = T>, T>(
+    environment: Option<crate::member_environment::LaunchEnvironment>,
     future: F,
 ) -> T {
-    FROZEN_ENVIRONMENT.scope(environment, future).await
+    LAUNCH_ENVIRONMENT.scope(environment, future).await
 }

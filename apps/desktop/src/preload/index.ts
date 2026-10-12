@@ -345,6 +345,9 @@ const api: RovaiApi = {
     }
   },
   navigationPreferences: {
+    registerProjects(paths, completeLegacy = false) {
+      return ipcRenderer.invoke('rovai:navigation-preferences-register-projects', paths, completeLegacy)
+    },
     setThreadReadState(threadId, state) {
       return ipcRenderer.invoke('rovai:navigation-preferences-set-thread-read-state', threadId, state)
     },
@@ -358,12 +361,6 @@ const api: RovaiApi = {
     },
     replacePins(pins: NavigationPin[]) {
       return ipcRenderer.invoke('rovai:navigation-preferences-replace-pins', pins) as Promise<NavigationPreferencesSnapshot>
-    },
-    synchronizeProjectOrder(projectKeys: string[]) {
-      return ipcRenderer.invoke(
-        'rovai:navigation-preferences-synchronize-project-order',
-        projectKeys
-      ) as Promise<NavigationPreferencesSnapshot>
     },
     setProjectName(targetKey: string, name: string | null) {
       return ipcRenderer.invoke(

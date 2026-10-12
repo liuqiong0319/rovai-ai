@@ -296,6 +296,36 @@ pub(super) async fn process_execution_budgets(
     }
 }
 
+// This is owned by run_core, not the worker's shutdown branch: final Run
+// cancellation can happen after all execution workers have already stopped.
+pub(super) async fn persist_shutdown_text(
+    database: Arc<Mutex<Database>>,
+    deadline: tokio::time::Instant,
+) {
+    let Ok(mut database) = tokio::time::timeout_at(deadline, database.lock_owned()).await else {
+        eprintln!("Execution text shutdown persistence timed out waiting for the database");
+        return;
+    };
+    // A timeout around synchronous Blob I/O would not yield to the deadline.
+    // Retain the database/buffers in the blocking owner until that I/O finishes;
+    // run_stdio already bounds the Runtime's final blocking-task shutdown wait.
+    let mut task = tokio::task::spawn_blocking(move || {
+        crate::execution_text::settle_before_shutdown(&mut database, deadline.into_std())
+    });
+    match tokio::time::timeout_at(deadline, &mut task).await {
+        Ok(Ok(outcome)) => {
+            if let Some(error) = outcome.error {
+                eprintln!("Execution text shutdown persistence failed: {error:#}");
+            }
+        }
+        Ok(Err(error)) => eprintln!("Execution text shutdown worker failed: {error}"),
+        Err(_) => {
+            task.abort(); // Cancels a queued blocking task; in-flight I/O is not interruptible.
+            eprintln!("Execution text shutdown persistence exceeded its deadline");
+        }
+    }
+}
+
 pub(super) async fn process_text_retries(core: Arc<Core>, mut shutdown: watch::Receiver<bool>) {
     loop {
         if *shutdown.borrow() {

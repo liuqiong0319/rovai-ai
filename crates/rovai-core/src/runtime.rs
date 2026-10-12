@@ -595,6 +595,7 @@ pub struct AgentRunExecution {
     pub wait_reason: Option<String>,
     pub runtime_recovery_required: bool,
     pub native_adapter_installation_id: Option<String>,
+    pub native_adapter_kind: Option<AdapterKind>,
     pub native_session_id: Option<String>,
     pub native_binding_compatibility_digest: Option<String>,
     pub native_installation_generation: Option<i64>,
@@ -615,30 +616,11 @@ impl AgentRunExecution {
 
     pub fn native_session_resume_disposition(&self) -> NativeSessionResumeDisposition {
         if self.native_session_id.is_none()
-            || self.native_adapter_installation_id.as_deref()
-                != Some(self.runtime.installation_id.as_str())
-            || self.native_binding_compatibility_digest.as_deref()
-                != Some(self.runtime.binding_compatibility_digest.as_str())
+            || self.native_adapter_kind != Some(self.runtime.adapter_kind)
         {
             return NativeSessionResumeDisposition::New;
         }
-        match (
-            self.native_session_compatibility_key.as_deref(),
-            self.runtime.native_session_compatibility_key.as_deref(),
-        ) {
-            (Some(previous), Some(current)) if previous == current => {
-                NativeSessionResumeDisposition::Compatible
-            }
-            (None, None)
-                if self.native_installation_generation
-                    == Some(self.runtime.installation_generation) =>
-            {
-                NativeSessionResumeDisposition::Compatible
-            }
-            (None, None) => NativeSessionResumeDisposition::Controlled,
-            (Some(_), Some(_)) => NativeSessionResumeDisposition::New,
-            (None, Some(_)) | (Some(_), None) => NativeSessionResumeDisposition::Controlled,
-        }
+        NativeSessionResumeDisposition::Compatible
     }
 }
 
@@ -653,6 +635,50 @@ pub enum NativeSessionResumeDisposition {
 pub enum NativeSessionResumeFailure {
     Incompatible,
     Ambiguous,
+}
+
+impl std::fmt::Display for NativeSessionResumeFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Incompatible => "Adapter confirmed Native Session restoration is unavailable",
+            Self::Ambiguous => "Native Session restoration outcome is unknown",
+        })
+    }
+}
+
+impl std::error::Error for NativeSessionResumeFailure {}
+
+/// Resolve only the current Conversation's target, including installations that
+/// have since been removed. Configuration equality never identifies a Session.
+pub(crate) fn native_session_adapter_kind(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+) -> Result<Option<AdapterKind>> {
+    let (session, installation): (Option<String>, Option<String>) = connection.query_row(
+        "SELECT native_session_id, native_adapter_installation_id FROM conversation WHERE id=?1",
+        [conversation_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if session.is_none() {
+        return Ok(None);
+    }
+    let installation =
+        installation.context("Native Session has no recorded CLI installation identity")?;
+    let mut query = connection.prepare(
+        "SELECT adapter_kind FROM adapter_installation WHERE id=?1
+         UNION SELECT runtime_adapter_kind FROM agent_run
+         WHERE conversation_id=?2 AND runtime_installation_id=?1 AND runtime_adapter_kind IS NOT NULL",
+    )?;
+    let kinds = query
+        .query_map(params![installation, conversation_id], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        kinds.len() == 1,
+        "Native Session CLI type cannot be determined from its binding and runs"
+    );
+    Ok(Some(kinds[0].parse()?))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1002,77 +1028,10 @@ impl ExecutionRuntimeService {
         database: &mut Database,
         execution: &AgentRunExecution,
     ) -> Result<NativeSessionResumeDisposition> {
-        let disposition = execution.native_session_resume_disposition();
-        if disposition != NativeSessionResumeDisposition::Controlled {
-            return Ok(disposition);
-        }
-        let changes_before = database.connection().total_changes();
-        let transaction = database.connection_mut().transaction()?;
-        let existing = transaction
-            .query_row(
-                r#"
-                SELECT status
-                FROM native_session_resume_attempt
-                WHERE conversation_id = ?1
-                  AND installation_id = ?2
-                  AND installation_generation = ?3
-                "#,
-                params![
-                    execution.conversation_id,
-                    execution.runtime.installation_id,
-                    execution.runtime.installation_generation,
-                ],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        let now = chrono::Utc::now().to_rfc3339();
-        let disposition = match existing.as_deref() {
-            None => {
-                transaction.execute(
-                    r#"
-                    INSERT INTO native_session_resume_attempt(
-                        conversation_id, installation_id,
-                        installation_generation, status,
-                        attempted_at, completed_at
-                    ) VALUES (?1, ?2, ?3, 'attempting', ?4, NULL)
-                    "#,
-                    params![
-                        execution.conversation_id,
-                        execution.runtime.installation_id,
-                        execution.runtime.installation_generation,
-                        now,
-                    ],
-                )?;
-                NativeSessionResumeDisposition::Controlled
-            }
-            Some("attempting") => {
-                transaction.execute(
-                    r#"
-                    UPDATE native_session_resume_attempt
-                    SET status = 'ambiguous', completed_at = ?4
-                    WHERE conversation_id = ?1
-                      AND installation_id = ?2
-                      AND installation_generation = ?3
-                      AND status = 'attempting'
-                    "#,
-                    params![
-                        execution.conversation_id,
-                        execution.runtime.installation_id,
-                        execution.runtime.installation_generation,
-                        now,
-                    ],
-                )?;
-                NativeSessionResumeDisposition::New
-            }
-            Some("succeeded") => NativeSessionResumeDisposition::Compatible,
-            Some("incompatible" | "ambiguous") => NativeSessionResumeDisposition::New,
-            Some(_) => anyhow::bail!("Native Session resume attempt has an invalid status"),
-        };
-        transaction.commit()?;
-        if database.connection().total_changes() != changes_before {
-            database.execution_wake.execution_changed();
-        }
-        Ok(disposition)
+        // Run/epoch, input-delivery and native writer-lock fences remain the
+        // execution authority. Historical configuration attempts are audit only.
+        let _ = database;
+        Ok(execution.native_session_resume_disposition())
     }
 
     pub fn record_native_session_resume_failure(
@@ -1144,52 +1103,6 @@ impl ExecutionRuntimeService {
             database.execution_wake.execution_changed();
         }
         Ok(())
-    }
-
-    /// A failed replacement has no authority to erase the previous session
-    /// reference. Retain it under the new binding; never restore old credentials
-    /// or clear any accepted/unknown input evidence.
-    pub(crate) fn retain_session_after_failed_replacement(
-        &self,
-        database: &mut Database,
-        execution: &AgentRunExecution,
-    ) -> Result<bool> {
-        let Some(session_id) = execution.native_session_id.as_deref() else {
-            return Ok(false);
-        };
-        let tx = database.connection_mut().transaction()?;
-        let changed = tx.execute(
-            "UPDATE conversation SET native_session_id=?2,
-                native_adapter_installation_id=?3, native_binding_compatibility_digest=?4,
-                native_installation_generation=?5, native_session_compatibility_key=?6,
-                version=version+1, updated_at=?9
-             WHERE id=?1 AND native_session_id IS NULL AND native_binding_id IS NOT NULL
-               AND EXISTS(SELECT 1 FROM agent_run WHERE id=?7 AND conversation_id=?1
-                   AND execution_epoch=?8 AND status IN ('running','waiting') AND cancel_requested_at IS NULL)
-               AND EXISTS(SELECT 1 FROM event_log WHERE entity_type='agent_run' AND entity_id=?7
-                   AND execution_epoch=?8 AND event_type='agent_run.native_session_continuity_lost')
-               AND NOT EXISTS(SELECT 1 FROM runtime_input_delivery WHERE agent_run_id=?7
-                   AND (status IN ('accepted','delivery_unknown') OR dispatch_started_at IS NOT NULL))",
-            params![execution.conversation_id, session_id, execution.native_adapter_installation_id,
-                execution.native_binding_compatibility_digest, execution.native_installation_generation,
-                execution.native_session_compatibility_key, execution.agent_run_id, execution.execution_epoch,
-                chrono::Utc::now().to_rfc3339()],
-        )?;
-        if changed != 0 {
-            append_domain_event(
-                &tx,
-                "agent_run.native_session_reference_retained",
-                &execution.camp_id,
-                ("agent_run", &execution.agent_run_id),
-                &ActorRef::System {
-                    component_id: "runtime-adapter:session-continuation".into(),
-                },
-                Some(execution.execution_epoch),
-                &json!({"conversationId": execution.conversation_id, "nativeSessionId": session_id}),
-            )?;
-        }
-        tx.commit()?;
-        Ok(changed != 0)
     }
 
     pub fn expire_elapsed_camp_turn_execution_budgets(
@@ -1864,6 +1777,8 @@ impl ExecutionRuntimeService {
             runtime_protocol_version.as_deref(),
             runtime_native_session_compatibility_key.as_deref(),
         )?;
+        let native_adapter_kind =
+            native_session_adapter_kind(database.connection(), &conversation_id)?;
         Ok(Some(AgentRunExecution {
             agent_run_id,
             camp_id,
@@ -1881,6 +1796,7 @@ impl ExecutionRuntimeService {
             wait_reason,
             runtime_recovery_required: runtime_recovery_required != 0,
             native_adapter_installation_id,
+            native_adapter_kind,
             native_session_id,
             native_binding_compatibility_digest,
             native_installation_generation,
@@ -3335,6 +3251,16 @@ impl ExecutionRuntimeService {
             }
             let frozen_installation_generation =
                 frozen_installation_generation.context("frozen Runtime has no generation")?;
+            let native_session_replaced = if current_session.as_deref()
+                .is_some_and(|old| old != envelope.payload.native_session_id)
+            {
+                let kind: String = transaction.query_row(
+                    "SELECT runtime_adapter_kind FROM agent_run WHERE id=?1",
+                    [&envelope.payload.agent_run_id], |row| row.get(0),
+                )?;
+                native_session_adapter_kind(transaction, &envelope.payload.conversation_id)?
+                    == Some(kind.parse()?)
+            } else { false };
             let binding_reused = current_binding_id.is_some()
                 && current_binding_generation >= 1
                 && current_installation.as_deref()
@@ -3344,13 +3270,7 @@ impl ExecutionRuntimeService {
                     == Some(envelope.payload.binding_compatibility_digest.as_str());
             let binding_prepared = current_binding_id.is_some()
                 && current_binding_generation >= 1
-                && current_installation.as_deref()
-                    == Some(envelope.payload.adapter_installation_id.as_str())
-                && current_session.is_none()
-                && current_digest.as_deref()
-                    == Some(envelope.payload.binding_compatibility_digest.as_str())
-                && envelope.payload.proposed_binding_id.as_deref()
-                    == current_binding_id.as_deref();
+                && envelope.payload.proposed_binding_id.as_deref() == current_binding_id.as_deref();
             if binding_reused
                 && envelope.payload.proposed_binding_id.is_some()
                 && envelope.payload.proposed_binding_id.as_deref()
@@ -3389,14 +3309,13 @@ impl ExecutionRuntimeService {
                         r#"
                         UPDATE conversation
                         SET native_session_id = ?2,
+                            native_adapter_installation_id = ?5,
+                            native_binding_compatibility_digest = ?6,
                             native_installation_generation = ?9,
                             native_session_compatibility_key = ?10,
                             version = version + 1,
                             updated_at = ?3
                         WHERE id = ?1 AND version = ?4
-                          AND native_adapter_installation_id = ?5
-                          AND native_session_id IS NULL
-                          AND native_binding_compatibility_digest = ?6
                           AND native_binding_id = ?7
                           AND native_binding_generation = ?8
                           AND native_binding_secret_digest IS NOT NULL
@@ -3534,6 +3453,17 @@ impl ExecutionRuntimeService {
                     "nativeSessionCompatibilityKey": frozen_session_compatibility_key,
                 }),
             )?;
+            if native_session_replaced {
+                append_domain_event(transaction, "agent_run.native_session_continuity_lost", &camp_id,
+                    ("agent_run", &envelope.payload.agent_run_id), &envelope.actor,
+                    Some(envelope.payload.expected_execution_epoch), &json!({
+                        "agentRunId": envelope.payload.agent_run_id,
+                        "conversationId": envelope.payload.conversation_id,
+                        "executionEpoch": envelope.payload.expected_execution_epoch,
+                        "continuation": "native_session_replaced",
+                        "failure": "incompatible", "fallback": "new_session",
+                    }))?;
+            }
             Ok(CommandHandlerResult::applied(
                 "conversation.native_session_bound",
                 json!({
@@ -3623,15 +3553,7 @@ impl ExecutionRuntimeService {
                     "Native Session cannot be restarted while this Conversation has active work",
                 ));
             }
-            let removed_environment = crate::member_environment::reset_session(
-                transaction,
-                &envelope.payload.conversation_id,
-            )?;
-            if removed_environment == 0
-                && installation_id.is_none()
-                && native_session_id.is_none()
-                && binding_id.is_none()
-            {
+            if installation_id.is_none() && native_session_id.is_none() && binding_id.is_none() {
                 return Ok(CommandHandlerResult::applied(
                     "conversation_native_session_already_clear",
                     json!({
@@ -4580,7 +4502,7 @@ impl ExecutionRuntimeService {
             if database.connection().total_changes() != changes_before {
                 database.execution_wake.execution_changed();
             }
-            crate::execution_text::flush_settled(database)?;
+            crate::execution_text::request_settlement(database);
             return Ok(ControlledShutdownCycleSettlement {
                 core_generation: core_generation.to_string(),
                 fenced_agent_runs: Vec::new(),
@@ -4707,7 +4629,7 @@ impl ExecutionRuntimeService {
         if database.connection().total_changes() != changes_before {
             database.execution_wake.execution_changed();
         }
-        crate::execution_text::flush_settled(database)?;
+        crate::execution_text::request_settlement(database);
         Ok(ControlledShutdownCycleSettlement {
             core_generation: core_generation.to_string(),
             fenced_agent_runs,
@@ -4764,7 +4686,7 @@ impl ExecutionRuntimeService {
             if database.connection().total_changes() != changes_before {
                 database.execution_wake.execution_changed();
             }
-            crate::execution_text::flush_settled(database)?;
+            crate::execution_text::request_settlement(database);
             return Ok(PlannedShutdownTerminalSettlement {
                 agent_run_id: target.agent_run_id,
                 camp_turn_id: target.camp_turn_id,
@@ -4897,7 +4819,7 @@ impl ExecutionRuntimeService {
         if database.connection().total_changes() != changes_before {
             database.execution_wake.execution_changed();
         }
-        crate::execution_text::flush_settled(database)?;
+        crate::execution_text::request_settlement(database);
         pump_target_after_run_terminal(database, &terminal.agent_run_id)?;
         Ok(PlannedShutdownTerminalSettlement {
             agent_run_id: target.agent_run_id,
@@ -5076,14 +4998,7 @@ pub(crate) fn fail_lost_agent_run_in_tx(
         &target.now,
         AbortiveEffectClosureReason::runtime_loss(),
     )?;
-    // Cleanup still gates the lane. Discard only continuation metadata, keeping
-    // the accepted boundary and immutable input/output evidence intact.
-    transaction.execute(
-        "UPDATE conversation SET native_session_id = NULL,
-             native_binding_compatibility_digest = NULL,
-             version = version + 1, updated_at = ?2 WHERE id = ?1",
-        params![target.conversation_id, target.now],
-    )?;
+    // Runtime loss fences this input; it does not establish that native history is gone.
     settle_failed_agent_run_in_tx(
         transaction,
         &target,
@@ -6157,17 +6072,6 @@ fn settle_interrupted_run_in_tx(
             terminal_status,
             Some(reason_code),
             now,
-        )?;
-    }
-    if runtime_lost {
-        transaction.execute(
-            "UPDATE conversation SET native_adapter_installation_id = NULL, native_session_id = NULL,
-                 native_binding_compatibility_digest = NULL, native_installation_generation = NULL,
-                 native_session_compatibility_key = NULL, native_binding_id = NULL,
-                 native_binding_secret_digest = NULL, native_charter_digest = NULL,
-                 native_collaboration_state_digest = NULL, version = version + 1, updated_at = ?2
-             WHERE id = ?1",
-            params![conversation_id, now],
         )?;
     }
     Ok(AbortiveRunSettlement {
@@ -7523,6 +7427,7 @@ mod tests {
             wait_reason: None,
             runtime_recovery_required: false,
             native_adapter_installation_id: Some("adapter-test-codex".to_string()),
+            native_adapter_kind: Some(AdapterKind::CodexCli),
             native_session_id: Some("session-existing".to_string()),
             native_binding_compatibility_digest: Some("binding-stable".to_string()),
             native_installation_generation: Some(previous_generation),
@@ -7565,57 +7470,28 @@ mod tests {
     }
 
     #[test]
-    fn session_compatibility_key_controls_resume_independently_of_installation_generation() {
-        let legacy = resume_execution(None, Some("opencode-cli:acp-v1:storage"), 1, 1);
-        assert_eq!(
-            legacy.native_session_resume_disposition(),
-            NativeSessionResumeDisposition::Controlled
-        );
-        assert_eq!(
-            legacy.resumable_native_session_id(),
-            Some("session-existing")
-        );
-        assert_eq!(
-            resume_execution(Some("session-v1"), Some("session-v1"), 1, 2)
-                .native_session_resume_disposition(),
-            NativeSessionResumeDisposition::Compatible
-        );
-        assert_eq!(
-            resume_execution(Some("session-v1"), Some("session-v2"), 1, 2)
-                .native_session_resume_disposition(),
-            NativeSessionResumeDisposition::New
-        );
-        // Retired backend keys are passive data; even the same installation
-        // generation must create an ACP Binding, never load the old Hub ID.
-        let mut retired = resume_execution(
-            Some("cline-cli:native-hub-v1:old"),
-            Some("cline-cli:history-restore-v1:current"),
-            1,
-            1,
-        );
-        retired.runtime.adapter_kind = AdapterKind::ClineCli;
-        retired.runtime.protocol_version = "acp-v1".into();
-        assert_eq!(
-            retired.native_session_resume_disposition(),
-            NativeSessionResumeDisposition::New
-        );
-        assert_eq!(
-            retired.native_session_id.as_deref(),
-            Some("session-existing"),
-            "classification must not delete historical identity"
-        );
-        assert_eq!(
-            resume_execution(Some("session-v1"), None, 1, 2).native_session_resume_disposition(),
-            NativeSessionResumeDisposition::Controlled
-        );
-        assert_eq!(
-            resume_execution(None, None, 1, 1).native_session_resume_disposition(),
-            NativeSessionResumeDisposition::Compatible
-        );
-        assert_eq!(
-            resume_execution(None, None, 1, 2).native_session_resume_disposition(),
-            NativeSessionResumeDisposition::Controlled
-        );
+    fn resume_uses_cli_type_and_current_target_instead_of_configuration() {
+        for (old_key, new_key) in [
+            (None, None),
+            (None, Some("new")),
+            (Some("old"), None),
+            (Some("old"), Some("new")),
+        ] {
+            let mut execution = resume_execution(old_key, new_key, 1, 9);
+            execution.runtime.installation_id = "reinstalled-cli".into();
+            execution.runtime.binding_compatibility_digest =
+                "different-context-and-permissions".into();
+            execution.runtime.executable_fingerprint = "new-binary".into();
+            assert_eq!(
+                execution.resumable_native_session_id(),
+                Some("session-existing")
+            );
+            execution.runtime.adapter_kind = AdapterKind::ClaudeCodeCli;
+            assert_eq!(execution.resumable_native_session_id(), None);
+            execution.runtime.adapter_kind = AdapterKind::CodexCli;
+            execution.native_session_id = None;
+            assert_eq!(execution.resumable_native_session_id(), None);
+        }
     }
 
     #[test]
@@ -7644,7 +7520,7 @@ mod tests {
     }
 
     #[test]
-    fn controlled_resume_is_persistently_fenced_after_a_crash_or_failure() {
+    fn historical_resume_attempts_do_not_disqualify_a_fresh_run() {
         let (mut database, directory) = crate::test_support::seeded_runtime_database();
         let now = chrono::Utc::now().to_rfc3339();
         database
@@ -7683,54 +7559,21 @@ mod tests {
             )
             .unwrap();
         let service = ExecutionRuntimeService::default();
-        let generation_two = resume_execution(None, None, 1, 2);
-        assert_eq!(
-            service
-                .prepare_native_session_resume(&mut database, &generation_two)
-                .unwrap(),
-            NativeSessionResumeDisposition::Controlled
-        );
-        assert_eq!(
-            service
-                .prepare_native_session_resume(&mut database, &generation_two)
-                .unwrap(),
-            NativeSessionResumeDisposition::New,
-            "an unfinished pre-input attempt becomes ambiguous after restart"
-        );
-        let crash_status: String = database
-            .connection()
-            .query_row(
-                r#"
-                SELECT status FROM native_session_resume_attempt
-                WHERE conversation_id = 'conversation-resume'
-                  AND installation_generation = 2
-                "#,
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(crash_status, "ambiguous");
-
         let generation_three = resume_execution(None, None, 1, 3);
-        assert_eq!(
-            service
-                .prepare_native_session_resume(&mut database, &generation_three)
-                .unwrap(),
-            NativeSessionResumeDisposition::Controlled
-        );
-        service
-            .record_native_session_resume_failure(
-                &mut database,
-                &generation_three,
-                NativeSessionResumeFailure::Incompatible,
-            )
-            .unwrap();
-        assert_eq!(
-            service
-                .prepare_native_session_resume(&mut database, &generation_three)
-                .unwrap(),
-            NativeSessionResumeDisposition::New
-        );
+        for status in ["attempting", "ambiguous", "incompatible", "succeeded"] {
+            database.connection().execute(
+                "INSERT OR REPLACE INTO native_session_resume_attempt(conversation_id, installation_id, installation_generation, status, attempted_at) VALUES('conversation-resume','adapter-test-codex',3,?1,?2)",
+                params![status, now],
+            ).unwrap();
+            assert_eq!(
+                service
+                    .prepare_native_session_resume(&mut database, &generation_three)
+                    .unwrap(),
+                NativeSessionResumeDisposition::Compatible
+            );
+            let recorded: String = database.connection().query_row("SELECT status FROM native_session_resume_attempt WHERE conversation_id='conversation-resume'", [], |r| r.get(0)).unwrap();
+            assert_eq!(recorded, status, "legacy audit is not an execution lock");
+        }
         service
             .record_native_session_continuity_lost(
                 &mut database,
@@ -8976,7 +8819,8 @@ mod tests {
         let (directory, mut database, _, _, run_id, epoch) =
             claimed_run_for_planned_shutdown("required");
         let service = ExecutionRuntimeService::default();
-        let binding = crate::team_tool::TeamToolService::default()
+        let tools = crate::team_tool::TeamToolService::default();
+        let binding = tools
             .prepare_binding_credential(&mut database, &run_id, epoch, false)
             .unwrap();
         database.connection().execute("UPDATE conversation SET native_session_id='recoverable-old-session' WHERE id=(SELECT conversation_id FROM agent_run WHERE id=?1)", [&run_id]).unwrap();
@@ -8984,63 +8828,82 @@ mod tests {
             .load_agent_run_execution(&database, &run_id, epoch)
             .unwrap()
             .unwrap();
-        service
-            .record_native_session_continuity_lost(
-                &mut database,
-                &execution,
-                "native_resume",
-                NativeSessionResumeFailure::Ambiguous,
-            )
-            .unwrap();
-        let replacement = crate::team_tool::TeamToolService::default()
+        let replacement = tools
             .prepare_binding_credential(&mut database, &run_id, epoch, true)
             .unwrap();
         assert_ne!(replacement.native_binding_id, binding.native_binding_id);
         assert_ne!(replacement.binding_credential, binding.binding_credential);
         assert!(
-            service
-                .retain_session_after_failed_replacement(&mut database, &execution)
-                .unwrap()
+            replacement.native_session_id.is_none(),
+            "the replacement launch creates a fresh native session"
         );
-        let retained: (String, String, i64) = database.connection().query_row(
-            "SELECT native_session_id,native_binding_id,native_binding_generation FROM conversation WHERE id=?1",
-            [&execution.conversation_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
-        ).unwrap();
         assert_eq!(
-            retained,
-            (
-                "recoverable-old-session".into(),
-                replacement.native_binding_id,
-                replacement.native_binding_generation
-            )
+            replacement.previous_native_session_id.as_deref(),
+            Some("recoverable-old-session")
+        );
+        let retained = |db: &Database| -> String {
+            db.connection()
+                .query_row(
+                    "SELECT native_session_id FROM conversation WHERE id=?1",
+                    [&execution.conversation_id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            retained(&database),
+            "recoverable-old-session",
+            "failed activation needs no compensating write"
+        );
+        let notices: i64 = database.connection().query_row("SELECT count(*) FROM event_log WHERE event_type='agent_run.native_session_continuity_lost'", [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            notices, 0,
+            "preparation cannot claim a successful replacement"
         );
         assert!(
-            !service
-                .retain_session_after_failed_replacement(&mut database, &execution)
-                .unwrap(),
-            "never overwrite a bound session"
+            tools
+                .prepare_binding_credential(&mut database, &run_id, epoch + 1, true)
+                .is_err()
         );
-        // An old epoch has no authority over the current binding, even if empty.
+        database.connection().execute_batch("CREATE TEMP TRIGGER reject_replacement_notice BEFORE INSERT ON event_log WHEN NEW.event_type='agent_run.native_session_continuity_lost' BEGIN SELECT RAISE(ABORT,'notice write rejected'); END;").unwrap();
+        let bound = service.bind_native_session(
+            &mut database,
+            &adapter_envelope(
+                "replace-with-notice",
+                &execution.camp_id,
+                BindNativeSessionCommand {
+                    conversation_id: execution.conversation_id.clone(),
+                    agent_run_id: run_id.clone(),
+                    expected_conversation_version: replacement.conversation_version,
+                    expected_execution_epoch: epoch,
+                    previous_adapter_installation_id: replacement
+                        .previous_adapter_installation_id
+                        .clone(),
+                    previous_native_session_id: replacement.previous_native_session_id.clone(),
+                    previous_binding_compatibility_digest: replacement
+                        .previous_binding_compatibility_digest
+                        .clone(),
+                    proposed_binding_id: Some(replacement.native_binding_id.clone()),
+                    adapter_installation_id: replacement.adapter_installation_id.clone(),
+                    native_session_id: "replacement-session".into(),
+                    binding_compatibility_digest: replacement.binding_compatibility_digest.clone(),
+                },
+            ),
+        );
+        assert!(
+            bound.is_err(),
+            "the successful-replacement notice belongs to the binding transaction"
+        );
+        assert_eq!(retained(&database), "recoverable-old-session");
         database
             .connection()
-            .execute(
-                "UPDATE conversation SET native_session_id=NULL WHERE id=?1",
-                [&execution.conversation_id],
-            )
+            .execute_batch("DROP TRIGGER reject_replacement_notice")
             .unwrap();
-        let mut stale = execution.clone();
-        stale.execution_epoch += 1;
-        assert!(
-            !service
-                .retain_session_after_failed_replacement(&mut database, &stale)
-                .unwrap()
-        );
         insert_test_runtime_input(&database, &run_id, epoch, "delivery_unknown");
         assert!(
-            !service
-                .retain_session_after_failed_replacement(&mut database, &execution)
-                .unwrap(),
-            "dispatched unknown input cannot be reinterpreted as failed activation"
+            tools
+                .prepare_binding_credential(&mut database, &run_id, epoch, true)
+                .is_err()
         );
         database
             .connection()
@@ -9050,10 +8913,11 @@ mod tests {
             )
             .unwrap();
         assert!(
-            !service
-                .retain_session_after_failed_replacement(&mut database, &execution)
-                .unwrap()
+            tools
+                .prepare_binding_credential(&mut database, &run_id, epoch, true)
+                .is_err()
         );
+        assert_eq!(retained(&database), "recoverable-old-session");
         drop(database);
         std::fs::remove_dir_all(directory).unwrap();
     }

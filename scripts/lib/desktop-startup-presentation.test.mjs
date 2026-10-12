@@ -52,6 +52,7 @@ test('the production App presents the full-window brand loader without weakening
     assert.equal(code, 0, `Desktop startup regression failed:\n${stdout}\n${stderr}`)
     const report = JSON.parse(stdout.split('\n').find(line => line.startsWith('{')))
     assert.equal(report.ok, true)
+    if (process.env.ROVAI_PROJECT_DIRECTORIES_ONLY === '1') { assert.equal(report.cases.length, 4); return }
     assert.ok(report.cases.length >= 8)
     assert.ok(report.cases.includes('Ordinary Camp switching reads only the target row without unrelated queries'))
     assert.ok(report.cases.includes('The Skill picker loads its catalog on demand'))

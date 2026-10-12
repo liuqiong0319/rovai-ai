@@ -1,7 +1,7 @@
 ---
 document_type: architecture
 authority: current-foundational-invariants
-last_updated: 2026-10-10
+last_updated: 2026-10-12
 ---
 
 # 当前基础架构不变量
@@ -337,12 +337,13 @@ last_updated: 2026-10-10
 
 ### Session continuity 与 Bootstrap
 
-- User 命名沿用既有冻结证据优先原则：已有 Bootstrap 原字节恢复；尚无 Bootstrap 的公开执行共用当前模板，Single Chat 专用模板保持。`agent_v1`／`agent_v2` 分别验证旧／新投影，Skill 在原路径同步。精确规则见 [User Naming v1](../contracts/user-naming-v1.md)。
+- 同一 Run 的既有 Bootstrap 原字节恢复；新 Run 的公开执行使用当前模板，Single Chat 专用模板保持。旧历史材料不成为新输入的恢复门槛。`agent_v1`／`agent_v2` 分别验证旧／新投影，Skill 在原路径同步。精确规则见 [User Naming v1](../contracts/user-naming-v1.md)。
 
-- Conversation handoff 只在明确、可验证的 Native Session continuation 边界保持连续性。Camp 公共历史与 portable context 属于 Rovai 逻辑连续性；Runtime native thread/session 是外部 binding。跨 Runtime、身份、Camp、binding generation 或不兼容 contract 的“恢复”必须创建新 Session，不能把摘要、同一路径或版本当作原生连续性证明。
-- Native Session Bootstrap 是完整、不可变的交付 bytes/digest。新 Binding v5 按 `SESSION_CHARTER → MEMBER_IDENTITY → ROVAI_PLATFORM_SKILLS → MEMORY_ENTRYPOINT?` 组合；旧 Binding v4 继续使用冻结的原三段。`MEMBER_IDENTITY` 始终包含一个 six-field self aggregate 的最新值；Dynamic Context 中的 `COLLABORATION_STATE` 只包含当前 Camp peer routing/Lead，不泄露 peer persona、Presence、Runtime、Memory 或 busy 状态。新 Session/替换 Session 使用当时最新身份，既有 Session 不因编辑被热改写。
-- 按 Binding ID 和 generation 查到 Bootstrap Evidence 时，复用其冻结字节并校验 delivery mode、组件 Blob 与平台 Skills 摘要；证据损坏仍拒绝。查不到证据时走该 Binding 原有的首次准备路径，冻结一份证据；单凭 `native_session_id` 已存在不能拒绝首次准备，也不表示 Bootstrap 已被 Runtime 接受。是否随输入交付继续由原有 delivery mode、Charter digest、redelivery requirement 和 accepted Input 门禁决定，不因缺失证据默认重建 Session 或重复发送。
-- Session Charter 只拥有稳定产品合同、工具/Skill 进入方法与协作纪律，合同不兼容时通过版本和 Session rotation 切换，不把 operation schema 复制入永久 prompt。公开 Camp 动态 Context 使用多消息 `RUN_INPUT`；Single Chat 继续使用 `CURRENT_INPUT`。两者都不重复永久 Session 规则或把私有 Conversation 当公开上下文。
+- 同一 Camp、队员和当前 Conversation，未重置且 AdapterKind 相同，优先把当前绑定的原生 ID 交给 Adapter 恢复。历史配置、安装记录、版本、指纹、兼容 key 或上下文摘要不否决资格；切换 CLI 类型不传递旧 ID。当前权限、工具、工作目录、进程归属与执行防重继续检查。恢复目标与业务输入接收是不同权威。
+- Adapter 在恢复调用处提供结论；只有能力不支持、针对恢复请求的结构化拒绝或已有精确目标核验才允许一次新建。认证、网络、锁、初始化、模型、MCP、取消和超时等不能从报错文本推断旧历史失效。新建成功并绑定后才切换目标和提示，失败保留旧目标；完整行为见 [Runtime Launch v60](../contracts/runtime-launch-and-verification-v60.md)。
+- Bootstrap、章程和上下文格式变化不触发 Session rotation。新 Run 按现有装配方式生成当前 Bootstrap；旧原生历史允许保留旧说明。`SESSION_CHARTER → MEMBER_IDENTITY → ROVAI_PLATFORM_SKILLS → MEMORY_ENTRYPOINT?` 的结构及公开/Single Chat 输入区别不变。
+- 同一 Run/Binding/generation 的 Bootstrap 与 Manifest bytes/digest 保持冻结。历史 Bootstrap 不作为下一个 Run 的必读材料，损坏或缺失不挡续聊；现有 Evidence 表保留每次准备结果和旧 Blob 引用。是否投递仍由 Adapter delivery mode、Charter digest、redelivery requirement 和 accepted Input 门禁决定；不重复业务输入，也不伪造已接受事实。
+- Session Charter 只拥有稳定产品合同、工具/Skill 进入方法与协作纪律，不复制 operation schema；文案及格式版本不构成原生历史有效性的证明。
 - Bootstrap 各组件、完整序列化 bytes 和实际投递是不同 evidence 层；不用“已生成完整 Bootstrap”替代 Runtime accepted evidence。ContextManifest 记录冻结 digest/versions，Runtime Input Delivery Evidence 记录实际 bytes 与 accepted ACK；只有当前有效 Run/epoch 和 Native Binding 的 accepted ACK 推进 Conversation 水位；明确未接受才可重新准备，accepted/unknown 不自动重发。迟到回执只补充证据，不修改 successor 水位。
 - Pi 的 `managed_system_prompt` 是第三种 Bootstrap delivery mode，不改变既有 Bootstrap 或 Formatter 22 原始 Dynamic Context。v7 extension 不注册 `input` 或 `tool_call` hook；它在每个 `before_agent_start` 重新读取当前 binding，只校验基本结构与 Bootstrap digest，并把完整 Bootstrap 追加到当时的 Pi system prompt。读取失败只发布脱敏 diagnostic 并让 Pi 按原生行为继续，不调用 abort，也不建立第二套 Session/cwd/Tool catalog 认证。`prompt` RPC response 只结束 command round trip；当前 Host owner 精确绑定的第一个 `agent_start` 才以现有 Delivery transition 接受 Input 并幂等发布 started。更早原生 Extension handled 输入而没有 `agent_start` 时，Rovai 不伪造 started。新 Run 不生成或读取 Managed Input Receipt；历史 Receipt 数据只作审计保留。Formatter 22 `prepared_context.rendered_payload` 不解析 `CURRENT_INPUT` 或 slash command，逐字节成为 Pi `prompt.message`；已授权图片只从结构化 ContextManifest refs 生成，schema-2 私有 evidence 直接绑定 Delivery。Pi `abort` 使用普通 pending request/response correlation，waiter 超时后迟到 response 仍被消费；非 Rovai Extension 的未映射交互只返回 cancelled/denied，不 poison Host。Pi system prompt 独立于压缩消息历史，因此固定使用 `native_system_prompt_preserved`，不创建 redelivery requirement 或 compaction observer lease。
 - Bootstrap redelivery 是 durable requirement，但 detector signal 本身不证明 compaction、不授权发送。Core 通过每 Native Session 唯一的 observer lease/generation、Runtime-owned policy epoch、prepared-input cutoff 和幂等 Session-scoped command 决定下一个尚未准备的输入是否需要 redelivery；旧 binding、旧 generation、迟到信号或已经 prepare 的输入都 fail closed。
@@ -602,8 +603,8 @@ last_updated: 2026-10-10
 ### 产品与导航
 
 - 正式产品名是 **Rovai-ai**，仓库/package slug 为 `rovai-ai`，普通内部命名使用 `rovai`，Rust package/crate/executable 使用 `rovai-core` / `rovai_core`。旧 namespace 只在受控迁移或外部兼容边界保留。
-- 普通导航使用“置顶 / 项目”投影：directory-backed Project 与 Quick Chat 分组来自 Camp workspace read model。设置在同一侧栏槽位以显式模式覆盖，不创造第二导航真源。
-- Core 拥有 Project 聚合、Project 内 Camp 最近用户消息顺序和活动字段；只有已发布的 `user` / `external_principal` 消息（含飞书、钉钉等渠道用户）推进 Camp 排序，队员消息和运行状态不推进；无用户消息时固定使用创建时间，草稿编辑不推进。运行中和完成未读标记独立刷新。当前设备的 Sidecar Project 行顺序由 Main-owned `navigation.json` nullable `projectOrder` 拥有。schema 2 用户第一次进入时按当时 Core Project 数组冻结，之后只保留既有项相对顺序、追加新项并清理消失项；消息活动不得移动 Project。
+- 普通导航使用“置顶 / 项目”投影：directory-backed Project 入口来自客户端导航偏好的登记目录，未完成旧补齐时兼容 Camp 分组；会话窗口与 Quick Chat 仍来自 Camp workspace read model。设置在同一侧栏槽位以显式模式覆盖，不创造第二导航真源。
+- Core 拥有 Project 聚合、Project 内 Camp 最近用户消息顺序和活动字段；只有已发布的 `user` / `external_principal` 消息（含飞书、钉钉等渠道用户）推进 Camp 排序，队员消息和运行状态不推进；无用户消息时固定使用创建时间，草稿编辑不推进。运行中和完成未读标记独立刷新。当前设备的 Sidecar Project 行顺序由 Main-owned `navigation.json` nullable `projectOrder` 拥有。schema 2 用户第一次进入时按当时 Core Project 数组冻结，之后保持既有项相对顺序，明确添加／恢复时追加、主动移除时清理；会话归零与消息活动不得删除或移动 Project。
 - Navigation 新鲜度采用事件驱动为主、前台约 20 秒安全刷新兜底；隐藏时暂停周期与后台 retry，focus 后立即重读。并发、trailing generation 与失败退避由 [Desktop Navigation Refresh](desktop-navigation-refresh.md) 统一拥有。
 - Sidebar wordmark 是展示资产，不定义产品领域身份；Core 健康和诊断只从诊断入口读取，不常驻普通导航制造伪状态。
 

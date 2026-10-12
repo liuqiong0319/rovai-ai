@@ -266,24 +266,8 @@ impl std::fmt::Display for PiRpcCommandRejected {
 impl std::error::Error for PiRpcCommandRejected {}
 
 fn switch_target_is_explicitly_unavailable(error: &anyhow::Error) -> bool {
-    let Some(rejection) = error.downcast_ref::<PiRpcCommandRejected>() else {
-        return false;
-    };
-    if rejection.command != "switch_session" {
-        return false;
-    }
-    let message = rejection.message.to_ascii_lowercase();
-    [
-        "not found",
-        "does not exist",
-        "no such file",
-        "cannot read",
-        "can't read",
-        "unreadable",
-        "failed to read",
-    ]
-    .iter()
-    .any(|needle| message.contains(needle))
+    error.downcast_ref::<rovai_core::runtime::NativeSessionResumeFailure>()
+        == Some(&rovai_core::runtime::NativeSessionResumeFailure::Incompatible)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,7 +313,7 @@ pub(crate) struct PiHost {
 }
 
 struct PiHostLaunch<'a> {
-    environment: Option<&'a rovai_core::member_environment::FrozenEnvironment>,
+    environment: Option<&'a rovai_core::member_environment::LaunchEnvironment>,
     executable: &'a Path,
     cwd: &'a Path,
     private_runtime_dir: &'a Path,
@@ -520,7 +504,7 @@ fn configure_host_working_directory(command: &mut Command, cwd: &Path) -> Result
 
 impl PiHost {
     async fn spawn(launch: PiHostLaunch<'_>) -> Result<Arc<Self>> {
-        rovai_core::runtime_discovery::with_frozen_environment(
+        rovai_core::runtime_discovery::with_launch_environment(
             launch.environment.cloned(),
             Self::spawn_in_environment(launch),
         )
@@ -991,7 +975,14 @@ impl PiHost {
         if let Some(expected_session_id) = seed.expected_native_session_id.as_deref() {
             let locator = read_session_locator(locator_root, expected_session_id, &self.cwd)
                 .map_err(|error| {
-                    activation_failure(PiActivationFailureKind::ResumeContinuityLost, error)
+                    activation_failure(
+                        if switch_target_is_explicitly_unavailable(&error) {
+                            PiActivationFailureKind::ResumeContinuityLost
+                        } else {
+                            PiActivationFailureKind::ActivationFailed
+                        },
+                        error,
+                    )
                 })?;
             let response = match self
                 .command(
@@ -1046,7 +1037,7 @@ impl PiHost {
         )
         .map_err(|error| {
             activation_failure(
-                if exact_resume {
+                if exact_resume && switch_target_is_explicitly_unavailable(&error) {
                     PiActivationFailureKind::ResumeContinuityLost
                 } else {
                     PiActivationFailureKind::ActivationFailed
@@ -1163,16 +1154,7 @@ impl PiHost {
             locator_root,
             &self.cwd,
         )
-        .map_err(|error| {
-            activation_failure(
-                if exact_resume {
-                    PiActivationFailureKind::ResumeContinuityLost
-                } else {
-                    PiActivationFailureKind::ActivationFailed
-                },
-                error,
-            )
-        })?;
+        .map_err(|error| activation_failure(PiActivationFailureKind::ActivationFailed, error))?;
         if session_id != activated_session_id || session_file != activated_session_file {
             return Err(activation_failure(
                 PiActivationFailureKind::ActivationFailed,
@@ -1786,6 +1768,7 @@ impl PiRpcRuntimeAdapter {
         let spawn_incoming = self.incoming.clone();
         let spawn_builtin_tools = request.builtin_tools.clone();
         let spawn_environment = request.frozen_runtime.environment.clone();
+        let spawn_environment_source = rovai_core::member_environment::launch_source();
         let lease = self
             .fleet
             .acquire(
@@ -1796,15 +1779,16 @@ impl PiRpcRuntimeAdapter {
                     compatibility: RuntimeCompatibilityKey::member_session(
                         request.camp_id,
                         request.agent_id,
-                        request
-                            .frozen_runtime
-                            .environment
-                            .as_ref()
-                            .map(|env| env.plan_id.as_str()),
+                        Some(request.native_binding_id),
                         request.runtime_compatibility_digest,
                     ),
                 },
                 move || async move {
+                    let spawn_environment = rovai_core::member_environment::resolve_for_launch(
+                        spawn_environment_source,
+                        spawn_environment,
+                    )
+                    .await?;
                     let host = PiHost::spawn(PiHostLaunch {
                         environment: spawn_environment.as_ref(),
                         executable: &spawn_executable,
@@ -2485,14 +2469,36 @@ fn scope_key(kind: &str, id: &str) -> Result<String> {
     canonical_json_digest(&json!({"kind": kind, "id": id}))
 }
 
-fn locator_path(root: &Path) -> PathBuf {
-    root.join("locator.json")
+fn locator_path(root: &Path, session_id: &str) -> Result<PathBuf> {
+    let id =
+        uuid::Uuid::parse_str(session_id).context("Pi locator Session ID is not a full UUID")?;
+    anyhow::ensure!(
+        id.hyphenated().to_string() == session_id,
+        "Pi locator Session ID is not canonical"
+    );
+    Ok(root.join(format!("{session_id}.json")))
 }
 
 fn read_session_locator(root: &Path, expected_id: &str, cwd: &Path) -> Result<PiSessionLocator> {
-    let path = locator_path(root);
-    let metadata =
-        std::fs::symlink_metadata(&path).context("Pi exact-resume locator is unavailable")?;
+    let mut path = locator_path(root, expected_id)?;
+    let metadata = match std::fs::symlink_metadata(&path) {
+        // Older versions kept one locator per member. Only a matching exact ID
+        // below can admit it; another Conversation's locator is never borrowed.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            path = root.join("locator.json");
+            std::fs::symlink_metadata(&path)
+        }
+        result => result,
+    }
+    .map_err(|error| {
+        let missing = error.kind() == std::io::ErrorKind::NotFound;
+        let error = anyhow::Error::new(error).context("Pi exact-resume locator is unavailable");
+        if missing {
+            error.context(rovai_core::runtime::NativeSessionResumeFailure::Incompatible)
+        } else {
+            error
+        }
+    })?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         bail!("Pi exact-resume locator is not a regular file");
     }
@@ -2513,7 +2519,7 @@ fn write_session_locator(
 ) -> Result<()> {
     validate_native_session_file(file, id, cwd, must_exist)?;
     write_private_json(
-        &locator_path(root),
+        &locator_path(root, id)?,
         &PiSessionLocator {
             schema_version: 2,
             session_id: id.to_string(),
@@ -2527,8 +2533,16 @@ fn validate_native_session_file(path: &Path, id: &str, cwd: &Path, must_exist: b
         bail!("Pi Session file path is not absolute");
     }
     let parent = path.parent().context("Pi Session file has no parent")?;
-    let parent_metadata =
-        std::fs::symlink_metadata(parent).context("Pi Session file parent is unavailable")?;
+    let parent_metadata = std::fs::symlink_metadata(parent)
+        .map_err(|error| {
+            if must_exist && error.kind() == std::io::ErrorKind::NotFound {
+                anyhow::Error::new(error)
+                    .context(rovai_core::runtime::NativeSessionResumeFailure::Incompatible)
+            } else {
+                anyhow::Error::new(error)
+            }
+        })
+        .context("Pi Session file parent is unavailable")?;
     if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
         bail!("Pi Session file parent is not a regular directory");
     }
@@ -2542,6 +2556,11 @@ fn validate_native_session_file(path: &Path, id: &str, cwd: &Path, must_exist: b
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if !must_exist && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow::Error::new(error)
+                .context("Pi Session file is unavailable")
+                .context(rovai_core::runtime::NativeSessionResumeFailure::Incompatible));
+        }
         Err(error) => return Err(error).context("Pi Session file is unavailable"),
     };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -2840,7 +2859,10 @@ mod tests {
                 command: "switch_session".to_string(),
                 message: message.to_string(),
             });
-            assert!(switch_target_is_explicitly_unavailable(&error));
+            assert!(
+                !switch_target_is_explicitly_unavailable(&error),
+                "diagnostic text is not a restore result"
+            );
         }
         for error in [
             anyhow::Error::new(PiRpcCommandRejected {
@@ -3513,7 +3535,7 @@ done
     }
 
     #[test]
-    fn session_header_scan_skips_malformed_and_unknown_records() {
+    fn session_header_scan_and_missing_exact_target_are_classified_without_text_guessing() {
         let root =
             std::env::temp_dir().join(format!("rovai-pi-session-scan-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
@@ -3528,6 +3550,60 @@ done
         )
         .unwrap();
         validate_native_session_file(&session, id, &root, true).unwrap();
+        let locator_root = root.join("locator");
+        std::fs::create_dir_all(&locator_root).unwrap();
+        write_private_json(
+            &locator_root.join("locator.json"),
+            &PiSessionLocator {
+                schema_version: 2,
+                session_id: id.into(),
+                session_file: session.to_string_lossy().into_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            read_session_locator(&locator_root, id, &root)
+                .unwrap()
+                .session_id,
+            id
+        );
+        let other_id = "00000000-0000-4000-8000-000000000088";
+        let wrong_legacy = read_session_locator(&locator_root, other_id, &root).unwrap_err();
+        assert!(
+            !switch_target_is_explicitly_unavailable(&wrong_legacy),
+            "another Conversation's legacy locator does not prove this target is missing"
+        );
+        assert!(locator_path(&locator_root, "../locator").is_err());
+        write_session_locator(&locator_root, id, &session, &root, true).unwrap();
+        std::fs::write(
+            locator_root.join("locator.json"),
+            "unreadable legacy locator",
+        )
+        .unwrap();
+        assert_eq!(
+            read_session_locator(&locator_root, id, &root)
+                .unwrap()
+                .session_id,
+            id,
+            "the scoped locator takes precedence over legacy data"
+        );
+        std::fs::remove_file(&session).unwrap();
+        assert!(switch_target_is_explicitly_unavailable(
+            &read_session_locator(&locator_root, id, &root).unwrap_err()
+        ));
+        let absent_parent = root.join("removed-directory").join("session.jsonl");
+        write_private_json(
+            &locator_path(&locator_root, id).unwrap(),
+            &PiSessionLocator {
+                schema_version: 2,
+                session_id: id.into(),
+                session_file: absent_parent.to_string_lossy().into_owned(),
+            },
+        )
+        .unwrap();
+        assert!(switch_target_is_explicitly_unavailable(
+            &read_session_locator(&locator_root, id, &root).unwrap_err()
+        ));
         std::fs::remove_dir_all(root).unwrap();
     }
 

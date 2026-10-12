@@ -6543,8 +6543,9 @@ impl ChannelService {
         }
         let provider = channel_host_provider(actor)
             .context("Channel Host actor does not identify a supported provider")?;
-        // Sealed cards must capture settled text, not the streaming position placeholder.
-        crate::execution_text::flush_settled(database)?;
+        // Request asynchronous text settlement. Console sealing separately checks
+        // persisted text readiness within the projection transaction below.
+        crate::execution_text::request_settlement(database);
         // Even an empty response can expire, settle or admit work. Keep all
         // maintenance and delivery claims atomic, but never journal the poll.
         let mut settled_run_ids = Vec::new();
@@ -10705,6 +10706,16 @@ fn materialize_execution_console(
         )
         .optional()?;
     let terminal = matches!(run_status, "succeeded" | "failed" | "cancelled");
+    // Streaming text rows are only durable positions; their accepted body is
+    // still buffered. Quiet time cannot prove that asynchronous finalization ran.
+    let text_settled = !terminal
+        || !transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_run_execution_evidence
+             WHERE agent_run_id = ?1 AND event_type = 'agent.text.block'
+               AND json_extract(payload_preview_json, '$.status') = 'streaming')",
+            [agent_run_id],
+            |row| row.get::<_, bool>(0),
+        )?;
     let live_state = if run_status == "queued" {
         "opening"
     } else {
@@ -10738,10 +10749,9 @@ fn materialize_execution_console(
                         params![console_id, next_sequence, digest, now],
                     )?;
                     (console_id, next_sequence, false)
-                } else if execution_console_terminal_quiet_window_elapsed(
-                    &previous_updated_at,
-                    now,
-                )? {
+                } else if text_settled
+                    && execution_console_terminal_quiet_window_elapsed(&previous_updated_at, now)?
+                {
                     let next_sequence = latest_sequence + 1;
                     let snapshot = capture_execution_console_snapshot(
                         transaction,
@@ -10794,7 +10804,7 @@ fn materialize_execution_console(
             // A descendant Run may be discovered only after its parent Request
             // settled or after a Host restart. Its terminal quiet window can
             // already have elapsed by the first projection.
-            let terminal_quiet_elapsed = if terminal {
+            let terminal_quiet_elapsed = if terminal && text_settled {
                 transaction
                     .query_row(
                         "SELECT ended_at FROM agent_run WHERE id = ?1",
@@ -21568,6 +21578,30 @@ mod tests {
             )
             .unwrap();
 
+        // Keep text maintenance paused while the channel observes terminal state.
+        // A Blob-sized body also proves the sealed snapshot pins the full payload.
+        database
+            .connection()
+            .execute(
+                "UPDATE agent_run SET status = 'running', execution_epoch = 1 WHERE id = ?1",
+                [&agent_run_id],
+            )
+            .unwrap();
+        let buffered_text = "异步正文🙂".repeat(4_000);
+        let store = ManagedBlobStore::new(database.directory());
+        let buffered = crate::execution_evidence::ExecutionEvidenceService
+            .record_runtime_event(
+                &mut database,
+                &store,
+                &agent_run_id,
+                1,
+                "agent.text.delta",
+                &json!({"itemId":"terminal-buffered-text", "delta":buffered_text}),
+            )
+            .unwrap()
+            .unwrap();
+        let buffered_id = buffered.payload["blockId"].as_str().unwrap().to_owned();
+
         let terminal_at = Utc::now().to_rfc3339();
         database
             .connection()
@@ -21654,7 +21688,7 @@ mod tests {
                     payload_preview_json, content_blob_id, content_byte_count,
                     is_truncated, occurred_at
                 ) VALUES (
-                    'terminal-console-late-evidence', ?1, 1, 2,
+                    'terminal-console-late-evidence', ?1, 1, 3,
                     'activity.completed', 'narration', 'completed',
                     '{"text":"late terminal evidence"}', NULL, 0, 0, ?2
                 )
@@ -21703,6 +21737,38 @@ mod tests {
                 ],
             )
             .unwrap();
+        let waiting_for_text = service
+            .host_tick(
+                &mut database,
+                &ActorRef::System {
+                    component_id: FEISHU_CHANNEL_HOST_COMPONENT.to_string(),
+                },
+                &ChannelHostTickRequest {
+                    worker_id: "terminal-console-paused-text-worker".to_string(),
+                    inbound_attachment_app_ids: Vec::new(),
+                    limit: 20,
+                },
+            )
+            .unwrap();
+        assert!(waiting_for_text.has_outstanding_work);
+        let (state, sealed): (String, Option<String>) = database.connection().query_row(
+            "SELECT state, terminal_snapshot_json FROM channel_execution_console WHERE agent_run_id = ?1",
+            [&agent_run_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(
+            state, "terminal_pending",
+            "quiet time cannot finalize buffered text"
+        );
+        assert!(sealed.is_none());
+        let maintenance = crate::execution_text::maintain_settled(&mut database);
+        assert!(maintenance.error.is_none());
+        assert!(
+            maintenance
+                .finalized
+                .iter()
+                .any(|evidence| evidence.id == buffered_id)
+        );
+
         let data_directory = database.directory().to_path_buf();
         database.close();
         let mut restarted = Database::open(&data_directory).unwrap();
@@ -21740,6 +21806,13 @@ mod tests {
             .unwrap()
             .expect("the recovered terminal snapshot must be readable");
         assert_eq!(sealed_source.state, "terminal_sealed");
+        let sealed_text = sealed_source
+            .evidence
+            .iter()
+            .find(|item| item.id == buffered_id)
+            .unwrap();
+        assert_eq!(sealed_text.payload["text"], buffered_text);
+        assert_eq!(sealed_text.payload["status"], "completed");
         assert!(
             sealed_source
                 .evidence

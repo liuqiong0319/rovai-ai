@@ -32,7 +32,7 @@ const stage = async n => { await b.evaluate(`__presence.setStage(${n})`); await 
 const scenario = async (name,n) => { await b.evaluate(`__presence.setScenario(${JSON.stringify(name)});__presence.setStage(${n})`); await settle() }
 const rest = async () => { await b.send('Input.dispatchMouseEvent',{type:'mouseMoved',x:4,y:4});await b.evaluate('document.activeElement?.blur()');await settle() }
 const row = '[data-presence-run="run-alice"]'
-const identity = () => b.evaluate(`(() => {const row=document.querySelector('${row}');return {continuation:row.dataset.continuation,avatar:!!row.querySelector('.member-avatar'),after:Array.from(document.querySelectorAll('[data-message-id]')).at(-1)?.dataset.messageId,top:row.getBoundingClientRect().top}})()`)
+const identity = () => b.evaluate(`(() => {const row=document.querySelector('${row}');return {continuation:row.dataset.continuation,avatar:!!row.querySelector('.member-avatar'),after:Array.from(document.querySelectorAll('[data-message-id]')).filter(e=>Boolean(e.compareDocumentPosition(row)&Node.DOCUMENT_POSITION_FOLLOWING)).at(-1)?.dataset.messageId,top:row.getBoundingClientRect().top}})()`)
 try {
   await b.send('Page.navigate',{url:pathToFileURL(join(root,'rovai-teammate-presence.html')).href})
   await b.wait('!!window.__presence && !!document.querySelector(".composer-box")')
@@ -40,7 +40,7 @@ try {
     for(let n=0;n<total;n++) {
       await scenario(name,n)
       const result=await b.evaluate('__presence.verify()')
-      for(const key of ['allMessagesPresent','messagesInOrder','uniqueMessages','slotsAreNotMessages','noQueuedPlaceholders','noCompletedRows','uniqueRuns','allAfterLatestMessage','independentActivityRows','compactRows','identityMatchesRun','commandIconsMatchContent','retryOnlyOnFailure']) assert.equal(result[key],true,`${name}/${n}/${key}`)
+      for(const key of ['allMessagesPresent','messagesInOrder','uniqueMessages','slotsAreNotMessages','noQueuedPlaceholders','noCompletedRows','uniqueRuns','anchoredOrder','independentActivityRows','compactRows','identityMatchesRun','commandIconsMatchContent','retryOnlyOnFailure']) assert.equal(result[key],true,`${name}/${n}/${key}`)
       assert.equal(result.overflow,false)
       report.scenarios.push({name,stage:n,...result})
     }
@@ -54,7 +54,7 @@ try {
   const first=await sample();await b.capture(join(out,'stream-start.png'));await pause(600);const second=await sample()
   assert.ok(second.text.length>first.text.length)
   assert.ok(second.raw.length>first.raw.length)
-  assert.equal(second.text,second.raw.replace(/\s+/g,' ').trim())
+  assert.equal(second.text,second.raw.split(/\r\n?|\n/).findLast(line=>line.trim()).trim())
   assert.equal(first.height,second.height);assert.equal(first.top,second.top);assert.equal(second.sameNode,true);assert.deepEqual(second.ids,first.ids)
   await b.wait('document.querySelector(".run-presence-preview").scrollWidth>document.querySelector(".run-presence-preview").clientWidth')
   const overflow=await sample();assert.equal(overflow.height,first.height);assert.equal(overflow.top,first.top)
@@ -63,6 +63,7 @@ try {
   await b.capture(join(out,'stream-overflow.png'))
   report.interactions.push({streaming:'growing evidence; single-line ellipsis preserves beginning, first character and Stop position; no horizontal scrolling or vertical jump',samples:[first.text.length,second.text.length,overflow.text.length,laterOverflow.text.length],lineHeight:first.height})
 
+  await scenario('stream',0)
   await b.click('.run-presence-open');await settle()
   assert.match(await b.evaluate('document.querySelector(".camp-detail-popover").innerText'),/执行/)
   const beforeDetail=await b.evaluate('document.querySelector(".camp-detail-popover").innerText')
@@ -71,24 +72,46 @@ try {
   await b.capture(join(out,'stream-detail.png'));await b.key('Escape');await settle()
   report.interactions.push('full production Run detail receives the same incremental narration')
 
-  // B speaks while A is still active: A moves after B, with identity restored.
+  await scenario('stream',0)
+  const lineGeometry = () => b.evaluate('(() => {const r=document.querySelector(".run-presence-line").getBoundingClientRect(),s=document.querySelector(".run-presence-stop").getBoundingClientRect();return [r.x,r.y,r.height,s.x,s.y]})()')
+  const geometry = await lineGeometry()
+  for (const [source, expected] of [['第一行正在输出','第一行正在输出'],['第一行正在输出\n','第一行正在输出'],
+    ['第一行正在输出\n第二','第二'],['第一行正在输出\n第二行继续','第二行继续'],
+    ['第一行正在输出\r\n第二行继续\r\n\r\n第三行','第三行']]) {
+    await b.evaluate('__presence.showNarration(' + JSON.stringify(source) + ')'); await settle()
+    assert.equal(await b.evaluate('document.querySelector(".run-presence-preview").textContent'),expected)
+    assert.deepEqual(await lineGeometry(),geometry)
+  }
+  assert.equal(await b.evaluate('document.querySelectorAll(".run-presence-status.is-running").length'),0)
+  assert.equal(await b.evaluate('getComputedStyle(document.querySelector(".run-presence-preview .running-text-highlight")).animationName'),'running-text-sweep')
+  assert.equal(await b.evaluate('getComputedStyle(document.querySelector(".run-presence-preview .running-text-highlight")).animationDuration'),'2.4s')
+  await b.click('.run-presence-open'); await settle()
+  const complete = await b.evaluate('document.querySelector(".camp-detail-popover").textContent')
+  for (const text of ['第一行正在输出','第二行继续','第三行']) assert.ok(complete.includes(text))
+  await b.key('Escape'); await settle()
+  report.interactions.push('original LF/CRLF and blank lines advance narration in the same fixed row; RunningText replaces the circle; details preserve the complete source')
+
+  // A stays below its own reply while B speaks; only another A send moves A.
   await scenario('interleaved',2)
   let before=await identity();assert.equal(before.continuation,'true');assert.equal(before.avatar,false);assert.equal(before.after,'reply-alice')
   await b.evaluate(`window.savedRow=document.querySelector('${row}');document.querySelector('${row} .run-presence-open').focus()`)
   await b.capture(join(out,'same-run-continuation.png'))
   await stage(3)
-  let after=await identity();assert.equal(after.continuation,'false');assert.equal(after.avatar,true);assert.equal(after.after,'reply-review')
+  let after=await identity();assert.equal(after.continuation,'true');assert.equal(after.avatar,false);assert.equal(after.after,'reply-alice');assert.equal(after.top,before.top)
   assert.equal(await b.evaluate(`document.querySelector('${row}')===window.savedRow`),true)
   assert.equal(await b.evaluate(`document.activeElement===document.querySelector('${row} .run-presence-open')`),true)
   await rest();await b.capture(join(out,'other-member-interrupts.png'))
+  await b.evaluate('document.querySelector("[data-presence-run=run-alice] .run-presence-open").focus()')
   await stage(4)
   after=await identity();assert.equal(after.avatar,false);assert.equal(after.continuation,'true');assert.equal(after.after,'reply-alice-2')
+  assert.equal(await b.evaluate('document.querySelector("[data-presence-run=run-alice]")===window.savedRow'),true)
+  assert.equal(await b.evaluate('document.activeElement===document.querySelector("[data-presence-run=run-alice] .run-presence-open")'),true)
   await b.capture(join(out,'same-run-replies-again.png'))
   await stage(5);assert.equal(await b.evaluate('document.querySelectorAll(".conversation-run-presence").length'),0)
-  report.interactions.push('A reply → B interruption → A reply: tail moves forward; identity hidden/restored/hidden; live DOM and focus preserved')
+  report.interactions.push('A reply → B message → A reply: own anchor stays until next own send; live DOM and focus preserved')
 
   await scenario('same_member',1);assert.equal((await identity()).avatar,false)
-  await stage(2);assert.equal((await identity()).avatar,true);assert.equal((await identity()).after,'reply-alice-other')
+  await stage(2);assert.equal((await identity()).avatar,false);assert.equal((await identity()).after,'reply-alice')
   await b.capture(join(out,'same-member-other-run.png'))
   await stage(3);assert.equal((await identity()).avatar,false)
   report.interactions.push('identity continuity uses Run ID, not member identity')
@@ -97,11 +120,11 @@ try {
   await stage(1);assert.equal(await b.evaluate('__presence.getState().snapshot.agentRuns.some(r=>r.status==="queued")'),true)
   assert.equal(await b.evaluate('document.querySelectorAll(".conversation-run-presence").length'),1)
   await stage(2)
-  assert.deepEqual(await b.evaluate('Array.from(document.querySelectorAll(".conversation-run-presence")).map(e=>[e.dataset.presenceRun,e.dataset.continuation])'),[['run-audrey','true'],['run-alice','false']])
+  assert.deepEqual(await b.evaluate('Array.from(document.querySelectorAll(".conversation-run-presence")).map(e=>[e.dataset.presenceRun,e.dataset.continuation])'),[['run-alice','false'],['run-audrey','true']])
   await b.capture(join(out,'parallel-live-tail.png'))
-  await scenario('followup',2);assert.equal(await b.evaluate('document.querySelectorAll(".conversation-run-presence").length'),1);assert.equal((await identity()).after,'followup-2')
+  await scenario('followup',2);assert.equal(await b.evaluate('document.querySelectorAll(".conversation-run-presence").length'),1);assert.equal((await identity()).after,'request-main')
   await scenario('silent',2);assert.equal(await b.evaluate('document.querySelectorAll(".conversation-run-presence").length'),0)
-  report.interactions.push('queued inputs occupy no space; parallel continuation is first; silent completion leaves no completion row')
+  report.interactions.push('queued inputs occupy no space; parallel rows retain individual anchors; silent completion leaves no completion row')
 
   // Compare the actual message-action styles with the unchanged production view.
   await scenario('interleaved',3);await rest()
@@ -225,7 +248,9 @@ try {
   await b.evaluate('__presence.controls.holdEntrySnapshot=false;__presence.setStage(2)'); await settle()
   assert.equal(await b.evaluate('document.querySelectorAll(".conversation-run-presence").length'),0)
   assert.deepEqual(await waiting(),accepted)
-  await b.send('Page.reload'); await b.wait('!!window.__presence && !!document.querySelector(".composer-box")')
+  await b.evaluate('window.__presenceReloadPending = true')
+  await b.send('Page.reload')
+  await b.wait('!window.__presenceReloadPending && !!window.__presence && !!document.querySelector(".composer-box")')
   assert.equal(await b.evaluate('document.querySelectorAll(".conversation-run-presence").length'),0)
   assert.deepEqual(await waiting(),accepted)
   await b.capture(join(out,'accepted-retry-after-reload.png'))
@@ -291,6 +316,7 @@ try {
   await b.evaluate('document.querySelector(".run-presence-stop-dialog .danger-button").click()')
   await b.key('Escape');assert.equal(await b.evaluate('!!document.querySelector(".run-presence-stop-dialog")'),true)
   assert.equal(await b.evaluate('__presence.controls.stopAttempts.length'),stopCount+1)
+  assert.equal(await b.evaluate('document.querySelectorAll(\"[data-presence-run=run-alice] .running-text-highlight\").length'),0,'stop submission pauses the activity highlight')
   assert.deepEqual(await b.evaluate('__presence.controls.stopAttempts.at(-1)'),await b.evaluate('({id:"run-alice",version:__presence.getState().snapshot.agentRuns[0].version})'))
   await b.evaluate('__presence.controls.stopError=true;__presence.controls.holdStop=false')
   await b.wait('!document.querySelector(".run-presence-stop-dialog .danger-button").disabled')
@@ -310,8 +336,8 @@ try {
   await b.click('[aria-label="展开导航侧栏"]');await b.click('[contenteditable=true]');await b.key('Enter')
   await b.wait('document.querySelector("[contenteditable=true]").textContent.trim()===""')
   await b.wait('__presence.getState().snapshot.messages.some(m=>m.id.startsWith("local-")&&m.authorType==="agent")')
-  assert.equal((await b.evaluate('__presence.verify()')).allAfterLatestMessage,true)
-  report.interactions.push('streaming, themes, comparison and navigation preserve draft; sending moves the live tail after new messages')
+  assert.equal((await b.evaluate('__presence.verify()')).anchoredOrder,true)
+  report.interactions.push('streaming, themes, comparison and navigation preserve draft; only successful own messages advance each live row')
 
   for(const theme of ['day','night']) {
     await b.evaluate(`__presence.setTheme('${theme}')`)
@@ -340,10 +366,10 @@ try {
   report.interactions.push('coarse pointers retain a single line and expand the Stop target to 44px')
   await b.send('Emulation.setDeviceMetricsOverride',{width:1440,height:920,deviceScaleFactor:1,mobile:false})
   await scenario('stream',0);await b.send('Emulation.setEmulatedMedia',{features:[{name:'prefers-reduced-motion',value:'reduce'}]});await settle()
-  assert.equal(await b.evaluate('getComputedStyle(document.querySelector(".run-presence-status.is-running svg")).animationName'),'none')
+  assert.equal(await b.evaluate('getComputedStyle(document.querySelector(".run-presence-preview .running-text-highlight")).display'),'none')
   const reducedBefore=await b.evaluate('document.querySelector(".run-presence-preview").textContent');await pause(300)
   assert.notEqual(await b.evaluate('document.querySelector(".run-presence-preview").textContent'),reducedBefore)
-  report.interactions.push('reduced motion disables status rotation while real streamed text still updates')
+  report.interactions.push('reduced motion hides the RunCard highlight while real streamed text still updates')
   await b.capture(join(out,'night-stream.png'))
   await b.click('[aria-label="设计说明与源码依据"]');await settle();await b.capture(join(out,'notes.png'));await b.key('Escape')
 

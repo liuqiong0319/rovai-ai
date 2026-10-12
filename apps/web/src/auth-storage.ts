@@ -14,16 +14,34 @@ export interface AuthStorage {
 }
 export const TAB_AUTH_KEY = 'rovai.web.auth.v1'
 
-export function browserAuthStorage(origin: string): AuthStorage {
-  let database: Promise<IDBDatabase> | undefined
-  const open = () => database ??= new Promise<IDBDatabase>((resolve, reject) => {
-    const request = indexedDB.open('rovai-web-auth-v1', 1)
-    request.onupgradeneeded = () => request.result.createObjectStore('sessions')
-    request.onsuccess = () => resolve(request.result)
-    request.onerror = () => { database = undefined; reject(new Error('无法打开浏览器登录存储。')) }
+let database: Promise<IDBDatabase> | undefined
+const openBrowserDatabase = () => database ??= new Promise<IDBDatabase>((resolve, reject) => {
+  const request = indexedDB.open('rovai-web-auth-v1', 1)
+  request.onupgradeneeded = () => request.result.createObjectStore('sessions')
+  request.onsuccess = () => resolve(request.result)
+  request.onerror = () => { database = undefined; reject(new Error('无法打开浏览器登录存储。')) }
+})
+
+/** Serialize only active preference writes across tabs. The navigation JSON stays
+ * in localStorage; this existing IDB store holds no copy, queue or project data. */
+export async function withBrowserPreferenceWrite<T>(scope: string, update: () => T): Promise<T> {
+  const db = await openBrowserDatabase()
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction('sessions', 'readwrite')
+    const request = transaction.objectStore('sessions').get(`presentation:${scope}`)
+    let result: T
+    let failure: unknown
+    request.onsuccess = () => {
+      try { result = update() } catch (error) { failure = error; transaction.abort() }
+    }
+    transaction.oncomplete = () => resolve(result)
+    transaction.onerror = transaction.onabort = () => reject(failure ?? new Error('界面偏好暂时无法保存。'))
   })
+}
+
+export function browserAuthStorage(origin: string): AuthStorage {
   const access = async (update?: (value: BrowserSession | null, store: IDBObjectStore) => void): Promise<BrowserSession | null> => {
-    const db = await open()
+    const db = await openBrowserDatabase()
     return new Promise((resolve, reject) => {
       const transaction = db.transaction('sessions', update ? 'readwrite' : 'readonly')
       const store = transaction.objectStore('sessions')

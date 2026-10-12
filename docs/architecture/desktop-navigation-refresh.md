@@ -3,13 +3,13 @@ document_type: architecture
 architecture: desktop-navigation-refresh
 authority: desktop-navigation-invalidation-and-refresh-boundaries
 status: accepted
-last_updated: 2026-10-02
+last_updated: 2026-10-12
 ---
 
 # Desktop Navigation Refresh 架构
 
 本架构规定侧栏的单会话、单分组、完整快照读取与刷新边界。Core 拥有状态、排序、计数；Main-owned
-Navigation Preferences 拥有本机项目顺序和显示名称。字段见 [Navigation Read v1](../contracts/navigation-read-v1.md)。
+Navigation Preferences 拥有客户端目录清单、移除记录、项目顺序和显示名称。字段见 [Navigation Read v1](../contracts/navigation-read-v1.md)。
 
 ## Component authority
 
@@ -17,7 +17,7 @@ Navigation Preferences 拥有本机项目顺序和显示名称。字段见 [Navi
 | --- | --- |
 | Core Navigation Read Model | 从 camp 摘要与现有业务表读取；目标行按 ID、分组按索引前缀；同一事务取得窗口与总数 |
 | Core mutation boundary | 事件序号确定后，同事务维护所属 Camp 的活动/完成摘要；提交后发带 scope 的失效提示 |
-| Electron Main | 原样转发，不组装业务状态；schema 5 私有原子 JSON 保存 projectOrder/projectNames/threadReadStates |
+| Electron Main | 原样转发，不组装业务状态；schema 6 私有原子 JSON 保存目录、一次性完成标记与其他导航偏好 |
 | Renderer window reader + refresh coordinator | 一处合并行/组/完整范围，串行执行、trailing、退避与窗口旧响应保护 |
 | Foreground safety refresh | 保留前台约 20 秒与聚焦完整性兜底，从摘要取完整快照；隐藏时停止 |
 | Overview loader | 首次建立完整导航与其他页面基础；普通 Camp 切换不调用 Overview |
@@ -108,39 +108,36 @@ Migration 177 接受经核验的 v1.72/schema 126，升级到 schema 127，新�
 
 ## Sidecar Project order synchronization
 
-`navigation.json` schema 5 的 `projectOrder: string[] | null` 只保存 canonical
-`directory:<projectPath>` key。合法 schema 2 以 `null` 读取而不被视为损坏；`null` 与空数组不同，前者表示尚未
-首次冻结，后者表示已经在空列表上完成冻结。第一次同步按 Core 当前 Project 数组顺序写入所有未被本机移除的
-Project。后续每次同步执行同一确定性规则：
+目录清单与一次性旧项目补齐复用现有 Navigation Preferences；字段和失败语义见
+[Navigation Read v1](../contracts/navigation-read-v1.md#client-directory-preferences)。Core 只读取会话事实，
+不建目录登记表，不在业务事务自动补登，不增加登记服务、轮询或恢复队列。
 
-1. 从旧顺序删除本次列表中已不存在的 key；
-2. 保留其余 key 的原相对顺序；
-3. 把本次列表中尚未保存的 key 按发现顺序追加到末尾。
+Renderer 在启动成功取得完整导航后只尝试一次旧目录补齐，同时保留启动恢复前的旧选中空目录。
+完成标记与目录一起原子提交；失败继续展示可靠旧分组，只提示一次，下一次启动再尝试。成功后内存标记直接关闭整个
+旧补齐分支，不随刷新、切换或会话活动做集合扫描和同步。真正的目录选择／移除继续调用统一偏好写入口。
 
-相同结果不写文件。Project 的消息、Run、时间或未读变化不会改变 key 集合，因此不能移动 Project；Core 仍在每个
-Project 内按 `lastActivityAt`、global sequence 和 Camp ID 排列 Camp。刚选择但尚未形成 Core Project 的空目录由
-Renderer 作为新项追加到当前列表尾部；形成 Camp 后再进入相同同步规则。
-
-Project 本机移除会同时清理其顺序 key；重新选择或恢复后，它作为新发现项追加。偏好同步由与 pin/移除/恢复相同的
-Main 串行队列保护，Renderer 用 generation 忽略迟到返回。同步失败可以显示本机保存错误，但已经提交的 Core
-Navigation Snapshot 和协调器 generation 不回滚、不停止后续失效刷新。
+`projectOrder` 保留原相对顺序，登记新路径时追加，主动移除时清理；消息、Run 或会话归零不改变
+目录登记与顺序。合法旧 schema 的 `null` 顺序在一次补齐时按已有目录和完整 Core 分组顺序建立。
+已登记空目录和普通目录使用同一展示投影，别名仍由 `projectNames` 覆盖。
+Desktop 在实际修改时复用 Main 串行队列、最新偏好读取和原子写入；Web 复用既有 IndexedDB store 的
+短互斥事务来保护原 localStorage JSON，不把目录保存到数据库。普通会话路径只判断已加载的内存偏好。
 
 ## Local Project display names
 
 `projectNames: Record<string, string>` 使用既有 canonical `directory:<projectPath>` key 保存本机显示名称。
 合法 schema 2/3 在内存升级时补空映射，不因升级产生损坏提示，也不在读取时重写旧文件。schema 1 继续沿用
-已有恢复规则。后续成功写入输出 schema 5；名称与置顶、移除、恢复、顺序共用 Main 串行队列和原子文件写入。
+已有恢复规则。后续成功写入输出 schema 6；名称与置顶、移除、恢复、顺序共用 Main 串行队列和原子文件写入。
 写入失败保留旧快照；返回完整快照只发生在成功保存后。
 
 Main-owned `navigationPreferences.setProjectName(targetKey, name)` 接受字符串或 `null`；字符串去除首尾空白、
 合并连续空白，非空且最多 80 个 Unicode scalar；`null` 删除覆盖、恢复目录名。名称可重复，同名不同路径独立保存。
-移除项目、顺序同步中的暂时消失、无 Camp 的空目录均不删除名称；重新选择相同目录后恢复该名称。
+移除项目、会话刷新或无 Camp 的空目录均不删除名称；重新选择相同目录后恢复该名称。
 
-Renderer 在 Core 原始 Navigation Snapshot 之外建立名称展示投影，并在加入当前空目录后再次应用覆盖。
+Renderer 在 Core 原始 Navigation Snapshot 之外建立名称展示投影，并在加入已登记空目录后应用覆盖。
 侧栏/置顶、顶部、搜索、新建对话和定时任务项目选择共用该投影；Workspace inspection 返回的目录名称不会覆盖
 已保存的显示名称。重命名不调用 Core mutation、Workspace inspection 或 Runtime；不修改项目路径、Camp ID、
 消息、队员、记忆、Native Session、执行状态、活动时间或排序。渠道项目目录仍由既有 Core 投影拥有，本机别名不进入
-模型上下文或渠道配置。旧 Overview 名称读取通过改名 generation 隔离；顺序和置顶写入的返回不更新名称状态。
+模型上下文或渠道配置。所有导航偏好写入保持其他字段，并发布成功后的完整快照。
 
 ## Local Thread unread intent
 
@@ -189,7 +186,7 @@ preference 失败可以报告自己的错误，但不能停止 Navigation retry�
 - Overview 附属模块失败不禁用侧栏刷新；
 - Core 通知只在权威 mutation 已提交后发生。
 - schema 2 第一次进入时冻结旧显示顺序，合法升级不产生偏好损坏提示；
-- 老 Project 的消息活动不改顺序，新 Project 追加，消失或本机移除的 Project 清理；
+- 老 Project 的消息活动不改顺序，新 Project 追加，只有本机主动移除的 Project 清理；
 - Sidecar Project 稳定顺序不改变 Project 内 Camp 最近活动、时间、marker 或未读更新。
 - 改名后刷新与重启保留，独立路径互不覆盖，保存失败可重试；目录和 Camp/Runtime 身份不变。
 

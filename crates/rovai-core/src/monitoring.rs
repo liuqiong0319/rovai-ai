@@ -22,6 +22,28 @@ use crate::{
 };
 
 const USAGE_SCHEMA_VERSION: i64 = 2;
+
+pub(crate) const ASYNC_SETTLEMENT_TRIGGER: &str = "CREATE TRIGGER runtime_usage_agent_run_terminal
+    AFTER UPDATE OF status ON agent_run
+    WHEN NEW.status IN ('succeeded', 'failed', 'cancelled')
+     AND OLD.status NOT IN ('succeeded', 'failed', 'cancelled')
+    BEGIN
+        UPDATE runtime_usage_run_summary
+        SET finalized_at = COALESCE(finalized_at, NEW.ended_at, NEW.updated_at)
+        WHERE collection_epoch = (SELECT collection_epoch FROM runtime_usage_collection_state WHERE singleton_id = 1)
+          AND agent_run_id = NEW.id;
+    END";
+
+pub(crate) fn async_settlement_schema_matches(
+    connection: &rusqlite::Connection,
+) -> rusqlite::Result<bool> {
+    let actual: Option<String> = connection.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='runtime_usage_agent_run_terminal'",
+        [], |row| row.get(0),
+    ).optional()?;
+    let normalize = |sql: &str| sql.split_whitespace().collect::<String>();
+    Ok(actual.as_deref().map(normalize) == Some(normalize(ASYNC_SETTLEMENT_TRIGGER)))
+}
 const USAGE_PARSER_VERSION: i64 = 5;
 const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const CHECKPOINT_TTL_HOURS: i64 = 72;
@@ -305,6 +327,7 @@ pub enum RuntimeUsageFlushTarget {
 #[derive(Debug, Default)]
 pub struct RuntimeUsageBuffer {
     runs: BTreeMap<UsageRunKey, RuntimeUsageRun>,
+    finished: BTreeSet<UsageRunKey>,
     pending: BTreeMap<BufferedUsageKey, Vec<BufferedUsageRecord>>,
     pending_since: BTreeMap<UsageRunKey, Instant>,
     seen_source_identities: BTreeSet<(BufferedUsageKey, String)>,
@@ -315,6 +338,24 @@ pub struct RuntimeUsageBuffer {
 }
 
 impl RuntimeUsageBuffer {
+    pub fn finish_run(&mut self, agent_run_id: &str, execution_epoch: i64) {
+        let key = UsageRunKey {
+            agent_run_id: agent_run_id.to_string(),
+            execution_epoch,
+        };
+        if self.runs.contains_key(&key) {
+            self.finished.insert(key);
+        }
+    }
+
+    pub fn accepts_native_poll(&self, agent_run_id: &str, execution_epoch: i64) -> bool {
+        let key = UsageRunKey {
+            agent_run_id: agent_run_id.to_string(),
+            execution_epoch,
+        };
+        self.runs.contains_key(&key) && !self.finished.contains(&key)
+    }
+
     pub fn register_run(&mut self, run: RuntimeUsageRun) {
         self.runs.insert(run.key.clone(), run);
     }
@@ -471,13 +512,14 @@ impl RuntimeUsageBuffer {
             .into_iter()
             .collect(),
             RuntimeUsageFlushTarget::All => self.runs.keys().cloned().collect(),
-            RuntimeUsageFlushTarget::Periodic => BTreeSet::new(),
+            RuntimeUsageFlushTarget::Periodic => self.finished.clone(),
         };
         let idle = candidates
             .into_iter()
             .filter(|run| !self.pending_since.contains_key(run))
             .collect::<BTreeSet<_>>();
         self.runs.retain(|run, _| !idle.contains(run));
+        self.finished.retain(|run| !idle.contains(run));
         self.seen_source_identities
             .retain(|(key, _)| !idle.contains(&key.run));
         self.latest_context_sources
@@ -1151,6 +1193,9 @@ fn persist_usage_record(
                     // native delegated Sessions. Reuse the existing partial
                     // quality instead of advertising a complete Run total.
                     && record.usage.dialect_id != "opencode-acp-root-prompt-usage-v2"
+                    // Native journals are sampled asynchronously; neither the
+                    // initial cursor nor the final tail is a completion barrier.
+                    && record.usage.identity_suffix != "native_model_call"
                     && existing.as_ref().is_none_or(|checkpoint| {
                         record.usage.counter_mode == RuntimeUsageCounterMode::Delta
                             || (checkpoint.baseline.prompt_input_total_tokens.is_some()
@@ -1814,13 +1859,8 @@ fn finalize_run_in_transaction(
     collection_epoch: &str,
     agent_run_id: &str,
 ) -> Result<bool> {
-    transaction.execute(
-        r#"
-        DELETE FROM runtime_usage_checkpoint
-        WHERE collection_epoch = ?1 AND agent_run_id = ?2
-        "#,
-        params![collection_epoch, agent_run_id],
-    )?;
+    // Late periodic batches still need the baseline and deduplication keys.
+    // The existing bounded retention job owns checkpoint removal.
     let changed = transaction.execute(
         r#"
         UPDATE runtime_usage_run_summary
@@ -4687,12 +4727,17 @@ mod tests {
                             )
                             .unwrap();
                     }
+                    if index + 1 == calls.len() {
+                        assert!(buffer.accepts_native_poll(&run.key.agent_run_id, 1));
+                        buffer.finish_run(&run.key.agent_run_id, 1);
+                        assert!(!buffer.accepts_native_poll(&run.key.agent_run_id, 1));
+                    }
                     if index + 1 == calls.len() || partition & (1 << index) != 0 {
                         if let Some(batches) = failed.take() {
                             // Older failed records precede newer arrivals, including baselines/resets.
                             buffer.restore(batches).unwrap();
                         }
-                        let batches = buffer.drain(RuntimeUsageFlushTarget::All);
+                        let batches = buffer.drain(RuntimeUsageFlushTarget::Periodic);
                         if !injected_failure {
                             database.connection().execute_batch("CREATE TEMP TRIGGER reject_usage_flush BEFORE INSERT ON runtime_usage_checkpoint BEGIN SELECT RAISE(ABORT, 'injected usage flush failure'); END;").unwrap();
                             assert!(
@@ -4708,6 +4753,10 @@ mod tests {
                                 !observed,
                                 "summary and checkpoint writes must roll back together"
                             );
+                            assert!(
+                                buffer.runs.contains_key(&run.key),
+                                "failed flush keeps its owner"
+                            );
                             injected_failure = true;
                             if index + 1 < calls.len() {
                                 failed = Some(batches);
@@ -4715,8 +4764,10 @@ mod tests {
                             }
                         }
                         buffer.restore(batches).unwrap();
-                        let batches = buffer.drain(RuntimeUsageFlushTarget::All);
+                        let batches = buffer.drain(RuntimeUsageFlushTarget::Periodic);
                         MonitoringService::record_usage_batches(&mut database, &batches).unwrap();
+                        buffer.finish_idle_target_after_flush(&RuntimeUsageFlushTarget::Periodic);
+                        assert_eq!(buffer.runs.contains_key(&run.key), index + 1 < calls.len());
                         if mode == RuntimeUsageCounterMode::Delta {
                             assert_eq!(
                                 MonitoringService::record_usage_batches(&mut database, &batches)
@@ -4752,7 +4803,7 @@ mod tests {
     }
 
     #[test]
-    fn cumulative_checkpoint_dedupes_resets_and_fences_resume_before_terminal() {
+    fn cumulative_checkpoint_dedupes_resets_resume_and_late_terminal_batches() {
         let directory = std::env::temp_dir().join(format!(
             "rovai-runtime-usage-checkpoint-{}",
             uuid::Uuid::new_v4()
@@ -4874,7 +4925,27 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(checkpoint_count, 0);
+        assert_eq!(
+            checkpoint_count, 2,
+            "terminal retains both execution baselines"
+        );
+        persist(&mut database, &resumed, "event-resume-advance", 100, 25, 10);
+        persist(
+            &mut database,
+            &resumed,
+            "late-terminal-advance",
+            120,
+            30,
+            12,
+        );
+        persist(
+            &mut database,
+            &resumed,
+            "late-terminal-advance",
+            120,
+            30,
+            12,
+        );
         let retained: (Option<i64>, Option<i64>, Option<i64>, bool) = database
             .connection()
             .query_row(
@@ -4883,7 +4954,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(retained, (Some(90), Some(30), Some(17), true));
+        assert_eq!(retained, (Some(110), Some(35), Some(19), true));
         database.connection().execute("INSERT INTO runtime_usage_run_summary(collection_epoch,agent_run_id,runtime_kind,parser_version,eligible_mask,input_semantics,enrolled_at) VALUES(?1,'claude-run','claude-code-cli',2,127,'unknown',?2)", params![epoch, started_at]).unwrap();
         let mut claude_run = run.clone();
         claude_run.key.agent_run_id = "claude-run".into();

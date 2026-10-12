@@ -69,16 +69,6 @@ impl NativeUsageReader {
             Self::OpenCode(reader) => reader.poll(),
         }
     }
-
-    pub(crate) fn poll_prompt_end(&mut self) -> Vec<NativeUsageObservation> {
-        let mut observed = self.poll();
-        // Kimi's step.end journal append can follow the ACP response. Keep the
-        // current Run's cursor until this bounded tail read; a successor prompt
-        // may only establish its baseline after the terminal flush completes.
-        std::thread::sleep(std::time::Duration::from_millis(400));
-        observed.extend(self.poll());
-        observed
-    }
 }
 
 pub(crate) struct NativeJsonlUsageReader {
@@ -1905,21 +1895,16 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let late_path = path.clone();
-            let late = line("late-terminal");
-            let writer = std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(75));
-                let mut file = OpenOptions::new().append(true).open(late_path).unwrap();
-                write!(file, "{late}").unwrap();
-                file.flush().unwrap();
-            });
             assert!(terminal.poll().is_empty());
+            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            write!(file, "{}", line("late-terminal")).unwrap();
+            file.flush().unwrap();
             assert_eq!(
-                terminal.poll_prompt_end().len(),
+                terminal.poll().len(),
                 1,
-                "ACP completion may precede the native journal tail"
+                "a later background read can collect the journal tail"
             );
-            writer.join().unwrap();
+            drop(file);
             assert!(terminal.poll().is_empty());
             fs::remove_dir_all(root).unwrap();
         }

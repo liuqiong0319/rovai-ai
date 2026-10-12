@@ -1,10 +1,15 @@
 ---
 document_type: research-report
 status: implemented
-last_updated: 2026-10-11
+last_updated: 2026-10-12
 ---
 
 # 队员环境变量验收
+
+> 2026-10-12：以下保留 v58 会话环境实现的历史验收证据。当前方案 A 已由
+> [Runtime Launch v59](../contracts/runtime-launch-and-verification-v59.md)替代其生命周期语义；
+> 新结果与验证边界见[当前实施记录](../versions/v1.72/implementation-plan.md#队员环境按进程启动读取2026-10-12)。
+
 
 当前合同为 [Runtime Launch v58](../contracts/runtime-launch-and-verification-v58.md)，在 `e53665264` 基础上收敛为
 配置透传、会话创建时固定、显式重置后更新。本轮平台为 macOS arm64；所有验收使用独立目录、合成凭据或

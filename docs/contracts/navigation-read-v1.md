@@ -3,7 +3,7 @@ document_type: contract
 contract: navigation-read
 version: v1
 status: accepted
-last_updated: 2026-10-02
+last_updated: 2026-10-12
 ---
 
 # Navigation Read v1
@@ -30,6 +30,34 @@ NavigationCampItem 延续 schema 3 字段，并提供 `lastSeenGlobalSequence`�
 Renderer 的运行环沿用 loading，而未读独立使用最新回复与查看水位计算，允许运行和未读同时显示；
 `latestCompletionGlobalSequence` 的 wire 名称保留，其事实为已发布且未撤回的 Agent 回复，不要求 Run 已结束。
 
+## Client directory preferences
+
+Desktop 的 `navigation.json` 与 Web 既有 origin/Owner 偏好 JSON 是各自目录清单的唯一存储；
+不在 SQLite 登记目录，不跨客户端同步。schema 6 在旧 pins、removedProjects、projectOrder、
+projectNames、threadReadStates 上增补 `registeredProjects: string[]` 与 `legacyProjectsSynced: boolean`。
+路径沿用 Workspace 规范绝对路径；名称只读取既有别名映射。旧 schema 在内存补空数组和 false，不在读取时重写。
+
+`registerProjects(paths, completeLegacy=false)` 由同一个偏好写入口增量追加缺失目录，过滤最新移除记录；
+`completeLegacy=true` 在同一次原子保存中写清单和完成标记，已经完成则不改变清单。
+正常目录操作不重置完成标记。明确移除同时去掉登记和顺序并保留移除记录；明确恢复重新加入同一路径。
+合法空集合可以完成；读取失败的默认值不能完成。可选 `readError` 仅为读取结果的降级说明，不进入存储。
+
+启动在恢复当前选中项前保留旧选中空目录，只在内存标记未完成时，对启动成功取得的完整 Navigation
+项目元数据尝试一次补齐。别名残留不作为候选，不遍历消息或磁盘。失败保留未完成标记，等下次启动再尝试，
+导航刷新、新消息、切换与计时器不触发补齐。成功后退出兼容逻辑；普通会话读取保持原样。
+
+完成后项目入口来自登记清单，挂接普通 Navigation 会话窗口；无会话的已登记目录仍显示。
+未完成或读取降级时使用登记和普通会话项目的并集，过滤可靠的移除记录。
+显式选择目录、新建对话／使命的目录选择入口直接保存，成功后才展示和选择新目录；失败保留原选择，
+沿用现有提示告知未保存，用户再次添加即可重新尝试。不保留项目专属错误横幅、重试回调或临时目录恢复状态。
+旧项目未补齐时创建／删除会话可按内存集合补缺，完成后不再执行该检查，更不为判断标记而读取 JSON。
+可选补缺失败只提示一次；原有路径、权限和业务检查通过时会话继续。明确访问恢复仍须通过原有检查。
+
+所有写入基于最新可读偏好增量修改并保持其他字段，失败保留旧持久数据与已确认快照。
+Desktop 复用 Main 队列及私有原子文件写入；Web 在现有浏览器数据库上用短 readwrite 事务串行执行
+偏好读取／修改／localStorage 写入，事务不存目录、副本或后台队列。跨标签页与迟到启动补齐都不能撤销移除。
+损坏原文不被空默认值覆盖；后续明确添加仍经同一安全写入口读取最新偏好。`onChanged` 仅发布成功写入的完整偏好。
+
 ## Observed read acknowledgement
 
 `navigation.campViewed { campId, throughGlobalSequence }` 只确认已正式展示、可见且拥有焦点的 Camp；
@@ -42,7 +70,7 @@ Renderer 的运行环沿用 loading，而未读独立使用最新回复与查看
 
 ## Explicit local read intent
 
-`navigationPreferences` schema 5 另存本机 `threadReadStates`，每个稳定 Thread ID 的值为
+`navigationPreferences` schema 6 另存本机 `threadReadStates`，每个稳定 Thread ID 的值为
 `{ manualUnread: boolean, readThroughGlobalSequence: number }`；水位必须是非负安全整数。
 `setThreadReadState(threadId, state | null)` 原子保存并返回完整偏好快照；`null` 移除本机意图，非空值的 read-through
 与旧值取最大。`onChanged` 发布成功保存后的快照。schema 2/3/4 默认补空映射，不修改 Core schema 或已读存储。

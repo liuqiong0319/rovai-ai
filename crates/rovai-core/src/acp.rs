@@ -697,7 +697,7 @@ pub struct ObservedAcpToolContext {
 enum PendingRpc {
     Response {
         method: String,
-        sender: oneshot::Sender<std::result::Result<Value, String>>,
+        sender: oneshot::Sender<Result<Value>>,
     },
     Prompt {
         owner: AcpRuntimeOwner,
@@ -1295,6 +1295,14 @@ impl AcpRpcError {
     }
 }
 
+impl std::fmt::Display for AcpRpcError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.diagnostic())
+    }
+}
+
+impl std::error::Error for AcpRpcError {}
+
 #[derive(Clone)]
 struct ZcodeBackgroundRoute {
     owner: AcpRuntimeOwner,
@@ -1442,7 +1450,7 @@ impl AcpHost {
         private_runtime_dir: &Path,
         attachment_access_root: Option<&Path>,
     ) -> Result<Arc<Self>> {
-        rovai_core::runtime_discovery::with_frozen_environment(
+        rovai_core::runtime_discovery::with_launch_environment(
             frozen_runtime.environment.clone(),
             Self::spawn_in_environment(
                 cwd,
@@ -2219,7 +2227,7 @@ impl AcpHost {
         self.shutdown_and_reap().await;
         for (_, pending) in self.pending.lock().await.drain() {
             if let PendingRpc::Response { sender, .. } = pending {
-                let _ = sender.send(Err("ACP Host exited".to_string()));
+                let _ = sender.send(Err(anyhow::anyhow!("ACP Host exited")));
             }
         }
         for owner in self.owners().await {
@@ -2254,6 +2262,19 @@ impl AcpHost {
         };
         match pending {
             PendingRpc::Response { sender, .. } => {
+                // Keep the machine-readable rejection through the correlated RPC.
+                // Diagnostic fields still cross the same credential redaction boundary.
+                let response = match response_error {
+                    Some(error) => Err(anyhow::Error::new(AcpRpcError {
+                        code: error.code,
+                        structured_code: error.structured_code.map(|code| self.redact_text(&code)),
+                        message: self.redact_text(&error.message),
+                        provider_detail: error
+                            .provider_detail
+                            .map(|detail| self.redact_text(&detail)),
+                    })),
+                    None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
+                };
                 let _ = sender.send(response);
             }
             PendingRpc::Prompt {
@@ -3112,7 +3133,7 @@ impl AcpHost {
         };
         for request in rejected {
             if let PendingRpc::Response { sender, .. } = request {
-                let _ = sender.send(Err(reason.clone()));
+                let _ = sender.send(Err(anyhow::anyhow!("{reason}")));
             }
         }
     }
@@ -3690,7 +3711,10 @@ impl AcpHost {
                 bail!("ACP request timed out: {method}");
             }
         };
-        response.map_err(|message| anyhow::anyhow!("{method}: {message}"))
+        response.map_err(|error| {
+            let diagnostic = format!("{method}: {error}");
+            error.context(diagnostic)
+        })
     }
 
     async fn prepare_prompt(
@@ -4130,7 +4154,7 @@ pub struct AcpRuntime {
     session_permissions: AcpSessionPermissions,
     dsh_model_source: Option<rovai_core::agent_profile::DshModelSource>,
     active_observation: Mutex<Option<AcpPromptObservation>>,
-    native_usage: Mutex<Option<Arc<std::sync::Mutex<NativeUsageReader>>>>,
+    native_usage: Arc<Mutex<Option<Arc<std::sync::Mutex<NativeUsageReader>>>>>,
 }
 
 pub(crate) use rovai_core::agent_runtime_adapter::LiveModelValidationError as AcpLiveModelValidationError;
@@ -4293,7 +4317,7 @@ impl AcpRuntime {
             session_permissions,
             dsh_model_source,
             active_observation: Mutex::new(None),
-            native_usage: Mutex::new(None),
+            native_usage: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -4463,41 +4487,64 @@ impl AcpRuntime {
                     )
                     .await
                     .context(AcpSessionRestoreError)?;
-                let method = if continuation == AcpSessionContinuation::Resume {
+                let mut method = if continuation == AcpSessionContinuation::Resume {
                     "session/resume"
                 } else {
                     "session/load"
                 };
-                let params = if continuation == AcpSessionContinuation::Resume {
-                    build_acp_resume_session_params(
-                        self.host.adapter_kind,
-                        existing_session_id,
-                        &cwd,
-                        &mcp_servers,
-                        &additional_directories,
-                    )
-                } else {
-                    let mut params = json!({
-                        "sessionId": existing_session_id,
-                        "cwd": cwd,
-                        "mcpServers": mcp_servers,
-                    });
-                    if self.host.adapter_kind != AdapterKind::CursorAgent {
-                        params["additionalDirectories"] = json!(additional_directories);
-                    }
-                    params
-                };
-                let result = match self
-                    .host
-                    .rpc_with_timeout(method, params, ACP_HISTORY_RESTORE_TIMEOUT)
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(error) => {
-                        self.host
-                            .unbind_session(existing_session_id, &self.owner)
-                            .await;
-                        return Err(error.context(AcpSessionRestoreError));
+                let result = loop {
+                    let params = if method == "session/resume" {
+                        build_acp_resume_session_params(
+                            self.host.adapter_kind,
+                            existing_session_id,
+                            &cwd,
+                            &mcp_servers,
+                            &additional_directories,
+                        )
+                    } else {
+                        let mut params = json!({
+                            "sessionId": existing_session_id,
+                            "cwd": cwd,
+                            "mcpServers": mcp_servers,
+                        });
+                        if self.host.adapter_kind != AdapterKind::CursorAgent {
+                            params["additionalDirectories"] = json!(additional_directories);
+                        }
+                        params
+                    };
+                    match self
+                        .host
+                        .rpc_with_timeout(method, params, ACP_HISTORY_RESTORE_TIMEOUT)
+                        .await
+                    {
+                        Ok(result) => break result,
+                        Err(error) => {
+                            // -32601 on this exact restore request means the advertised
+                            // method is unavailable. Try an advertised, supported load
+                            // alternative once before declaring that no restore method exists.
+                            let method_unavailable = error
+                                .downcast_ref::<AcpRpcError>()
+                                .is_some_and(|error| error.code == Some(-32601));
+                            if method_unavailable
+                                && method == "session/resume"
+                                && capabilities.can_load_history
+                                && history_restore_allowed(self.host.adapter_kind)
+                            {
+                                method = "session/load";
+                                continue;
+                            }
+                            self.host
+                                .unbind_session(existing_session_id, &self.owner)
+                                .await;
+                            let error = if method_unavailable {
+                                error.context(
+                                    rovai_core::runtime::NativeSessionResumeFailure::Incompatible,
+                                )
+                            } else {
+                                error
+                            };
+                            return Err(error.context(AcpSessionRestoreError));
+                        }
                     }
                 };
                 if let Some(returned_session_id) = result.get("sessionId").and_then(Value::as_str)
@@ -4888,47 +4935,42 @@ impl AcpRuntime {
             .host
             .prepare_prompt(&session_id, &self.owner, delivery_id)
             .await?;
-        let kind = self.adapter_kind();
-        let workspace = self.execution_root.clone();
-        let native_session = session_id.clone();
-        let context_model = match kind {
-            AdapterKind::CodebuddyCli => self
-                .session_result
-                .read()
+        if self.native_usage_selected().await {
+            let kind = self.adapter_kind();
+            let workspace = self.execution_root.clone();
+            let native_session = session_id.clone();
+            let session_result = self.session_result.read().await.clone();
+            let model_id = self.observed_model_id().await;
+            let executable_path = self.host.executable_path.clone();
+            let native_usage = self.native_usage.clone();
+            // Optional journal baseline I/O cannot delay dispatch or a successor.
+            // An initialization that finishes late may omit early usage.
+            tokio::spawn(async move {
+                let context_model = match kind {
+                    AdapterKind::CodebuddyCli => {
+                        session_result.as_ref().and_then(codebuddy_context_model)
+                    }
+                    AdapterKind::QoderCli => {
+                        model_id.and_then(crate::native_usage::qoder_context_model)
+                    }
+                    AdapterKind::TraeCnCli => match model_id {
+                        Some(id) => {
+                            Some(trae_context_model(&executable_path, &workspace, id).await)
+                        }
+                        None => None,
+                    },
+                    _ => None,
+                };
+                let reader = tokio::task::spawn_blocking(move || {
+                    NativeUsageReader::for_prompt(kind, &workspace, &native_session, context_model)
+                        .map(|reader| Arc::new(std::sync::Mutex::new(reader)))
+                })
                 .await
-                .as_ref()
-                .and_then(codebuddy_context_model),
-            AdapterKind::QoderCli => {
-                if let Some(model_id) = self.observed_model_id().await {
-                    crate::native_usage::qoder_context_model(model_id)
-                } else {
-                    None
-                }
-            }
-            AdapterKind::TraeCnCli => {
-                if let Some(model_id) = self.observed_model_id().await {
-                    Some(trae_context_model(&self.host.executable_path, &workspace, model_id).await)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
-        let terminal_usage = kind == AdapterKind::OpencodeCli
-            && crate::opencode_compat::Generation::from_version(
-                self.host.reported_version.as_deref(),
-            ) == Some(crate::opencode_compat::Generation::V2);
-        *self.native_usage.lock().await = if terminal_usage {
-            None
-        } else {
-            tokio::task::spawn_blocking(move || {
-                NativeUsageReader::for_prompt(kind, &workspace, &native_session, context_model)
-                    .map(|reader| Arc::new(std::sync::Mutex::new(reader)))
-            })
-            .await
-            .ok()
-            .flatten()
-        };
+                .ok()
+                .flatten();
+                *native_usage.lock().await = reader;
+            });
+        }
         if self.host.adapter_kind == AdapterKind::ClineCli {
             if let Err(error) = crate::cline::bind_prompt(
                 self.host
@@ -5314,7 +5356,18 @@ impl AcpRuntime {
     }
 
     pub(crate) async fn native_usage_selected(&self) -> bool {
-        self.native_usage.lock().await.is_some()
+        match self.adapter_kind() {
+            AdapterKind::CodebuddyCli
+            | AdapterKind::KimiCodeCli
+            | AdapterKind::QoderCli
+            | AdapterKind::TraeCnCli => true,
+            AdapterKind::OpencodeCli => {
+                crate::opencode_compat::Generation::from_version(
+                    self.host.reported_version.as_deref(),
+                ) != Some(crate::opencode_compat::Generation::V2)
+            }
+            _ => false,
+        }
     }
 
     pub(crate) async fn observed_context_window(&self) -> Option<i64> {
@@ -5336,7 +5389,7 @@ impl AcpRuntime {
         }
     }
 
-    pub(crate) async fn poll_native_usage(&self, prompt_end: bool) -> Vec<NativeUsageObservation> {
+    pub(crate) async fn poll_native_usage(&self) -> Vec<NativeUsageObservation> {
         if self.adapter_kind() == AdapterKind::ClineCli {
             let Some(session) = self.session_id().await else {
                 return Vec::new();
@@ -5349,13 +5402,7 @@ impl AcpRuntime {
         tokio::task::spawn_blocking(move || {
             reader
                 .lock()
-                .map(|mut reader| {
-                    if prompt_end {
-                        reader.poll_prompt_end()
-                    } else {
-                        reader.poll()
-                    }
-                })
+                .map(|mut reader| reader.poll())
                 .unwrap_or_default()
         })
         .await
@@ -5540,6 +5587,7 @@ impl AcpCliRuntimeAdapter {
         execution_epoch: i64,
         camp_id: &str,
         agent_id: &str,
+        native_binding_id: &str,
         workspace: &AgentRunWorkspace,
         permission_semantics: PermissionSemantics,
         frozen_runtime: &FrozenAgentRuntimeConfig,
@@ -5575,7 +5623,8 @@ impl AcpCliRuntimeAdapter {
         let execution_root = PathBuf::from(&workspace.execution_root);
         let spawn_execution_root = execution_root.clone();
         let spawn_workspace = workspace.clone();
-        let spawn_frozen_runtime = frozen_runtime.clone();
+        let mut spawn_frozen_runtime = frozen_runtime.clone();
+        let spawn_environment_source = rovai_core::member_environment::launch_source();
         let spawn_builtin_tools = builtin_tools.clone();
         let spawn_external_mcp_servers = external_mcp_servers.clone();
         let spawn_attachment_access_root = attachment_access_root.to_path_buf();
@@ -5585,10 +5634,7 @@ impl AcpCliRuntimeAdapter {
         let compatibility = RuntimeCompatibilityKey::member_session(
             camp_id,
             agent_id,
-            frozen_runtime
-                .environment
-                .as_ref()
-                .map(|env| env.plan_id.as_str()),
+            Some(native_binding_id),
             runtime_compatibility_digest,
         );
         if self.kind == AdapterKind::DeepseekHarness {
@@ -5610,6 +5656,19 @@ impl AcpCliRuntimeAdapter {
                     compatibility,
                 },
                 move || async move {
+                    spawn_frozen_runtime.environment =
+                        rovai_core::member_environment::resolve_for_launch(
+                            spawn_environment_source,
+                            spawn_frozen_runtime.environment,
+                        )
+                        .await?;
+                    if spawn_frozen_runtime
+                        .environment
+                        .as_ref()
+                        .is_some_and(|env| env.has_overlay())
+                    {
+                        spawn_frozen_runtime.custom_api = None;
+                    }
                     let host = AcpHost::spawn(
                         &spawn_execution_root,
                         &spawn_workspace,
@@ -9114,10 +9173,7 @@ while IFS= read -r ignored; do :; done
 
         let mut frozen = frozen_kimi_runtime(&executable);
         frozen.reported_version = Some("0.38.0".to_string());
-        frozen.environment = Some(rovai_core::member_environment::FrozenEnvironment {
-            plan_id: "protocol-fixture".into(),
-            revision: 1,
-            legacy_identity: None,
+        frozen.environment = Some(rovai_core::member_environment::LaunchEnvironment {
             values: Some(BTreeMap::from([
                 ("PATH".into(), "/usr/bin:/bin".into()),
                 ("AUTH_ENABLED".into(), "1".into()),
@@ -9245,8 +9301,12 @@ while IFS= read -r ignored; do :; done
         )
         .await;
         let detail = error_response.await.unwrap().unwrap_err();
-        assert!(!detail.contains("wire-stdout"));
-        assert!(detail.contains("failure 1"));
+        assert_eq!(
+            detail.downcast_ref::<AcpRpcError>().unwrap().code,
+            Some(-32000)
+        );
+        assert!(!detail.to_string().contains("wire-stdout"));
+        assert!(detail.to_string().contains("failure 1"));
 
         runtime.detach().await;
         host.shutdown().await;
@@ -9963,14 +10023,11 @@ done
             if let Some(value) = added_key {
                 values.insert("GROK_CODE_XAI_API_KEY".into(), value.into());
             }
-            let snapshot = rovai_core::member_environment::FrozenEnvironment {
-                plan_id: "grok-session-fixture".into(),
-                revision: 1,
-                legacy_identity: None,
+            let snapshot = rovai_core::member_environment::LaunchEnvironment {
                 values: Some(values),
                 overlay: None,
             };
-            rovai_core::runtime_discovery::with_frozen_environment(Some(snapshot), async {
+            rovai_core::runtime_discovery::with_launch_environment(Some(snapshot), async {
                 let mut command = Command::new("/bin/sh");
                 command.args(["-c", "printf '%s\\0%s\\0%s' \"$XAI_API_KEY\" \"${GROK_CODE_XAI_API_KEY-absent}\" \"$MINIMAX_API_KEY\""]);
                 rovai_core::runtime_discovery::configure_runtime_command(AdapterKind::GrokBuild, &mut command);
@@ -10914,7 +10971,7 @@ while IFS= read -r ignored; do :; done
                 ));
             }
             if message["params"]["update"]["sessionUpdate"] == "tool_call" {
-                let samples = runtime.poll_native_usage(false).await;
+                let samples = runtime.poll_native_usage().await;
                 for item in samples {
                     eprintln!(
                         "CLINE_LIVE_METRICS {}",
@@ -10923,7 +10980,7 @@ while IFS= read -r ignored; do :; done
                     live_usage.push(item.usage);
                 }
                 assert!(
-                    runtime.poll_native_usage(false).await.is_empty(),
+                    runtime.poll_native_usage().await.is_empty(),
                     "same native calls sampled twice"
                 );
             }
@@ -11900,6 +11957,7 @@ while IFS= read -r ignored; do :; done
                 1,
                 "camp-one",
                 "agent-one",
+                "fixture-binding",
                 &workspace,
                 PermissionSemantics::RuntimeManagedV2,
                 &frozen,
@@ -11936,6 +11994,7 @@ while IFS= read -r ignored; do :; done
                 1,
                 "camp-one",
                 "agent-one",
+                "fixture-binding",
                 &workspace,
                 PermissionSemantics::RuntimeManagedV2,
                 &frozen,
@@ -12066,6 +12125,7 @@ while IFS= read -r ignored; do :; done
                 1,
                 "camp-one",
                 "agent-one",
+                "fixture-binding",
                 &workspace,
                 PermissionSemantics::RuntimeManagedV2,
                 &frozen,
@@ -12140,6 +12200,7 @@ while IFS= read -r ignored; do :; done
                 1,
                 "camp-one",
                 "agent-one",
+                "fixture-binding",
                 &workspace,
                 PermissionSemantics::RuntimeManagedV2,
                 &next_frozen,

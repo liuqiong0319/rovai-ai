@@ -1,5 +1,5 @@
 import { isThreadId } from '@contracts'
-import { EMPTY_SNAPSHOT, sanitizeSnapshot, isProjectTargetKey, isStableId, isTimestamp, isRecord, isNavigationThreadReadState } from '../shared/navigation-preferences-model'
+import { EMPTY_SNAPSHOT, sanitizeSnapshot, isProjectTargetKey, isTimestamp, isNavigationThreadReadState, registerNavigationProjects, sourceMatchesSupportedSnapshot } from '../shared/navigation-preferences-model'
 import { readFile } from 'node:fs/promises'
 import type {
   NavigationPin,
@@ -49,40 +49,11 @@ async function readNavigationPreferencesResult(filePath: string): Promise<{
   }
 }
 
-function sourceMatchesSupportedSnapshot(
-  source: unknown,
-  snapshot: NavigationPreferencesSnapshot
-): boolean {
-  if (!isRecord(source)) return false
-  if (source.schemaVersion === 2) {
-    return JSON.stringify(source) === JSON.stringify({
-      schemaVersion: 2,
-      pins: snapshot.pins,
-      removedProjects: snapshot.removedProjects
-    })
-  }
-  if (source.schemaVersion === 3) {
-    return JSON.stringify(source) === JSON.stringify({
-      schemaVersion: 3,
-      pins: snapshot.pins,
-      removedProjects: snapshot.removedProjects,
-      projectOrder: snapshot.projectOrder
-    })
-  }
-  if (source.schemaVersion === 4) {
-    return JSON.stringify(source) === JSON.stringify({
-      schemaVersion: 4, pins: snapshot.pins, removedProjects: snapshot.removedProjects,
-      projectOrder: snapshot.projectOrder, projectNames: snapshot.projectNames
-    })
-  }
-  return JSON.stringify(source) === JSON.stringify(snapshot)
-}
-
 export class NavigationPreferencesStore {
   readonly #filePath: string
   readonly #now: () => string
   #snapshot: NavigationPreferencesSnapshot
-  readonly loadDegradation: StructuredError | null
+  loadDegradation: StructuredError | null
   #writeTail: Promise<void> = Promise.resolve()
 
   private constructor(
@@ -118,7 +89,18 @@ export class NavigationPreferencesStore {
   }
 
   get(): NavigationPreferencesSnapshot {
-    return structuredClone(this.#snapshot)
+    return { ...structuredClone(this.#snapshot), ...(this.loadDegradation ? { readError: this.loadDegradation.message } : {}) }
+  }
+
+  reload(): Promise<NavigationPreferencesSnapshot> {
+    return this.#enqueue(async () => this.get())
+  }
+
+  registerProjects(paths: string[], completeLegacy = false): Promise<NavigationPreferencesSnapshot> {
+    return this.#enqueue(async () => {
+      await this.#commit(registerNavigationProjects(this.#snapshot, paths, completeLegacy))
+      return this.get()
+    })
   }
 
   replacePins(pins: NavigationPin[]): Promise<NavigationPreferencesSnapshot> {
@@ -167,33 +149,6 @@ export class NavigationPreferencesStore {
     })
   }
 
-  synchronizeProjectOrder(projectKeys: string[]): Promise<NavigationPreferencesSnapshot> {
-    if (
-      !Array.isArray(projectKeys)
-      || !projectKeys.every(isProjectTargetKey)
-      || new Set(projectKeys).size !== projectKeys.length
-    ) {
-      return Promise.reject(new Error('Project navigation keys are invalid'))
-    }
-    return this.#enqueue(async () => {
-      const currentProjectKeys = new Set(projectKeys)
-      const retainedProjectKeys = this.#snapshot.projectOrder === null
-        ? []
-        : this.#snapshot.projectOrder.filter((projectKey) => currentProjectKeys.has(projectKey))
-      const retainedProjectKeySet = new Set(retainedProjectKeys)
-      const projectOrder = [
-        ...retainedProjectKeys,
-        ...projectKeys.filter((projectKey) => !retainedProjectKeySet.has(projectKey))
-      ]
-      const next = sanitizeSnapshot({
-        ...this.#snapshot,
-        projectOrder
-      })
-      await this.#commit(next)
-      return this.get()
-    })
-  }
-
   removeProject(
     targetKey: string,
     relatedThreadIds: string[]
@@ -215,6 +170,7 @@ export class NavigationPreferencesStore {
           (pin.kind === 'project' && pin.targetKey === targetKey)
           || (pin.kind === 'camp' && relatedThreadIdSet.has(pin.targetKey))
         )),
+        registeredProjects: this.#snapshot.registeredProjects.filter(path => `directory:${path}` !== targetKey),
         removedProjects: [
           ...this.#snapshot.removedProjects.filter(
             (project) => project.targetKey !== targetKey
@@ -237,6 +193,8 @@ export class NavigationPreferencesStore {
     return this.#enqueue(async () => {
       const next = {
         ...this.#snapshot,
+        registeredProjects: [...new Set([...this.#snapshot.registeredProjects, targetKey.slice('directory:'.length)])],
+        projectOrder: [...new Set([...(this.#snapshot.projectOrder ?? []), targetKey])],
         removedProjects: this.#snapshot.removedProjects.filter(
           (project) => project.targetKey !== targetKey
         )
@@ -258,6 +216,8 @@ export class NavigationPreferencesStore {
         pins: this.#snapshot.pins.filter((pin) => !(
           pin.kind === 'project' && pin.targetKey === project.targetKey
         )),
+        registeredProjects: this.#snapshot.registeredProjects.filter(path => `directory:${path}` !== project.targetKey),
+        projectOrder: this.#snapshot.projectOrder?.filter(key => key !== project.targetKey) ?? null,
         removedProjects: [
           ...this.#snapshot.removedProjects.filter(
             (candidate) => candidate.targetKey !== project.targetKey
@@ -271,13 +231,20 @@ export class NavigationPreferencesStore {
   }
 
   async #commit(next: NavigationPreferencesSnapshot): Promise<void> {
+    if (this.loadDegradation) throw new Error(this.loadDegradation.message)
     if (JSON.stringify(next) === JSON.stringify(this.#snapshot)) return
     await writePrivateJson(this.#filePath, next)
     this.#snapshot = next
   }
 
   #enqueue<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.#writeTail.then(operation, operation)
+    const update = async (): Promise<T> => {
+      const latest = await readNavigationPreferencesResult(this.#filePath)
+      this.loadDegradation = latest.degradation
+      if (!latest.degradation) this.#snapshot = latest.snapshot
+      return operation()
+    }
+    const result = this.#writeTail.then(update, update)
     this.#writeTail = result.then(() => undefined, () => undefined)
     return result
   }

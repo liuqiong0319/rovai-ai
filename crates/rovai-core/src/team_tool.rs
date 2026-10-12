@@ -205,6 +205,9 @@ pub struct BuiltinToolBindingCredential {
     pub native_session_id: Option<String>,
     pub binding_compatibility_digest: String,
     pub binding_replaced: bool,
+    pub previous_adapter_installation_id: Option<String>,
+    pub previous_native_session_id: Option<String>,
+    pub previous_binding_compatibility_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -712,7 +715,7 @@ impl TeamToolService {
         agent_run_id: &str,
         execution_epoch: i64,
         force_new_binding: bool,
-        allow_controlled_session_transition: bool,
+        _allow_controlled_session_transition: bool,
     ) -> Result<BuiltinToolBindingCredential> {
         if agent_run_id.trim().is_empty() || execution_epoch <= 0 {
             return Err(invocation_error(
@@ -723,6 +726,18 @@ impl TeamToolService {
         let transaction = database
             .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if force_new_binding
+            && !crate::run_continuation::can_replace_session_before_dispatch(
+                &transaction,
+                agent_run_id,
+                execution_epoch,
+            )?
+        {
+            return Err(invocation_error(
+                "team_tool.binding_fenced",
+                "Replacement requires a current execution with no dispatched input",
+            ));
+        }
         let now = camp_turn_execution_budget_now().to_rfc3339();
         let binding = transaction
             .query_row(
@@ -800,11 +815,11 @@ impl TeamToolService {
             conversation_id,
             current_binding_id,
             current_generation,
-            current_installation_id,
+            _current_installation_id,
             current_native_session_id,
-            current_compatibility_digest,
-            current_installation_generation,
-            current_session_compatibility_key,
+            _current_compatibility_digest,
+            _current_installation_generation,
+            _current_session_compatibility_key,
             conversation_version,
             adapter_kind,
             _capabilities,
@@ -827,26 +842,11 @@ impl TeamToolService {
         let frozen_installation_generation = frozen_installation_generation
             .context("Team Tool AgentRun has no frozen installation generation")?;
 
-        let stable_binding_identity = current_binding_id.is_some()
+        let current_kind =
+            crate::runtime::native_session_adapter_kind(&transaction, &conversation_id)?;
+        let compatible_binding = current_binding_id.is_some()
             && current_generation >= 1
-            && current_installation_id.as_deref() == Some(frozen_installation_id.as_str())
-            && current_compatibility_digest.as_deref()
-                == Some(frozen_compatibility_digest.as_str());
-        let session_metadata_compatible = match (
-            current_session_compatibility_key.as_deref(),
-            frozen_session_compatibility_key.as_deref(),
-        ) {
-            (Some(previous), Some(current)) => previous == current,
-            (None, None) => current_installation_generation.is_some_and(|generation| {
-                generation == frozen_installation_generation || current_native_session_id.is_some()
-            }),
-            _ => false,
-        };
-        let controlled_session_transition = allow_controlled_session_transition
-            && current_native_session_id.is_some()
-            && !session_metadata_compatible;
-        let compatible_binding = stable_binding_identity
-            && (session_metadata_compatible || controlled_session_transition);
+            && current_kind.is_none_or(|kind| Some(kind.as_str()) == adapter_kind.as_deref());
         let binding_replaced = force_new_binding || !compatible_binding;
         let binding_id = if binding_replaced {
             Uuid::new_v4().to_string()
@@ -877,11 +877,11 @@ impl TeamToolService {
             transaction.execute(
                 r#"
                 UPDATE conversation
-                SET native_adapter_installation_id = ?2,
-                    native_session_id = NULL,
-                    native_binding_compatibility_digest = ?3,
-                    native_installation_generation = ?11,
-                    native_session_compatibility_key = ?12,
+                SET native_adapter_installation_id = CASE WHEN native_session_id IS NULL THEN ?2 ELSE native_adapter_installation_id END,
+                    native_session_id = native_session_id,
+                    native_binding_compatibility_digest = CASE WHEN native_session_id IS NULL THEN ?3 ELSE native_binding_compatibility_digest END,
+                    native_installation_generation = CASE WHEN native_session_id IS NULL THEN ?11 ELSE native_installation_generation END,
+                    native_session_compatibility_key = CASE WHEN native_session_id IS NULL THEN ?12 ELSE native_session_compatibility_key END,
                     native_binding_id = ?4,
                     native_binding_generation = ?5,
                     native_binding_secret_digest = ?6,
@@ -981,6 +981,12 @@ impl TeamToolService {
                 }),
             )?;
         }
+        // Reserve tool credentials without replacing the durable restore target.
+        // The Adapter commits that target only after native activation succeeds.
+        let previous = transaction.query_row(
+            "SELECT native_adapter_installation_id, native_session_id, native_binding_compatibility_digest FROM conversation WHERE id=?1",
+            [&conversation_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
         transaction.commit()?;
         Ok(BuiltinToolBindingCredential {
             native_binding_id: binding_id,
@@ -995,6 +1001,9 @@ impl TeamToolService {
             native_session_id,
             binding_compatibility_digest: frozen_compatibility_digest,
             binding_replaced,
+            previous_adapter_installation_id: previous.0,
+            previous_native_session_id: previous.1,
+            previous_binding_compatibility_digest: previous.2,
         })
     }
 

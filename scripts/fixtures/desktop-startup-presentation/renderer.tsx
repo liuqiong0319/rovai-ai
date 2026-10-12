@@ -1,3 +1,4 @@
+import { EMPTY_SNAPSHOT, sanitizeSnapshot, registerNavigationProjects } from '../../../apps/desktop/src/shared/navigation-preferences-model'
 import type { NavigationSnapshot, NavigationPreferencesSnapshot } from '@contracts'
 import type { ThreadCreationPreflight, CoreEvent, DesktopStartupSnapshot, HealthStatus, OnboardingSnapshot, RestorableLocation, RovaiApi, SupervisorSnapshot } from '@contracts'
 import { createRoot, type Root } from 'react-dom/client'
@@ -64,6 +65,7 @@ function api(path = ''): unknown {
   return new Proxy(() => undefined, {
     get(_target, key) {
       if (path === '' && key === 'platform') return 'darwin'
+      if (path === '' && key === 'windowClose') return undefined
       return api(path ? `${path}.${String(key)}` : String(key))
     },
     apply(_target, _this, args) {
@@ -78,6 +80,19 @@ function api(path = ''): unknown {
       if (path === 'navigationPreferences.onChanged') {
         navigationPreferenceListeners.add(args[0])
         return () => navigationPreferenceListeners.delete(args[0])
+      }
+      if (path === 'navigationPreferences.registerProjects') {
+        calls.push(path)
+        if (requestHandlers.has(path)) return Promise.resolve().then(() => requestHandlers.get(path)!(args))
+        const next = registerNavigationProjects(sanitizeSnapshot(responses.get('navigationPreferences.get')), args[0], args[1])
+        responses.set('navigationPreferences.get', next)
+        navigationPreferenceListeners.forEach(listener => listener(next))
+        return Promise.resolve(next)
+      }
+      if (path === 'navigationPreferences.get' && requestHandlers.has(path)) { calls.push(path); return Promise.resolve().then(() => requestHandlers.get(path)!(args)) }
+      if (path === 'navigationPreferences.get' && responses.has(path)) {
+        calls.push(path)
+        return Promise.resolve(sanitizeSnapshot(responses.get(path)))
       }
       if (path === 'navigationPreferences.setThreadReadState') {
         const previous = responses.get('navigationPreferences.get') as NavigationPreferencesSnapshot
@@ -205,6 +220,86 @@ function noAuthority() {
 }
 
 Object.assign(window, { startupTest: {
+  async runProjects() {
+    const cases: string[] = []
+    const emptyNavigation: NavigationSnapshot = { schemaVersion: 3, throughGlobalSequence: 0, projects: [], quickChat: { totalCount: 0, recentThreads: [] } }
+    const group = (path: string) => ({ projectKey: `directory:${path}`, projectPath: path, name: path.split('/').at(-1)!, totalCount: 1, recentThreads: [], lastActivityAt: '', lastActivityGlobalSequence: 0 })
+    const health: HealthStatus = { core: { ok: true, version: 'fixture', dataDir: '/isolated/fixture' }, database: { ok: true, path: '/isolated/fixture/rovai.sqlite' }, git: { installed: true, version: 'fixture' }, hostPlatform: 'macos-arm64', runtimeCatalog: [], runtimePlatformAdmission: [], runtimeAvailability: [], searchEnvironment: { generation: 1, createdAt: '2026-08-31T00:00:00Z', pathEntryCount: 0, shell: { status: 'unavailable', interactive: false, shellName: null, entryCount: 0, elapsedMillis: 0 } } }
+    const boot = async (preferences: NavigationPreferencesSnapshot, navigation = emptyNavigation, setup?: () => void) => {
+      await reset({ kind: 'quick_chat' })
+      responses.set('health.check', health)
+      responses.set('members.list', [])
+      responses.set('runtime.installations.list', [])
+      responses.set('navigation.snapshot', navigation)
+      responses.set('navigationPreferences.get', preferences)
+      responses.set('memory.hearthReviewItems.list', [])
+      responses.set('threads.deletionIssues', [])
+      setup?.()
+      onboarding.resolve({ schemaVersion: 2, status: 'completed', origin: 'existing_installation', completedAt: '2026-08-31T00:00:00Z', selectedMemberRole: null, memberAgentId: null, quickChatThreadId: null })
+      publish({ runtimeMode: 'full_core', fullCoreState: 'ready', startupPhase: null, authorityState: { kind: 'current', origin: 'existing' }, capabilities: { ...supervisor.capabilities, authoritativeWorkspace: true, coreRequests: true } })
+      await flush()
+      for (let pass = 0; pass < 6 && !calls.includes('navigation.snapshot'); pass++) await advance(100)
+      await flush()
+    }
+    const saved = () => responses.get('navigationPreferences.get') as NavigationPreferencesSnapshot
+    const visible = (path: string) => !!document.querySelector(`[data-group="directory:${path}"]`)
+    const refresh = async () => {
+      coreListeners.forEach(listener => listener({ method: 'navigation.invalidated', params: { scope: 'all', reason: 'fixture' } }))
+      await advance(100); await flush()
+    }
+    const add = async (path: string) => {
+      responses.set('selectWorkspaceDirectory', { projectPath: path, name: path.split('/').at(-1)! })
+      const button = document.querySelector<HTMLButtonElement>('.section-create-button[aria-label="选择工作目录"]')
+      check(button && !button.disabled, 'Project add must remain available')
+      button.click(); await flush(); await flush()
+    }
+    localStorage.setItem('rovai.current-project.v1', JSON.stringify({ kind: 'directory', projectPath: '/old-empty' }))
+    await boot({ ...EMPTY_SNAPSHOT, projectNames: { 'directory:/old': '旧别名', 'directory:/alias-only': '残留' }, removedProjects: [{ targetKey: 'directory:/removed', removedAt: '2026-10-01T00:00:00Z' }] }, { ...emptyNavigation, projects: [group('/old'), group('/removed')] })
+    check(saved().legacyProjectsSynced && saved().registeredProjects.includes('/old-empty') && saved().registeredProjects.includes('/old'), 'Complete import preserves the old empty selection before startup changes it: ' + JSON.stringify({ saved: saved(), calls }))
+    check(!saved().registeredProjects.includes('/removed') && !saved().registeredProjects.includes('/alias-only'), 'Removal wins and aliases do not invent directories')
+    check(document.body.textContent?.includes('旧别名'), 'Saved aliases remain visible')
+    const writes = calls.filter(call => call === 'navigationPreferences.registerProjects').length
+    const reads = calls.filter(call => call === 'navigationPreferences.get').length
+    await refresh(); await refresh()
+    check(calls.filter(call => call === 'navigationPreferences.registerProjects').length === writes && calls.filter(call => call === 'navigationPreferences.get').length === reads, 'Completed migration never rereads preferences or resynchronizes on navigation refresh')
+    await add('/empty-a'); await add('/empty-b')
+    check(visible('/empty-a') && visible('/empty-b'), 'All empty directories remain after switching')
+    const restarted = structuredClone(saved())
+    await boot(restarted)
+    check(visible('/empty-a') && visible('/empty-b') && visible('/old'), 'Saved directories survive restart and zero remaining conversations')
+    check(!calls.includes('navigationPreferences.registerProjects'), 'Completed startup does not attempt migration')
+    cases.push('Empty directories survive switching and restart; completed migration performs no reads or writes during navigation refresh')
+    await boot({ ...EMPTY_SNAPSHOT, legacyProjectsSynced: true }, { ...emptyNavigation, projects: [group('/old')] })
+    check(!visible('/old') && !calls.includes('navigationPreferences.registerProjects'), 'An intentionally empty completed list cannot revive legacy projects')
+    await add('/after-complete')
+    check(saved().registeredProjects.includes('/after-complete'), 'Completion does not disable explicit directory saving')
+    cases.push('An empty completed list stays empty until an explicit add')
+    await boot(structuredClone(EMPTY_SNAPSHOT), { ...emptyNavigation, projects: [group('/fallback')] }, () => requestHandlers.set('navigationPreferences.registerProjects', () => { throw new Error('fixture save failed') }))
+    check(visible('/fallback') && !saved().legacyProjectsSynced, 'Failed migration keeps legacy navigation and does not mark completion')
+    const failedWrites = calls.filter(call => call === 'navigationPreferences.registerProjects').length
+    await refresh(); await refresh()
+    check(calls.filter(call => call === 'navigationPreferences.registerProjects').length === failedWrites, 'Failure does not start automatic retry')
+    const previousSelection = localStorage.getItem('rovai.current-project.v1')
+    await add('/unsaved')
+    check(!visible('/unsaved') && !saved().registeredProjects.includes('/unsaved') && localStorage.getItem('rovai.current-project.v1') === previousSelection, 'A failed add neither displays nor selects an unsaved directory')
+    check(document.querySelector('.app-toast')?.textContent?.includes('项目目录未保存，请重新添加。') && !document.querySelector('.app-toast-action, .error-banner'), 'A failed add gives one ordinary notice with no recovery action or banner')
+    await advance(6000)
+    check(!document.querySelector('.app-toast'), 'The ordinary save failure notice expires')
+    requestHandlers.delete('navigationPreferences.registerProjects')
+    await add('/unsaved')
+    check(saved().registeredProjects.includes('/unsaved') && visible('/unsaved') && !saved().legacyProjectsSynced, 'Adding again saves and displays the directory without reopening legacy import')
+    cases.push('Failed import keeps legacy projects; failed adds remain absent until a successful add')
+    await boot(structuredClone(EMPTY_SNAPSHOT), { ...emptyNavigation, projects: [group('/fallback')] }, () => requestHandlers.set('navigationPreferences.get', () => { throw new Error('fixture read failed') }))
+    check(visible('/fallback'), 'First preference read failure cannot hide successful Core navigation')
+    await boot(structuredClone(EMPTY_SNAPSHOT), { ...emptyNavigation, projects: [group('/fallback')] })
+    check(saved().legacyProjectsSynced && saved().registeredProjects.includes('/fallback'), 'The next startup can complete legacy import after storage recovers')
+    requestHandlers.set('navigationPreferences.registerProjects', () => { throw new Error('fixture later save failed') })
+    await add('/unsaved-after-completion')
+    check(saved().legacyProjectsSynced && !visible('/unsaved-after-completion') && !document.querySelector('.error-banner'), 'A later save failure keeps the completed marker without a temporary row or persistent banner')
+    cases.push('First preference read failure preserves ordinary navigation')
+    return { ok: true, cases }
+  },
+
   captureNavigation: (theme: 'day' | 'night', collapsed: boolean) => captureNavigation(theme, collapsed),
   async run() {
     const cases: string[] = []
@@ -412,9 +507,8 @@ Object.assign(window, { startupTest: {
     responses.set('members.list', [])
     responses.set('runtime.installations.list', [])
     responses.set('navigation.snapshot', { schemaVersion: 3, projects: [], quickChat: { recentThreads: [], totalCount: 0 } })
-    const navPreferences: NavigationPreferencesSnapshot = { schemaVersion: 5, pins: [], removedProjects: [], projectOrder: [], projectNames: {}, threadReadStates: {} }
+    const navPreferences: NavigationPreferencesSnapshot = { schemaVersion: 6, registeredProjects: [], legacyProjectsSynced: false, pins: [], removedProjects: [], projectOrder: [], projectNames: {}, threadReadStates: {} }
     responses.set('navigationPreferences.get', navPreferences)
-    responses.set('navigationPreferences.synchronizeProjectOrder', navPreferences)
     responses.set('memory.hearthReviewItems.list', [])
     responses.set('memory.list', { capacities: [], memories: ['M', 'N'].map(id => ({
       id, scope: 'hearth', kind: 'preference', creationOrigin: 'user', companionAgentId: null,
