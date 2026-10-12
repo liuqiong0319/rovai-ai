@@ -6,16 +6,27 @@ import {
 import { avatarCropToPixels, clampAvatarCrop } from './member-avatar-crop'
 import { uiAttribute } from './interface-language'
 
-export type NormalizedMemberAvatarSource = {
-  sourcePng: Uint8Array
-  width: number
-  height: number
-}
+export type NormalizedMemberAvatarSource =
+  | {
+      kind: 'raster'
+      sourcePng: Uint8Array
+      width: number
+      height: number
+    }
+  | {
+      kind: 'gif'
+      sourceGif: Uint8Array
+      width: number
+      height: number
+      frameCount: number
+      loopCount: number
+    }
 
-export type NormalizedMemberAvatarAsset = NormalizedMemberAvatarSource & {
-  iconPng: Uint8Array
-  crop: MemberAvatarCrop
-}
+export type NormalizedMemberAvatarAsset =
+  Extract<NormalizedMemberAvatarSource, { kind: 'raster' }> & {
+    iconPng: Uint8Array
+    crop: MemberAvatarCrop
+  }
 
 export function validateDecodedMemberAvatarDimensions(
   width: number,
@@ -43,6 +54,27 @@ export function validateDecodedMemberAvatarDimensions(
   }
 }
 
+/** Animated GIF sources carry explicit frame-count and cumulative decode caps so
+ * a multi-frame file cannot exhaust renderer or Core decode resources. */
+export function validateGifMemberAvatarSource(
+  width: number,
+  height: number,
+  frameCount: number
+): void {
+  validateDecodedMemberAvatarDimensions(width, height)
+  if (!Number.isInteger(frameCount) || frameCount <= 0) {
+    throw new Error(uiAttribute('GIF 角色图片帧数无效'))
+  }
+  if (frameCount > MEMBER_AVATAR_LIMITS.maximumGifFrames) {
+    throw new Error(
+      uiAttribute('GIF 角色图片不能超过 {0} 帧', MEMBER_AVATAR_LIMITS.maximumGifFrames)
+    )
+  }
+  if (width * height * frameCount > MEMBER_AVATAR_LIMITS.maximumGifCumulativeDecodedPixels) {
+    throw new Error(uiAttribute('GIF 角色图片累计解码资源超出限制'))
+  }
+}
+
 export function normalizedMemberAvatarDimensions(
   width: number,
   height: number
@@ -65,6 +97,15 @@ export function isMemberAvatarSourceLowQuality(width: number, height: number): b
   )
 }
 
+/** Blob for preview and crop `<img>`; GIF stays animated, PNG keeps its type. */
+export function normalizedMemberAvatarBlob(
+  source: NormalizedMemberAvatarSource
+): Blob {
+  return source.kind === 'gif'
+    ? new Blob([Uint8Array.from(source.sourceGif).buffer], { type: 'image/gif' })
+    : new Blob([Uint8Array.from(source.sourcePng).buffer], { type: 'image/png' })
+}
+
 export async function normalizeMemberAvatarSource(
   selection: MemberAvatarSourceSelection
 ): Promise<NormalizedMemberAvatarSource> {
@@ -78,6 +119,28 @@ export async function normalizeMemberAvatarSource(
     selection.inspectedWidth,
     selection.inspectedHeight
   )
+
+  if (selection.mediaType === 'image/gif') {
+    if (
+      selection.frameCount === undefined
+      || selection.loopCount === undefined
+    ) {
+      throw new Error(uiAttribute('GIF 角色图片缺少帧信息'))
+    }
+    validateGifMemberAvatarSource(
+      selection.inspectedWidth,
+      selection.inspectedHeight,
+      selection.frameCount
+    )
+    return {
+      kind: 'gif',
+      sourceGif: Uint8Array.from(selection.bytes),
+      width: selection.inspectedWidth,
+      height: selection.inspectedHeight,
+      frameCount: selection.frameCount,
+      loopCount: selection.loopCount
+    }
+  }
 
   const bitmap = await createImageBitmap(
     new Blob([ownedArrayBuffer(selection.bytes)], { type: selection.mediaType }),
@@ -100,6 +163,7 @@ export async function normalizeMemberAvatarSource(
       throw new Error('规范化角色图片超过 16 MiB')
     }
     return {
+      kind: 'raster',
       sourcePng,
       width: dimensions.width,
       height: dimensions.height
@@ -110,9 +174,14 @@ export async function normalizeMemberAvatarSource(
 }
 
 export async function deriveMemberAvatarIcon(
-  source: NormalizedMemberAvatarSource,
+  source: Extract<NormalizedMemberAvatarSource, { kind: 'raster' }>,
   crop: MemberAvatarCrop
 ): Promise<NormalizedMemberAvatarAsset> {
+  if (source.kind !== 'raster') {
+    // Frame-accurate icon derivation lives in Core so the animation survives;
+    // the renderer must never flatten a GIF through a canvas here.
+    throw new Error(uiAttribute('GIF 角色图片由 Core 派生小头像'))
+  }
   const safeCrop = clampAvatarCrop(crop, source.width, source.height)
   const bitmap = await createImageBitmap(
     new Blob([ownedArrayBuffer(source.sourcePng)], { type: 'image/png' })

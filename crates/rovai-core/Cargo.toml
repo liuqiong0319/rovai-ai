@@ -18,7 +18,8 @@ croner = "4.0.0"
 comrak = { version = "=0.48.0", default-features = false }
 dirs = "6"
 getrandom = "0.3"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+gif = "0.14"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif"] }
 json5 = "0.4"
 rusqlite = { version = "0.40.2", features = ["backup", "bundled", "functions"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

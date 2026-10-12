@@ -3441,7 +3441,7 @@ export interface MemberAvatarCrop {
   size: number
 }
 
-export type MemberAvatarInputMediaType = 'image/png' | 'image/jpeg'
+export type MemberAvatarInputMediaType = 'image/png' | 'image/jpeg' | 'image/gif'
 
 export interface MemberAvatarSourceSelection {
   displayName: string
@@ -3450,15 +3450,31 @@ export interface MemberAvatarSourceSelection {
   inspectedWidth: number
   inspectedHeight: number
   byteLength: number
+  /** Present only for animated GIF selections (frame/loop semantics). */
+  frameCount?: number
+  loopCount?: number
 }
 
-export interface SaveMemberAvatarAssetInput {
+export interface SaveMemberAvatarRasterInput {
+  kind?: 'raster'
   sourcePng: Uint8Array
   iconPng: Uint8Array
   sourceWidth: number
   sourceHeight: number
   crop: MemberAvatarCrop
 }
+
+export interface SaveMemberAvatarGifInput {
+  kind: 'gif'
+  sourceGif: Uint8Array
+  sourceWidth: number
+  sourceHeight: number
+  crop: MemberAvatarCrop
+}
+
+export type SaveMemberAvatarAssetInput =
+  | SaveMemberAvatarRasterInput
+  | SaveMemberAvatarGifInput
 
 export interface MemberAvatarAssetSummary {
   avatarRef: string
@@ -3468,7 +3484,7 @@ export interface MemberAvatarAssetSummary {
 }
 
 export interface MemberAvatarRendition {
-  mediaType: 'image/png'
+  mediaType: 'image/png' | 'image/gif'
   bytes: Uint8Array
   width: number
   height: number

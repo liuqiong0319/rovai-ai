@@ -1,7 +1,7 @@
 import type { MemberAvatarCrop } from '@contracts'
 import type { NormalizedMemberAvatarSource } from './member-avatar-image'
 
-export interface PendingMemberAvatarSource extends NormalizedMemberAvatarSource {
+export type PendingMemberAvatarSource = NormalizedMemberAvatarSource & {
   crop: MemberAvatarCrop
   needsSave: boolean
 }

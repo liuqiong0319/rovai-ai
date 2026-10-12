@@ -40,7 +40,15 @@ type JpegInspection = {
   height: number
 }
 
-type ImageInspection = PngInspection | JpegInspection
+type GifInspection = {
+  mediaType: 'image/gif'
+  width: number
+  height: number
+  frameCount: number
+  loopCount: number
+}
+
+type ImageInspection = PngInspection | JpegInspection | GifInspection
 
 type AvatarManifestFile = {
   file: string
@@ -64,6 +72,10 @@ type AvatarManifestV1 = {
 }
 
 const PNG_SIGNATURE = [137, 80, 78, 71, 13, 10, 26, 10] as const
+const GIF_SIGNATURES = [
+  [0x47, 0x49, 0x46, 0x38, 0x37, 0x61],
+  [0x47, 0x49, 0x46, 0x38, 0x39, 0x61]
+] as const
 const MANAGED_TEMP_PATTERN =
   /^\.tmp-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const SHA256_PATTERN = /^[0-9a-f]{64}$/
@@ -77,6 +89,11 @@ export class MemberAvatarAssetService {
   }
 
   async save(input: SaveMemberAvatarAssetInput): Promise<MemberAvatarAssetSummary> {
+    if (input.kind === 'gif') {
+      // The animated GIF path is owned by the Rust Core (frame-accurate crop +
+      // re-encode); the Main TS service is a static PNG/JPEG mirror.
+      throw new Error('Member avatar GIF save is handled by Core')
+    }
     const sourcePng = ownedBytes(input.sourcePng, 'sourcePng')
     const iconPng = ownedBytes(input.iconPng, 'iconPng')
     if (sourcePng.byteLength > MEMBER_AVATAR_LIMITS.normalizedSourceBytes) {
@@ -258,6 +275,8 @@ export async function inspectMemberAvatarSourceFile(
     if (png.iendOffset !== bytes.byteLength) {
       canonicalBytes = bytes.subarray(0, png.iendOffset)
     }
+  } else if (isGif(bytes)) {
+    inspection = inspectGif(bytes)
   } else {
     inspection = inspectJpeg(bytes)
   }
@@ -268,13 +287,102 @@ export async function inspectMemberAvatarSourceFile(
     bytes: canonicalBytes,
     inspectedWidth: inspection.width,
     inspectedHeight: inspection.height,
-    byteLength: canonicalBytes.byteLength
+    byteLength: canonicalBytes.byteLength,
+    frameCount: inspection.mediaType === 'image/gif' ? inspection.frameCount : undefined,
+    loopCount: inspection.mediaType === 'image/gif' ? inspection.loopCount : undefined
   }
 }
 
 export function inspectImage(bytes: Uint8Array): ImageInspection {
   if (hasPrefix(bytes, PNG_SIGNATURE)) return inspectPng(bytes)
+  if (isGif(bytes)) return inspectGif(bytes)
   return inspectJpeg(bytes)
+}
+
+function isGif(bytes: Uint8Array): boolean {
+  return GIF_SIGNATURES.some((signature) => hasPrefix(bytes, signature))
+}
+
+export function inspectGif(bytes: Uint8Array): GifInspection {
+  if (!isGif(bytes)) throw new Error('Unsupported member avatar image type')
+  if (bytes.byteLength < 13) throw new Error('Truncated GIF member avatar')
+  const width = readU16LE(bytes, 6)
+  const height = readU16LE(bytes, 8)
+  if (width === 0 || height === 0) {
+    throw new Error('Invalid GIF member avatar dimensions')
+  }
+  validateMemberAvatarDimensions(width, height)
+  const packed = bytes[10]
+  const globalTableBytes = packed & 0x80
+    ? 3 << ((packed & 0x07) + 1)
+    : 0
+  let offset = 13 + globalTableBytes
+  if (offset > bytes.byteLength) throw new Error('Truncated GIF member avatar')
+  let frameCount = 0
+  let loopCount = 0
+  while (offset < bytes.byteLength) {
+    const block = bytes[offset]
+    if (block === 0x3b) break
+    if (block === 0x21) {
+      offset += 2
+      const label = bytes[offset - 1]
+      if (label === 0xff) {
+        const size = bytes[offset]
+        offset += 1
+        const app = bytes.subarray(offset, offset + size)
+        offset += size
+        if (app.byteLength === size && bytesToAscii(app) === 'NETSCAPE2.0') {
+          // Peek the loop-count sub-block; skipGifSubBlocks consumes it after.
+          const sub = bytes[offset]
+          if (sub >= 3) {
+            const payload = bytes.subarray(offset + 1, offset + 4)
+            if (payload[0] === 0x01) {
+              loopCount = payload[1] | (payload[2] << 8)
+            }
+          }
+        }
+      }
+      offset = skipGifSubBlocks(bytes, offset)
+      continue
+    }
+    if (block === 0x2c) {
+      frameCount += 1
+      if (frameCount > MEMBER_AVATAR_LIMITS.maximumGifFrames) {
+        throw new Error('Animated member avatar exceeds the frame limit')
+      }
+      offset += 9
+      const imagePacked = bytes[offset]
+      offset += 1
+      const localTableBytes = imagePacked & 0x80
+        ? 3 << ((imagePacked & 0x07) + 1)
+        : 0
+      offset += localTableBytes + 1
+      offset = skipGifSubBlocks(bytes, offset)
+      continue
+    }
+    throw new Error('Invalid GIF member avatar structure')
+  }
+  if (frameCount === 0) throw new Error('GIF member avatar contains no frames')
+  const cumulative = width * height * frameCount
+  if (cumulative > MEMBER_AVATAR_LIMITS.maximumGifCumulativeDecodedPixels) {
+    throw new Error('Animated member avatar exceeds the cumulative decode resource limit')
+  }
+  return { mediaType: 'image/gif', width, height, frameCount, loopCount }
+}
+
+function skipGifSubBlocks(bytes: Uint8Array, offset: number): number {
+  let cursor = offset
+  for (;;) {
+    const size = bytes[cursor]
+    cursor += 1
+    if (size === 0) return cursor
+    cursor += size
+    if (cursor > bytes.byteLength) throw new Error('Truncated GIF member avatar')
+  }
+}
+
+function bytesToAscii(bytes: Uint8Array): string {
+  return String.fromCharCode(...bytes)
 }
 
 export function inspectPng(bytes: Uint8Array): PngInspection {
@@ -574,6 +682,10 @@ function hasPrefix(bytes: Uint8Array, prefix: readonly number[]): boolean {
 
 function readU16(bytes: Uint8Array, offset: number): number {
   return (bytes[offset] << 8) | bytes[offset + 1]
+}
+
+function readU16LE(bytes: Uint8Array, offset: number): number {
+  return bytes[offset] | (bytes[offset + 1] << 8)
 }
 
 function readU32(bytes: Uint8Array, offset: number): number {

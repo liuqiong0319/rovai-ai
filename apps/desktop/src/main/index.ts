@@ -1725,7 +1725,7 @@ ipcMain.handle('rovai:member-avatar-select-source', async () => {
     title: '选择角色图片',
     buttonLabel: '选择图片',
     filters: [
-      { name: '静态图片', extensions: ['png', 'jpg', 'jpeg'] }
+      { name: '静态与动态图片', extensions: ['png', 'jpg', 'jpeg', 'gif'] }
     ],
     properties: ['openFile'] as Array<'openFile'>
   }
@@ -1738,11 +1738,20 @@ ipcMain.handle('rovai:member-avatar-select-source', async () => {
 
 ipcMain.handle(
   'rovai:member-avatar-save',
-  async (_event, input: SaveMemberAvatarAssetInput) => core.request('memberAvatars.save', {
-    sourceBase64: Buffer.from(input.sourcePng).toString('base64'),
-    iconBase64: Buffer.from(input.iconPng).toString('base64'),
-    sourceWidth: input.sourceWidth, sourceHeight: input.sourceHeight, crop: input.crop
-  })
+  async (_event, input: SaveMemberAvatarAssetInput) => {
+    if (input.kind === 'gif') {
+      return core.request('memberAvatars.save', {
+        kind: 'gif',
+        sourceGifBase64: Buffer.from(input.sourceGif).toString('base64'),
+        sourceWidth: input.sourceWidth, sourceHeight: input.sourceHeight, crop: input.crop
+      })
+    }
+    return core.request('memberAvatars.save', {
+      sourceBase64: Buffer.from(input.sourcePng).toString('base64'),
+      iconBase64: Buffer.from(input.iconPng).toString('base64'),
+      sourceWidth: input.sourceWidth, sourceHeight: input.sourceHeight, crop: input.crop
+    })
+  }
 )
 
 ipcMain.handle(
@@ -1758,7 +1767,7 @@ ipcMain.handle(
     ) {
       throw new Error('Unsupported member avatar read request')
     }
-    const image = await core.request<{ base64: string; mediaType: 'image/png'; width: number; height: number; crop: import('@contracts').MemberAvatarCrop } | null>('memberAvatars.read', { avatarRef, rendition })
+    const image = await core.request<{ base64: string; mediaType: 'image/png' | 'image/gif'; width: number; height: number; crop: import('@contracts').MemberAvatarCrop } | null>('memberAvatars.read', { avatarRef, rendition })
     return image ? { ...image, bytes: Uint8Array.from(Buffer.from(image.base64, 'base64')) } : null
   }
 )

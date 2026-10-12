@@ -7,7 +7,7 @@ import { useMemberRosterLayout } from './MemberRosterLayout'
 import { AppDialogContent, DialogControlIcon } from './AppDialog'
 import { MemberAvatarCropper } from './MemberAvatarCropper'
 import { defaultAvatarCrop } from './member-avatar-crop'
-import { normalizeMemberAvatarSource, deriveMemberAvatarIcon, type NormalizedMemberAvatarSource } from './member-avatar-image'
+import { normalizeMemberAvatarSource, deriveMemberAvatarIcon, normalizedMemberAvatarBlob, type NormalizedMemberAvatarSource } from './member-avatar-image'
 import { readErrorMessage } from './error-message'
 import { UiText, uiAttribute } from './interface-language'
 
@@ -84,8 +84,13 @@ export const CurrentUserProfileEditor = forwardRef<CurrentUserProfileEditorHandl
     try {
       const selection = await client.memberAvatars.selectSource()
       if (!selection) return
+      if (selection.mediaType === 'image/gif') {
+        // The current-user profile stores a PNG data URL; an animated GIF cannot
+        // survive that storage and is rejected up front instead of flattening.
+        throw new Error(uiAttribute('当前用户头像不支持 GIF，请选择 PNG 或 JPEG 图片。'))
+      }
       const normalized = await normalizeMemberAvatarSource(selection)
-      const sourceUrl = URL.createObjectURL(new Blob([Uint8Array.from(normalized.sourcePng).buffer], { type: 'image/png' }))
+      const sourceUrl = URL.createObjectURL(normalizedMemberAvatarBlob(normalized))
       setCrop(defaultAvatarCrop(normalized.width, normalized.height))
       setCropSource({ ...normalized, sourceUrl })
     } catch (failure) {
@@ -98,6 +103,10 @@ export const CurrentUserProfileEditor = forwardRef<CurrentUserProfileEditorHandl
   }
   async function applyCrop() {
     if (!cropSource || !crop || cropBusy) return
+    if (cropSource.kind === 'gif') {
+      setImageError(uiAttribute('当前用户头像不支持 GIF，请选择 PNG 或 JPEG 图片。'))
+      return
+    }
     setCropBusy(true)
     try {
       const asset = await deriveMemberAvatarIcon(cropSource, crop)

@@ -8858,31 +8858,69 @@ impl Core {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "camelCase", deny_unknown_fields)]
                 struct Save {
-                    source_base64: String,
-                    icon_base64: String,
+                    kind: Option<String>,
+                    source_base64: Option<String>,
+                    icon_base64: Option<String>,
+                    source_gif_base64: Option<String>,
                     source_width: u32,
                     source_height: u32,
                     crop: rovai_core::member_avatar::MemberAvatarCrop,
                 }
                 let params: Save = serde_json::from_value(request.params.clone())?;
-                anyhow::ensure!(
-                    params.source_base64.len() <= 23 * 1024 * 1024
-                        && params.icon_base64.len() <= 1400 * 1024,
-                    "Avatar exceeds the managed asset limit"
-                );
-                let source =
-                    base64::engine::general_purpose::STANDARD.decode(params.source_base64)?;
-                let icon = base64::engine::general_purpose::STANDARD.decode(params.icon_base64)?;
-                Ok(serde_json::to_value(
-                    rovai_core::member_avatar::save_managed_member_avatar(
-                        &self.data_dir,
-                        &source,
-                        &icon,
-                        params.source_width,
-                        params.source_height,
-                        params.crop,
-                    )?,
-                )?)
+                match params.kind.as_deref() {
+                    None | Some("raster") => {
+                        let source = params.source_base64.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!("Raster avatar save requires sourceBase64")
+                        })?;
+                        let icon = params.icon_base64.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!("Raster avatar save requires iconBase64")
+                        })?;
+                        anyhow::ensure!(
+                            source.len() <= 23 * 1024 * 1024
+                                && icon.len() <= 1400 * 1024,
+                            "Avatar exceeds the managed asset limit"
+                        );
+                        let source =
+                            base64::engine::general_purpose::STANDARD.decode(source)?;
+                        let icon =
+                            base64::engine::general_purpose::STANDARD.decode(icon)?;
+                        Ok(serde_json::to_value(
+                            rovai_core::member_avatar::save_managed_member_avatar(
+                                &self.data_dir,
+                                &source,
+                                &icon,
+                                params.source_width,
+                                params.source_height,
+                                params.crop,
+                            )?,
+                        )?)
+                    }
+                    Some("gif") => {
+                        let source_gif =
+                            params.source_gif_base64.as_deref().ok_or_else(|| {
+                                anyhow::anyhow!("GIF avatar save requires sourceGifBase64")
+                            })?;
+                        anyhow::ensure!(
+                            source_gif.len() <= 14 * 1024 * 1024,
+                            "Avatar exceeds the managed asset limit"
+                        );
+                        let source_gif =
+                            base64::engine::general_purpose::STANDARD.decode(source_gif)?;
+                        let frame_count =
+                            rovai_core::member_avatar::gif_frame_count_for(&source_gif)?;
+                        Ok(serde_json::to_value(
+                            rovai_core::member_avatar::save_managed_member_avatar_gif(
+                                &self.data_dir,
+                                &source_gif,
+                                params.source_width,
+                                params.source_height,
+                                params.crop,
+                                frame_count,
+                            )?,
+                        )?)
+                    }
+                    Some(_) => Err(anyhow::anyhow!("Unsupported avatar save kind")),
+                }
             }
             "members.list" => {
                 let database = self.database.lock().await;

@@ -5,6 +5,7 @@ import {
 } from './member-avatar-submit'
 
 const source: PendingMemberAvatarSource = {
+  kind: 'raster',
   sourcePng: Uint8Array.from([1]),
   width: 512,
   height: 512,

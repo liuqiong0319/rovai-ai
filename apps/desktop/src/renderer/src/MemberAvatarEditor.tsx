@@ -7,7 +7,8 @@ import { DialogControlIcon } from './AppDialog'
 import { BUILTIN_MEMBER_PRESETS } from './member-presets'
 import {
   deriveMemberAvatarIcon,
-  normalizeMemberAvatarSource
+  normalizeMemberAvatarSource,
+  normalizedMemberAvatarBlob
 } from './member-avatar-image'
 import { defaultAvatarCrop } from './member-avatar-crop'
 import { readErrorMessage } from './error-message'
@@ -36,15 +37,8 @@ export function MemberAvatarEditor({
   const generation = useRef(0)
   const loaded = useRef<string | null>(null)
   const sourceUrl = useMemo(
-    () =>
-      source
-        ? URL.createObjectURL(
-            new Blob([Uint8Array.from(source.sourcePng).buffer], {
-              type: 'image/png'
-            })
-          )
-        : null,
-    [source?.sourcePng]
+    () => (source ? URL.createObjectURL(normalizedMemberAvatarBlob(source)) : null),
+    [source]
   )
   useEffect(
     () => () => {
@@ -78,13 +72,27 @@ export function MemberAvatarEditor({
         if (attempt !== generation.current) return
         if (!image)
           throw new Error(uiAttribute('原角色图片不可读取。可以替换图片或移除当前图片。'))
-        setSource({
-          sourcePng: Uint8Array.from(image.bytes),
-          width: image.width,
-          height: image.height,
-          crop: image.crop,
-          needsSave: false
-        })
+        setSource(
+          image.mediaType === 'image/gif'
+            ? {
+                kind: 'gif',
+                sourceGif: Uint8Array.from(image.bytes),
+                width: image.width,
+                height: image.height,
+                frameCount: 0,
+                loopCount: 0,
+                crop: image.crop,
+                needsSave: false
+              }
+            : {
+                kind: 'raster',
+                sourcePng: Uint8Array.from(image.bytes),
+                width: image.width,
+                height: image.height,
+                crop: image.crop,
+                needsSave: false
+              }
+        )
       })
       .catch((issue) => {
         if (attempt === generation.current) setError(readErrorMessage(issue))
@@ -119,6 +127,21 @@ export function MemberAvatarEditor({
     setBusy(true)
     setError(null)
     try {
+      if (source.kind === 'gif') {
+        const persisted = await client.memberAvatars.save({
+          kind: 'gif',
+          sourceGif: source.sourceGif,
+          sourceWidth: source.width,
+          sourceHeight: source.height,
+          crop: source.crop
+        })
+        if (attempt !== generation.current) return
+        loaded.current = persisted.avatarRef
+        setSource(null)
+        onChange(persisted.avatarRef)
+        onClose()
+        return
+      }
       const asset = await deriveMemberAvatarIcon(source, source.crop)
       const persisted = await client.memberAvatars.save({
         sourcePng: asset.sourcePng,
@@ -193,7 +216,7 @@ export function MemberAvatarEditor({
           >
             {busy ? uiAttribute("正在处理…") : uiAttribute("上传图片")}
           </button>
-          <small><UiText zh={"PNG / JPEG · 最大 10 MiB"} /></small>
+          <small><UiText zh={"PNG / JPEG / GIF · 至少 256×256 px · 最大 10 MiB"} /></small>
         </div>
       </div>
       {source && sourceUrl && (

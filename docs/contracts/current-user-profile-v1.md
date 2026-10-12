@@ -22,6 +22,9 @@ Preload 暴露 `currentUserProfile.get()` 和 `currentUserProfile.save(profile)`
 - `avatarDataUrl` 为 `null` 时使用固定“你”字圆形头像，改名不改变默认头像。
   自定义值只接受规范 Base64 PNG data URL，沿用头像 PNG 结构与静态图片检查，必须恰为
   192×192 像素且解码后的文件字节不超过 1 MiB。禁止远程 URL、路径和 SVG。
+  动态 GIF 不进入当前用户资料：选择器或上传区遇到 GIF 时明确报错（本地化文案），
+  不通过 Canvas 退化为静态首帧。队员动态头像资产由
+  [队员身份与图像](../ui/components/member-identity.md) 的受管复合资产拥有。
 - 文件拥有 `schemaVersion: 1` 和以上两个字段。两个字段通过同一个私有临时文件原子替换，
   写入串行化；保存失败保留旧内存快照和用户草稿，后续允许重试。
 - 首次读取缺失文件时只使用内存默认值，不写入文件。损坏或不可读文件产生本地降级提示，

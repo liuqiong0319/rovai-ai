@@ -16,7 +16,12 @@ export const MEMBER_AVATAR_LIMITS = {
   iconEdge: 192,
   iconBytes: 1024 * 1024,
   saveIpcBytes: 17 * 1024 * 1024,
-  manifestBytes: 16 * 1024
+  manifestBytes: 16 * 1024,
+  /** Hard ceiling on decoded frames for an animated GIF member avatar. */
+  maximumGifFrames: 200,
+  /** Cumulative decoded frame pixels across the whole animation; bounds decode
+   * allocation and prevents a multi-frame bomb (e.g. 200 × 32M px). */
+  maximumGifCumulativeDecodedPixels: 128_000_000
 } as const
 
 export type BuiltinMemberAvatarRole = (typeof BUILTIN_MEMBER_AVATAR_ROLES)[number]
