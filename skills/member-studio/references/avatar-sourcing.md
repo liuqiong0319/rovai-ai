@@ -12,7 +12,7 @@ Pass the local path through `--avatar-file`. Do not write directly to `userData/
 
 ## Image requirements
 
-- PNG, JPEG or GIF, at least 256 x 256, within the product byte limit.
+- Use static PNG/JPEG by default. Use GIF only when the user supplies it for the avatar. At least 256 x 256, within the product byte limit.
 - Prefer a 4:5 portrait at 1024 x 1280, with head and shoulders or upper body centered slightly above the middle.
 - Leave crop space; use a simple background without text, logos, watermarks, or complex borders.
 - Keep the central subject suitable for a square avatar.
