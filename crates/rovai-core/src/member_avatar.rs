@@ -289,7 +289,6 @@ fn import_gif_selected(
         normalized_height,
         crop,
         info.frame_count,
-        info.loop_count,
     )
 }
 
@@ -463,7 +462,6 @@ fn prepare_gif_avatar(
         normalized_height,
         crop,
         info.frame_count,
-        info.loop_count,
     )?)
 }
 
@@ -810,7 +808,6 @@ fn save_normalized_member_avatar_gif(
         normalized_height,
         crop,
         frame_count,
-        info.loop_count,
     )?)
 }
 
@@ -1015,7 +1012,6 @@ fn publish_managed_member_avatar(
         source_width,
         source_height,
         0,
-        None,
         crop,
     )
 }
@@ -1029,7 +1025,6 @@ fn publish_managed_member_avatar_gif(
     source_height: u32,
     crop: MemberAvatarCrop,
     frame_count: u32,
-    loop_count: Option<u16>,
 ) -> std::result::Result<ManagedMemberAvatarSummary, MemberAvatarImportError> {
     publish_managed_member_avatar_with(
         data_dir,
@@ -1040,7 +1035,6 @@ fn publish_managed_member_avatar_gif(
         source_width,
         source_height,
         frame_count,
-        loop_count,
         crop,
     )
 }
@@ -1060,7 +1054,6 @@ fn publish_managed_member_avatar_with(
     source_width: u32,
     source_height: u32,
     frame_count: u32,
-    _loop_count: Option<u16>,
     crop: MemberAvatarCrop,
 ) -> std::result::Result<ManagedMemberAvatarSummary, MemberAvatarImportError> {
     let asset_id = asset_id.hyphenated().to_string();
@@ -1158,9 +1151,6 @@ fn publish_managed_member_avatar_with(
     })
 }
 
-/// Removes a published managed avatar asset. Used to compensate a member
-/// creation that imported the avatar but failed before the profile was written,
-/// so no orphan asset is left behind.
 fn validate_decoded_dimensions(
     width: u32,
     height: u32,
@@ -1247,8 +1237,8 @@ fn inspect_upload_png(bytes: &[u8]) -> std::result::Result<usize, MemberAvatarIm
 // ---------------------------------------------------------------------------
 // GIF member-avatar support
 //
-// Animated GIF is the only dynamic member-avatar format. PNG/APNG stays
-// rejected, WebP is not extended. A GIF is decoded frame-by-frame onto the
+// Animated GIF is the only dynamic member-avatar format. APNG and WebP stay
+// unsupported. A GIF is decoded frame-by-frame onto the
 // logical canvas (honouring each frame's disposal), the same crop geometry is
 // then applied to every frame, and the result is re-encoded as an animated GIF
 // so frame order, per-frame delay and the Netscape loop count survive.

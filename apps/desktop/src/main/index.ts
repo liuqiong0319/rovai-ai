@@ -442,11 +442,6 @@ const wakeNetworkRecoveryAfterSystemResume = (): void => {
   void core.request('runtime.networkRecovery.wake').catch(() => undefined)
 }
 
-function requireMemberAvatars(): MemberAvatarAssetService {
-  if (!memberAvatars) throw new Error('Core data directory has not been admitted')
-  return memberAvatars
-}
-
 const memberBotAvatarSource = new ControlledMemberBotAvatarSourceResolver({
   read: async (avatarRef) => {
     const image = await core.request<{

@@ -43,5 +43,4 @@ allows at most 200 frames and 128 million cumulative decoded canvas pixels; APNG
 are not admitted. PNG vendor data after IEND is tolerated only at upload and removed during
 normalization; GIF non-rendering metadata is removed while playback extensions are retained.
 Existing controlled assets are re-cropped by reference under normalized asset limits, not
-the original upload minimum. No member-creation preview, capability or confirmation table
-is introduced.
+the original upload minimum.

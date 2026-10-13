@@ -18,8 +18,6 @@ export type NormalizedMemberAvatarSource =
       sourceGif: Uint8Array
       width: number
       height: number
-      frameCount: number
-      loopCount: number | null
     }
 
 export type NormalizedMemberAvatarAsset =
@@ -136,9 +134,7 @@ export async function normalizeMemberAvatarSource(
       kind: 'gif',
       sourceGif: Uint8Array.from(selection.bytes),
       width: selection.inspectedWidth,
-      height: selection.inspectedHeight,
-      frameCount: selection.frameCount,
-      loopCount: selection.loopCount
+      height: selection.inspectedHeight
     }
   }
 

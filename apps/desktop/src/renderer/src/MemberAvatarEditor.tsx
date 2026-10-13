@@ -80,8 +80,6 @@ export function MemberAvatarEditor({
                 sourceGif: Uint8Array.from(image.bytes),
                 width: image.width,
                 height: image.height,
-                frameCount: 0,
-                loopCount: 0,
                 crop: image.crop,
                 sourceAvatarRef: value,
                 needsSave: false

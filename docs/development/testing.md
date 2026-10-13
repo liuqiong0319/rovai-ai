@@ -434,7 +434,7 @@ workspace 不同、同名图片内容不同、失效 epoch／缺失 workspace �
 新增最低成本纯 codec owner `gif_crop_preserves_transparency_disposal_and_loop_semantics`：修复前透明
 部分帧会留下残影、无循环扩展会变为无限循环；现有持久化 owner 只检查整帧颜色，不拥有部分帧
 disposal 的逐像素状态转换，因此不用完整数据库或重复文件夹具验证此矩阵。最小命令为
-`cargo test -p rovai-core --lib member_avatar::`。三阶段创建合同退出本 PR，相应专用 helper 随之移除；
+`cargo test -p rovai-core --lib member_avatar::`。
 创建路径复用 `confirmed_user_input_can_create_one_idempotent_member_but_agent_input_cannot`，在现有
 PNG 成员创建/幂等矩阵中增加 Run 相对路径 GIF；认证与 Migration owner 不变。该 owner 需
 `--features extended-tests`，不能用默认构建的同名过滤结果宣称已经执行。
