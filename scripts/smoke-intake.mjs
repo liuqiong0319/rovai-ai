@@ -57,7 +57,6 @@ try {
     throw new Error(`Configured Camp creation was not applied: ${JSON.stringify(created)}`)
   }
   if (createReplay.commandId !== created.commandId
-      || createReplay.requestDigest !== created.requestDigest
       || createReplay.payload?.threadId !== created.payload?.threadId) {
     throw new Error(`Configured Camp creation replay was not stable: ${JSON.stringify(createReplay)}`)
   }
@@ -159,7 +158,7 @@ try {
   if (first?.status !== 'accepted') {
     throw new Error(`Camp intake was not accepted: ${JSON.stringify(first)}`)
   }
-  if (replay?.commandId !== first.commandId || replay.requestDigest !== first.requestDigest) {
+  if (replay?.commandId !== first.commandId || JSON.stringify(replay.payload) !== JSON.stringify(first.payload)) {
     throw new Error(`Camp intake replay was not stable: ${JSON.stringify(replay)}`)
   }
 

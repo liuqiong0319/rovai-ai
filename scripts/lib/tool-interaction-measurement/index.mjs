@@ -465,20 +465,19 @@ function normalizeMeasurementSpec(value) {
 }
 
 function normalizeRuntimeCompatibility(value) {
-  assertExactKeys(value, [
-    'builtinToolCatalogDigest',
+  // A historical catalog fingerprint is readable but no longer an identity.
+  const { builtinToolCatalogDigest: _legacyCatalogDigest, ...versions } = value ?? {}
+  assertExactKeys(versions, [
     'builtinToolContractVersion',
     'builtinToolIpcProtocolVersion',
     'operationProjectionSchemaVersion'
   ], 'measurementSpec.runtimeCompatibility')
   const result = {
-    builtinToolCatalogDigest: stableDigest(value.builtinToolCatalogDigest),
     builtinToolContractVersion: value.builtinToolContractVersion,
     builtinToolIpcProtocolVersion: value.builtinToolIpcProtocolVersion,
     operationProjectionSchemaVersion: value.operationProjectionSchemaVersion
   }
-  if (!result.builtinToolCatalogDigest
-      || ![
+  if (![
         result.builtinToolContractVersion,
         result.builtinToolIpcProtocolVersion,
         result.operationProjectionSchemaVersion

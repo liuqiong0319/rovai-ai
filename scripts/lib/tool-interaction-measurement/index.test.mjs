@@ -878,7 +878,6 @@ function spec(opportunities) {
   return {
     specificationId: 'tool-measurement-test-spec',
     runtimeCompatibility: {
-      builtinToolCatalogDigest: digestIdentity('e'),
       builtinToolContractVersion: 1,
       builtinToolIpcProtocolVersion: 1,
       operationProjectionSchemaVersion: 2

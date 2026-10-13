@@ -61,8 +61,7 @@ counterfactual protocol 证明。
 
 ## Tool-use 与 paired counterfactual
 
-Tool-use measurement 由 Case 预注册的 Opportunity 驱动。v2 Pack 还必须冻结并核对 Core Built-in catalog digest、
-contract/IPC version 与 operation projection version；任何漂移都在 dispatch 前 fail closed。Core 只投影
+Tool-use measurement 由 Case 预注册的 Opportunity 驱动。v2 Pack 还必须冻结并核对 Core Built-in contract/IPC version 与 operation projection version；版本不兼容在 dispatch 前拒绝；旧 catalog digest 只作为历史字段读取，不再比较。Core 只投影
 operation-specific、digest-bound、长度有界的 canonical input/result；Runner 以 sealed oracle 确定性判断实体、
 revision、cursor、Task state、Memory exact readback、receipt/effect 与 coverage。原始 Tool
 payload、secret、完整 transcript 和 oracle answer 不进入模型。Camp message send 的 mechanical integrity 可进入 Tool

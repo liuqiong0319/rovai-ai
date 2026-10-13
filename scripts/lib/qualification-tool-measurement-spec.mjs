@@ -258,12 +258,11 @@ export function assertToolMeasurementRuntimeCompatibility(pack, releaseCore) {
     throw new Error('Tool Measurement runtime compatibility is unavailable')
   }
   const actual = {
-    builtinToolCatalogDigest: withDigest(releaseCore.builtinToolCatalogDigest),
     builtinToolContractVersion: releaseCore.builtinToolContractVersion,
     builtinToolIpcProtocolVersion: releaseCore.builtinToolIpcProtocolVersion,
     operationProjectionSchemaVersion: releaseCore.builtinToolEvidenceProjectionVersion
   }
-  if (canonicalJson(expected) !== canonicalJson(actual)) {
+  if (Object.entries(actual).some(([key, value]) => expected[key] !== value)) {
     throw new Error(
       'Tool Measurement Pack is incompatible with the running Built-in Tool catalog or Evidence projection'
     )
@@ -314,14 +313,12 @@ function validateSpec(spec, caseRecord) {
     throw new Error('Tool Measurement Spec identity is unsupported')
   }
   stableId(spec.specificationId, 'specificationId')
-  exactKeys(spec.runtimeCompatibility, [
-    'builtinToolCatalogDigest',
+  exactKeys(Object.fromEntries(Object.entries(spec.runtimeCompatibility).filter(([key]) => key !== 'builtinToolCatalogDigest')), [
     'builtinToolContractVersion',
     'builtinToolIpcProtocolVersion',
     'operationProjectionSchemaVersion'
   ], 'Tool Measurement runtime compatibility')
-  if (!/^sha256:[a-f0-9]{64}$/.test(spec.runtimeCompatibility.builtinToolCatalogDigest)
-      || ![
+  if (![
         spec.runtimeCompatibility.builtinToolContractVersion,
         spec.runtimeCompatibility.builtinToolIpcProtocolVersion,
         spec.runtimeCompatibility.operationProjectionSchemaVersion

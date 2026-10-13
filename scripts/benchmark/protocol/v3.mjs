@@ -230,7 +230,6 @@ function validateProductContract(contract) {
     'contextDeliveryProfileVersion',
     'durableTaskContract',
     'builtInTransportVersion',
-    'builtInCatalogDigest',
     'acceptedInputAckContract'
   ]) validateAvailability(contract[field], `productContract.${field}`)
 }

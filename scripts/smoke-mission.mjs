@@ -158,7 +158,12 @@ try {
   for (const file of ['lead-evidence.json', 'follower-evidence.json']) assert.equal(JSON.parse(await readFile(join(output, file))).cwd, workspace.working_directory)
   const manifests = snapshot.contextManifests
   assert.equal(manifests.length, 2); assert(manifests.every(m => m.workspaceFactIncluded && m.workspaceFact.workingDirectory === workspace.working_directory))
-  assert(manifests.every(m => Object.keys(m.runFactPayload.mission).sort().join() === 'missionId,status,title'))
+  for (const manifest of manifests) {
+    const blob = db.prepare('SELECT storage_relative_path FROM managed_blob JOIN context_manifest ON managed_blob.id=context_manifest.rendered_payload_blob_id WHERE context_manifest.id=?').get(manifest.id)
+    const input = await readFile(join(dataDirectory, 'managed-blobs', blob.storage_relative_path), 'utf8')
+    const facts = JSON.parse(input.split('[RUN_FACTS]\n')[1].split('\n[/RUN_FACTS]')[0])
+    assert.equal(Object.keys(facts.mission).sort().join(), 'missionId,status,title')
+  }
   assert(manifests.every(m => m.runFactRefs.some(ref => ref.missionId === mission.missionId)))
   assert.equal(db.prepare('SELECT count(*) n FROM mission_start').get().n, 1)
   report.cases.push('Start is status-independent and idempotent; preparing creates clean fixed-base worktree; A2A and non-lead editing use the same cwd; Agent CLI completes a Mission without a source message')

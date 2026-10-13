@@ -19,8 +19,8 @@ last_updated: 2026-10-12
 - Desktop 窗口、主题、本机偏好、Supervisor、重试和 bootstrap diagnostics 可以在 Full Core 不可用时继续工作；
   Camp、Member、Memory、Navigation 与其他业务读写只有 `authoritativeWorkspace` capability ready 后才能挂载。
   阻断期间不得创建替代数据库、查询未准入 authority 或用空集合冒充正常工作区。
-  非权威页面框架不属于业务读写：本机恢复目标读取后先挂载对应页面框架，正常慢启动/迁移沿用同一个 400ms
-  anti-flash 截止时间，超时后用不透明整窗品牌画布遮住框架；可见层只显示完整品牌标记，辅助技术统一获得
+  非权威页面框架不属于业务读写：本机恢复目标读取后挂载对应页面框架，从 Renderer 首帧起用不透明整窗品牌画布
+  遮住框架，正常启动、迁移与目标读取交接期间持续显示；可见层只显示完整品牌标记，辅助技术统一获得
   “正在打开会话”，不暴露内部阶段。只有最终阻断或 crashed 才展示“暂时无法打开会话”的 Bootstrap 恢复面。
 - Core 必须先持有绑定 canonical data directory 与稳定对象身份的 OS 排他 lease，再观察或操作 SQLite。数据库
   准入只返回 existing、initializable、migration 或 typed blocked；票据绑定 lease、不可复制、一次消费并在打开、
@@ -33,6 +33,7 @@ last_updated: 2026-10-12
   全部 receipts 与文件 identity。每步 DDL/DML/marker/receipt 一起提交，中断后从缺失步骤继续；不新建普通升级副本、
   备份或 manifest，不替换主文件，不默认全库扫描。迁移后只重新准入并打开同一 main，不以失败或原库消失为由建空库。
   旧 manifest 继续按 current main 的 original/migrated identity 恢复；未知 identity fail closed。
+- 当前数据库打开只检查现行 marker、迁移完成和必要业务结构，不比较 `sqlite_master.sql` 全文，不重验历史来源链。Usage 派生结构错误由模块处理，不阻断业务数据库；历史来源识别仍用于升级步骤。见[输入快照与数据库准入](../contracts/input-snapshot-storage-v1.md)。
 - Full Core Supervisor 发布单调 generation/revision 的完整快照。旧 child 的 frame、event、response 或 exit 不能污染
   当前 generation；准入/打开/迁移的明确瞬时故障使用独立 250/750/1500ms startup retry，确定性错误不自动重试，均不
   消耗 crash budget。已见 authority 的后续重启禁止初始化空库。Renderer-facing request 继续是 `Promise<T>`，内部 transport
@@ -44,12 +45,12 @@ last_updated: 2026-10-12
 ### 权威写入与幂等事务
 
 - Rust Core 是领域事实的唯一写入权威。新增、修改或终结权威事实必须经过封闭的强类型命令及命令专用 Handler；Renderer、Electron Main、Runtime、Skill 和文件投影都不得形成第二写入路径。
-- 命令在规范化后计算版本化请求摘要，并在一个 SQLite 写事务中重查幂等结果、校验 Actor、epoch、Capability、expected version 和领域门禁，再提交对象变化、审计事件与唯一命令结果。相同命令身份和相同摘要永久返回首次结果；相同身份但不同语义必须稳定冲突。
+- 命令在一个 SQLite 写事务中重查既有结果；新命令校验 Actor、epoch、Capability、expected version 和领域门禁，再提交对象变化、事件与唯一命令结果。相同 commandId 在相同类型、Actor、Camp 和来源 Run 内返回首次结果，不重新计算请求摘要；新业务意图使用新 ID，跨归属复用仍拒绝。见 [Domain Command Result v2](../contracts/domain-command-result-v2.md)。
 - Repository 参加调用方拥有的 Unit of Work，不自行提交。Migration 只改变 schema 和数据，不在事务中执行 Runtime、Git、网络或文件系统补偿；提交后的唤醒只是可恢复提示，不是事实真源。
 - 领域事件日志用于审计、幂等结果和增量失效，不是 Event Sourcing 状态库、Outbox、Worker 队列或业务对象的替代真源。
 - `command.result` 的完整结果正文只由同一事件行的 `result_payload_json` 专用列保存；`payload_json` 只写显式、
-  版本化的内部存储标记。命令直接响应与重放仍从专用回执列返回第一次提交的完整值，事务、摘要、状态和
-  时间戳语义不变。该内部编码与字段边界见 [Domain Command Result v1](../contracts/domain-command-result-v1.md)。
+  版本化的内部存储标记。命令直接响应与重放仍从专用回执列返回第一次提交的完整值，事务、状态和
+  时间戳语义不变。该内部编码与字段边界见 [Domain Command Result v2](../contracts/domain-command-result-v2.md)。
 - 渠道 Host 的内部 tick 只推进已提交的 request/Outbox，不是新的业务意图入口，也不为每次唤醒保存永久命令回执。
   维护步骤仍在 Core 单个写事务内调用既有 Handler；真实 admission 的领域事件、FIFO 防重和 delivery lease/结算幂等
   均保留。Core event 只负责提早唤醒，provider outstanding、静默判定及请求/响应丢失恢复由
@@ -342,9 +343,9 @@ last_updated: 2026-10-12
 - 同一 Camp、队员和当前 Conversation，未重置且 AdapterKind 相同，优先把当前绑定的原生 ID 交给 Adapter 恢复。历史配置、安装记录、版本、指纹、兼容 key 或上下文摘要不否决资格；切换 CLI 类型不传递旧 ID。当前权限、工具、工作目录、进程归属与执行防重继续检查。恢复目标与业务输入接收是不同权威。
 - Adapter 在恢复调用处提供结论；只有能力不支持、针对恢复请求的结构化拒绝或已有精确目标核验才允许一次新建。认证、网络、锁、初始化、模型、MCP、取消和超时等不能从报错文本推断旧历史失效。新建成功并绑定后才切换目标和提示，失败保留旧目标；完整行为见 [Runtime Launch v60](../contracts/runtime-launch-and-verification-v60.md)。
 - Bootstrap、章程和上下文格式变化不触发 Session rotation。新 Run 按现有装配方式生成当前 Bootstrap；旧原生历史允许保留旧说明。`SESSION_CHARTER → MEMBER_IDENTITY → ROVAI_PLATFORM_SKILLS → MEMORY_ENTRYPOINT?` 的结构及公开/Single Chat 输入区别不变。
-- 同一 Run/Binding/generation 的 Bootstrap 与 Manifest bytes/digest 保持冻结。历史 Bootstrap 不作为下一个 Run 的必读材料，损坏或缺失不挡续聊；现有 Evidence 表保留每次准备结果和旧 Blob 引用。是否投递仍由 Adapter delivery mode、Charter digest、redelivery requirement 和 accepted Input 门禁决定；不重复业务输入，也不伪造已接受事实。
+- 同一 Run/Binding/generation 的 Bootstrap 与 Manifest bytes 保持冻结。历史 Bootstrap 不作为下一个 Run 的必读材料，损坏或缺失不挡续聊；现有 Evidence 表保留每次准备结果和旧 Blob 引用。是否投递仍由 Adapter delivery mode、Charter digest、redelivery requirement 和 accepted Input 门禁决定；不重复业务输入，也不伪造已接受事实。
 - Session Charter 只拥有稳定产品合同、工具/Skill 进入方法与协作纪律，不复制 operation schema；文案及格式版本不构成原生历史有效性的证明。
-- Bootstrap 各组件、完整序列化 bytes 和实际投递是不同 evidence 层；不用“已生成完整 Bootstrap”替代 Runtime accepted evidence。ContextManifest 记录冻结 digest/versions，Runtime Input Delivery Evidence 记录实际 bytes 与 accepted ACK；只有当前有效 Run/epoch 和 Native Binding 的 accepted ACK 推进 Conversation 水位；明确未接受才可重新准备，accepted/unknown 不自动重发。迟到回执只补充证据，不修改 successor 水位。
+- Bootstrap 各组件、完整序列化 bytes 和实际投递是不同 evidence 层；不用“已生成完整 Bootstrap”替代 Runtime accepted evidence。ContextManifest 保存实际输入与必要来源，Runtime Input Delivery Evidence 记录实际 bytes 与 accepted ACK；只有当前有效 Run/epoch 和 Native Binding 的 accepted ACK 推进 Conversation 水位；明确未接受才可重新准备，accepted/unknown 不自动重发。迟到回执只补充证据，不修改 successor 水位。
 - Pi 的 `managed_system_prompt` 是第三种 Bootstrap delivery mode，不改变既有 Bootstrap 或 Formatter 22 原始 Dynamic Context。v7 extension 不注册 `input` 或 `tool_call` hook；它在每个 `before_agent_start` 重新读取当前 binding，只校验基本结构与 Bootstrap digest，并把完整 Bootstrap 追加到当时的 Pi system prompt。读取失败只发布脱敏 diagnostic 并让 Pi 按原生行为继续，不调用 abort，也不建立第二套 Session/cwd/Tool catalog 认证。`prompt` RPC response 只结束 command round trip；当前 Host owner 精确绑定的第一个 `agent_start` 才以现有 Delivery transition 接受 Input 并幂等发布 started。更早原生 Extension handled 输入而没有 `agent_start` 时，Rovai 不伪造 started。新 Run 不生成或读取 Managed Input Receipt；历史 Receipt 数据只作审计保留。Formatter 22 `prepared_context.rendered_payload` 不解析 `CURRENT_INPUT` 或 slash command，逐字节成为 Pi `prompt.message`；已授权图片只从结构化 ContextManifest refs 生成，schema-2 私有 evidence 直接绑定 Delivery。Pi `abort` 使用普通 pending request/response correlation，waiter 超时后迟到 response 仍被消费；非 Rovai Extension 的未映射交互只返回 cancelled/denied，不 poison Host。Pi system prompt 独立于压缩消息历史，因此固定使用 `native_system_prompt_preserved`，不创建 redelivery requirement 或 compaction observer lease。
 - Bootstrap redelivery 是 durable requirement，但 detector signal 本身不证明 compaction、不授权发送。Core 通过每 Native Session 唯一的 observer lease/generation、Runtime-owned policy epoch、prepared-input cutoff 和幂等 Session-scoped command 决定下一个尚未准备的输入是否需要 redelivery；旧 binding、旧 generation、迟到信号或已经 prepare 的输入都 fail closed。
 - 所有 Runtime 输入在一个 Core-owned 串行 preparation boundary 中冻结。Redelivery 是完整 Bootstrap 在本次输入上的 transient overlay，不改写 Session Charter、正常 Dynamic Context 或历史消息；Bootstrap+Current Input 共享有界 payload 门禁，无法完整交付时本次输入整体失败，不部分发送。
@@ -367,9 +368,9 @@ last_updated: 2026-10-12
 
 ### ContextManifest 与结构化 Run Facts
 
-- ContextManifest、模型输入 bytes、Runtime Input Delivery Evidence 和 Native Session/Run 状态是四个独立权威。Manifest 冻结模型实际可见选择、formatter/profile/section 版本、来源 digest、遗漏、水位和 exact compact payload digest；交付 evidence 记录 Runtime 实际接受。日志摘要、Run 状态或 Manifest 本身不能互相代替。
-- Manifest 对新 public Run 冻结完整有序 AgentRunInput、最后一条 anchor、执行配置、Skill Selection/Resolution v2、`ROVAI_ADDITIONAL_SKILLS` 完整文本/digest、visibility fence、claim 时前次有效接受边界及额外可见消息判断对应的 RUN_FACTS/historyHint 与 exact rendered bytes/digest；历史专属 refs/evidence 为空。输入附件只使用各消息 `RUN_INPUT.messages[].attachments`。旧 Manifest 原字节留作审计；v30/10/7、v29/9/7 和非 batch v26/6/5 在完整冻结证据下有界恢复，公开 v28 及更早不续派或重播。
-- 模型投影可以 compact，但不得丢失、重命名或自由文本化 authoritative fact。稳定产品规则留在 Session Charter，per-Run 事实只出现一次；每个 schema/formatter/profile/manifest/section 版本跟随实际 owner 独立推进，不用一个全局数字伪造同步升级。
+- ContextManifest 保存实际输入及必要来源、遗漏与水位；Runtime Input Delivery 记录真实接收，Native Session/Run 保存执行状态。新快照不再重复保存生成材料或其独立摘要，旧输入直接复用最终 Blob；不把历史版本组合用于再次证明已冻结输入。规则见[输入快照存储](../contracts/input-snapshot-storage-v1.md)。
+- Manifest 对新 public Run 冻结完整有序 AgentRunInput、最后一条 anchor、执行配置、Skill Selection/Resolution v2、最终输入中的 `ROVAI_ADDITIONAL_SKILLS` 文本、visibility fence、claim 时前次有效接受边界及额外可见消息判断对应的 RUN_FACTS/historyHint 与 实际输入字节；历史专属 refs/evidence 为空。输入附件只使用各消息 `RUN_INPUT.messages[].attachments`。旧 Manifest 原字节留作审计；v30/10/7、v29/9/7 和非 batch v26/6/5 保留已有序列化入口；已物化输入不因生成版本组合失配而拒绝。
+- 模型投影可以 compact，但不得丢失、重命名或自由文本化 authoritative fact。稳定产品规则留在 Session Charter，per-Run 事实只出现一次；实际格式变化由原序列化 owner 管理；不为中间材料另建兼容版本。
 - 新公开 batch `RUN_FACTS` v8 必有 `attachmentOutputRoot` 和 `historyHint`，其余只允许 Mission、Task、Session continuity 与真实 external effect；不含 Gather、delegation 或 conversationMode。Single Chat 使用非 batch v5；Core 生成的模型正文不包含协议 `schemaVersion`。
 - Mission start、Automation、Channel 与 A2A 都是普通 `RUN_INPUT.messages[]`，来源事实保留在业务域而不形成特殊 input kind。独立 `WORKSPACE` 段仍冻结实际目录/branch 并按既有 accepted-only 规则交付。默认寻址消息只在 `RUN_INPUT` 中派生冻结接收者 Mention；版本与完整 evidence 见 [ContextManifest v31](../contracts/context-manifest-evidence-v31.md)。
 - Self-active Task snapshot 只选当前成员在当前 Camp 显式负责的非终态 Task，按 Profile 的稳定 order/limit/budget priority 冻结。真实空集合产生显式 empty snapshot；候选存在但被上限/预算全部排除时整段省略并记 aggregate omitted count，不泄露被排除 ID。Renderer/Skill 不得临时改排序。
@@ -414,16 +415,17 @@ last_updated: 2026-10-12
 
 ### Built-in 权威与运输
 
-- Core 拥有封闭 canonical built-in operation catalog、授权、幂等、lease、receipt/replay、审计和完整 `BuiltinToolInvocationEnvelope`。一个 App 生命周期只有一个 Built-in Tool Router/Gateway 权威；CLI、Adapter 和外部 MCP 都不复制 Schema、Handler 或业务授权。
+- Core 拥有封闭 canonical built-in operation catalog、授权、幂等、lease、请求关联/replay、审计和完整 `BuiltinToolInvocationEnvelope`。一个 App 生命周期只有一个 Built-in Tool Router/Gateway 权威；CLI、Adapter 和外部 MCP 都不复制 Schema、Handler 或业务授权。
 - Router 在每次 Agent 业务 operation invocation 时重验 current Run/lease/Native Binding 与 Run 冻结的 exact active Camp membership version；旧 ID、旧 receipt、已知 target 或离开后再次添加都不恢复授权。terminal evidence 使用独立窄入口，不属于业务 operation capability。
+- Built-in Envelope 2 不包含结果摘要 receipt；静态目录只构造一次，不输出 catalog digest、不以说明文案或目录指纹淘汰 Binding。接口不兼容变化使用原协议版本，普通 Agent 输出保持。
 - Core IPC 先返回并校验完整 Envelope，然后按 operation 投影一份 closed Agent result JSON。普通 Agent 输出不包含 envelope wrapper、request identity 或 receipt，也不通过递归删字段得到；每个 operation 有明确 `agentOutputSchema` 与 golden fixture。完整 Envelope 只用于 Core、Evidence、Qualification 和 host-controlled debug 边界。
 - `rovai` CLI 是 Runtime 调用 Rovai-owned built-ins 的唯一运输。内置 MCP/`rovai_team` Bridge、注入、alias map、Runtime 临时配置和 native permission bundle 已 clean break 删除；不存在 fallback 或同 Run 双运输。用户外部 MCP 继续走独立 Library/Runtime-native projection，不经 Built-in Router。
-- CLI 使用领域分组命令，但 receipt、审计、Activity 与 Envelope 保留 canonical dotted operation identity。Native Session Bootstrap 只教稳定 CLI 入口和通用失败纪律；Agent 侧没有 `tool list`、`tool describe`、generic invoke 或全量 schema discovery。精确输入源和本命令约束由简短 `--help` 给出，复杂选择/恢复由 `cli-operations` Skill 说明。
-- CLI 将输入规范化为一个请求对象；只有 Send 正文文件可与除 `--body` 外的直接参数组合。Send 文件严格命中现有封闭请求 Schema 时保留整个请求，且禁止混入直接参数；其他合法 UTF-8 文本成为原文正文。识别后的业务失败不能降级重发。其他命令仍一次只选 direct arguments、JSON stdin/heredoc 或 JSON `--input-file`，不合并或覆盖；显式文件/参数不读取继承 stdin。文件与兼容边界见 [Built-in Tool Transport v37](../contracts/builtin-tool-transport-v37.md)。`camp.read` 只在所选来源成为 JSON 对象之后、canonical Schema 校验之前补全安全 Timeline 默认；默认 Timeline 发送给 Core 的 canonical JSON 始终包含 mode/direction/limit，其他显式 mode 继续发送各自完整 branch。其他命令不引入业务默认；输入文件路径、Shell quoting 与临时文件不是 Core 信任边界或保密保证。
+- CLI 使用领域分组命令，但 请求记录、审计、Activity 与 Envelope 保留 canonical dotted operation identity。Native Session Bootstrap 只教稳定 CLI 入口和通用失败纪律；Agent 侧没有 `tool list`、`tool describe`、generic invoke 或全量 schema discovery。精确输入源和本命令约束由简短 `--help` 给出，复杂选择/恢复由 `cli-operations` Skill 说明。
+- CLI 将输入规范化为一个请求对象；只有 Send 正文文件可与除 `--body` 外的直接参数组合。Send 文件严格命中现有封闭请求 Schema 时保留整个请求，且禁止混入直接参数；其他合法 UTF-8 文本成为原文正文。识别后的业务失败不能降级重发。其他命令仍一次只选 direct arguments、JSON stdin/heredoc 或 JSON `--input-file`，不合并或覆盖；显式文件/参数不读取继承 stdin。文件与兼容边界见 [Built-in Tool Transport v38](../contracts/builtin-tool-transport-v38.md)。`camp.read` 只在所选来源成为 JSON 对象之后、canonical Schema 校验之前补全安全 Timeline 默认；默认 Timeline 发送给 Core 的 canonical JSON 始终包含 mode/direction/limit，其他显式 mode 继续发送各自完整 branch。其他命令不引入业务默认；输入文件路径、Shell quoting 与临时文件不是 Core 信任边界或保密保证。
 - 目标 Runtime 必须在接收 Run 输入前证明 CLI、当前 IPC、Run binding 和当前 contract 可用；否则以结构化理由 fail closed，不启动降级 Agent。发布资格按 Runtime 及宿主平台独立验收，不因一个平台未准入而否定其他已验收组合。
-- Business rejection 投影稳定 code、safe message、closed recovery 和合同允许的 details；不泄露 stack、SQL、内部路径、IPC 地址、secret 或未筛底层错误。乐观冲突要求重读后重新判断；只有 Core 明确允许时才以同一 request identity 有界重试。幂等重试返回原 receipt/结果而不重复效果；无法证明时返回 outcome indeterminate 并要求核对当前状态。
+- Business rejection 投影稳定 code、safe message、closed recovery 和合同允许的 details；不泄露 stack、SQL、内部路径、IPC 地址、secret 或未筛底层错误。乐观冲突要求重读后重新判断；只有 Core 明确允许时才以同一 request identity 有界重试。幂等重试返回原结果而不重复效果；无法证明时返回 outcome indeterminate 并要求核对当前状态。
 - CLI 子进程通过当前 Run 的受保护本地 IPC endpoint 与新 lease 继承调用身份，不从可复用 Runtime 进程身份继承权力。Runtime 及它启动的子进程共享当前 Run/Member 归属和同一 scope/version/quota/fence，不根据父进程名、命令文本或层级猜测模型意图。Run release 先 fence lease，迟到子进程调用不得归属于后续 Run。
-- Unix Socket 和受保护 Windows Named Pipe 共享 Local IPC v2 语义：每 App 一个 endpoint，基于 OS identity 加 process/lease token 的双重校验，当前用户专用权限、framing、超时与断连不明时不盲重发。Rovai-owned request/response/Runtime adapter 不再使用统一逻辑总量上限；一次调用完整成功或明确失败，不允许 success + truncated，也不要求 Agent 通过 preview/blobRef/offset 补读。
+- Unix Socket 和受保护 Windows Named Pipe 共享 Local IPC v3 语义：每 App 一个 endpoint，基于 OS identity 加 process/lease token 的双重校验，当前用户专用权限、framing、超时与断连不明时不盲重发。Rovai-owned request/response/Runtime adapter 不再使用统一逻辑总量上限；一次调用完整成功或明确失败，不允许 success + truncated，也不要求 Agent 通过 preview/blobRef/offset 补读。
 - 当前 catalog 不包含 Gather。多人协作使用普通多目标 send；Core 不提供 Barrier、captured return 或 completion。CLI/Skill/help 不能继续宣传历史能力。
 - Mission read side 以有效 Run/epoch/lease/Binding 认证后全局读取，不把目标 Camp membership 或历史 ContextManifest 当 ACL；`mission.list/get` 不切换当前 Mission，`mission.update/status` 不接受目标 ID。数据库关系、内部事件、Agent Mission 操作和新 Context 共用唯一内部 `rvm_...` ID；number 派生的 `M-xxx` 只用于人类界面，不作为 Agent selector 或结果字段。
 - 一次已由 Core 验证的 CLI invocation 在主 Activity 中以 canonical operation 呈现。Runtime Shell Evidence 只在具有显式 Core request/receipt 与结构化 command identity 关联时折叠为 supporting transport；无法证明时保留两项独立 Evidence，不用文本、时间或目录猜测。

@@ -516,6 +516,8 @@
   "撤回这条消息": "Revoke this message",
   "全文已展开": "Full content expanded",
   "其余内容已收起": "Other content collapsed",
+  "正在同步队员名册": "Syncing teammate roster",
+  "队员 {0} 的名册正在同步": "Roster for teammate {0} is syncing",
   "该队员已不可用": "Teammate is unavailable",
   "不可用队员": "Unavailable teammate",
   "已复制这条消息": "Copied this message",

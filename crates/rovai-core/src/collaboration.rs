@@ -362,6 +362,9 @@ pub struct SendUserThreadDraftCommand {
 impl sealed::Sealed for SendUserThreadDraftCommand {}
 impl DomainCommand for SendUserThreadDraftCommand {
     const TYPE: &'static str = "camp.message.send_user_draft";
+    fn draft_client(&self) -> Option<&DraftClient> {
+        Some(&self.draft_client)
+    }
 }
 
 /// One-shot local Composer submission. Editing state stays in the Renderer; Core
@@ -9411,7 +9414,7 @@ mod slow_tests {
         );
         assert_eq!(row_count(&database, "camp_message_mention"), 0);
 
-        let receipt: (String, i64, String, String) = database
+        let receipt: (Option<String>, Option<i64>, String, String) = database
             .connection()
             .query_row(
                 r#"
@@ -9424,8 +9427,8 @@ mod slow_tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(receipt.0, "");
-        assert_eq!(receipt.1, 0);
+        assert_eq!(receipt.0, None);
+        assert_eq!(receipt.1, None);
         assert_eq!(receipt.2, "message.withdrawn");
         assert!(!receipt.3.contains("这段原文"));
 

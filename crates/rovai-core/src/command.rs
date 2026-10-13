@@ -9,8 +9,6 @@ use uuid::Uuid;
 
 use crate::db::Database;
 
-const REQUEST_DIGEST_VERSION: i64 = 1;
-const ERASED_REQUEST_DIGEST_VERSION: i64 = 0;
 pub(crate) const COMMAND_RESULT_STORAGE_MARKER_JSON: &str =
     r#"{"_rovaiStorage":"command-result-columns-v1"}"#;
 const COMMAND_RESULT_STORAGE_MARKER: &str = "command-result-columns-v1";
@@ -22,6 +20,11 @@ pub(crate) mod sealed {
 pub trait DomainCommand: sealed::Sealed + Serialize {
     const TYPE: &'static str;
     const ALLOWED_WHILE_CAMP_DELETING: bool = false;
+
+    /// Existing private draft commands belong to a Host-verified editor.
+    fn draft_client(&self) -> Option<&crate::draft_client::DraftClient> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,8 +174,6 @@ impl CommandHandlerResult {
 pub struct StoredCommandResult {
     pub command_id: String,
     pub command_type: String,
-    pub request_digest: String,
-    pub request_digest_version: i64,
     pub status: CommandResultStatus,
     pub code: String,
     pub payload: Value,
@@ -182,6 +183,10 @@ pub struct StoredCommandResult {
     actor_type: String,
     #[serde(skip)]
     actor_id: String,
+    #[serde(skip)]
+    source_agent_run_id: Option<String>,
+    #[serde(skip)]
+    command_client_id: Option<String>,
     #[serde(skip)]
     camp_id: Option<String>,
 }
@@ -226,9 +231,8 @@ impl DomainCommandGateway {
         C: DomainCommand,
     {
         validate_envelope::<C>(envelope)?;
-        let request_digest = request_digest(envelope)?;
         load_stored_result(database.connection(), &envelope.command_id)?
-            .map(|result| replay_or_conflict(result, envelope, &request_digest))
+            .map(|result| replay_or_conflict(result, envelope))
             .transpose()
     }
 
@@ -243,10 +247,9 @@ impl DomainCommandGateway {
         F: FnOnce(&Transaction<'_>) -> Result<CommandHandlerResult>,
     {
         validate_envelope::<C>(envelope)?;
-        let request_digest = request_digest(envelope)?;
 
         if let Some(result) = load_stored_result(database.connection(), &envelope.command_id)? {
-            return replay_or_conflict(result, envelope, &request_digest);
+            return replay_or_conflict(result, envelope);
         }
 
         let message_output = database.message_changes.clone();
@@ -257,7 +260,7 @@ impl DomainCommandGateway {
 
         if let Some(result) = load_stored_result(&transaction, &envelope.command_id)? {
             transaction.commit()?;
-            return replay_or_conflict(result, envelope, &request_digest);
+            return replay_or_conflict(result, envelope);
         }
 
         let message_changes =
@@ -284,8 +287,6 @@ impl DomainCommandGateway {
         let mut stored_result = StoredCommandResult {
             command_id: envelope.command_id.clone(),
             command_type: C::TYPE.to_string(),
-            request_digest,
-            request_digest_version: REQUEST_DIGEST_VERSION,
             status: handler_result.status,
             code: handler_result.code,
             payload: handler_result.payload,
@@ -293,6 +294,11 @@ impl DomainCommandGateway {
             recorded_at,
             actor_type: envelope.actor.actor_type().to_string(),
             actor_id: envelope.actor.actor_id().to_string(),
+            source_agent_run_id: envelope.actor.source_agent_run_id().map(str::to_string),
+            command_client_id: envelope
+                .payload
+                .draft_client()
+                .map(|client| client.id().to_owned()),
             camp_id: envelope.camp_id.clone(),
         };
         append_command_result(&transaction, envelope, &stored_result)?;
@@ -358,29 +364,6 @@ where
     }
 }
 
-fn request_digest<C>(envelope: &CommandEnvelope<C>) -> Result<String>
-where
-    C: DomainCommand,
-{
-    let mut expected_versions = envelope.expected_versions.clone();
-    expected_versions.sort_by(|left, right| {
-        (&left.entity_type, &left.entity_id, left.version).cmp(&(
-            &right.entity_type,
-            &right.entity_id,
-            right.version,
-        ))
-    });
-    let semantic_request = json!({
-        "digestVersion": REQUEST_DIGEST_VERSION,
-        "commandType": C::TYPE,
-        "actor": envelope.actor,
-        "campId": envelope.camp_id,
-        "expectedVersions": expected_versions,
-        "payload": crate::thread_compat::stored_command_payload(serde_json::to_value(&envelope.payload)?)?,
-    });
-    canonical_json_digest(&semantic_request)
-}
-
 pub fn canonical_json_digest(value: &Value) -> Result<String> {
     canonical_json_digest_with(|writer| write_canonical_json(writer, value))
 }
@@ -442,20 +425,24 @@ pub(crate) fn write_canonical_json(writer: &mut dyn Write, value: &Value) -> Res
 fn replay_or_conflict<C>(
     mut result: StoredCommandResult,
     envelope: &CommandEnvelope<C>,
-    request_digest: &str,
 ) -> Result<CommandExecution>
 where
     C: DomainCommand,
 {
-    let normal_match = result.command_type == C::TYPE
-        && result.request_digest_version == REQUEST_DIGEST_VERSION
-        && result.request_digest == request_digest;
-    let erased_scope_match = result.command_type == C::TYPE
-        && result.request_digest_version == ERASED_REQUEST_DIGEST_VERSION
+    // commandId names the first submission. A retry returns that result even
+    // if its payload changed; a new operation must use a new commandId.
+    if result.command_type == C::TYPE
         && result.actor_type == envelope.actor.actor_type()
         && result.actor_id == envelope.actor.actor_id()
-        && result.camp_id == envelope.camp_id;
-    if normal_match || erased_scope_match {
+        && result.source_agent_run_id.as_deref() == envelope.actor.source_agent_run_id()
+        && result.command_client_id.as_deref().is_none_or(|client_id| {
+            envelope
+                .payload
+                .draft_client()
+                .is_some_and(|client| client.id() == client_id)
+        })
+        && result.camp_id == envelope.camp_id
+    {
         crate::thread_compat::project_command_result(C::TYPE, &mut result.payload)?;
         return Ok(CommandExecution {
             result,
@@ -473,79 +460,71 @@ fn load_stored_result(
     connection: &rusqlite::Connection,
     command_id: &str,
 ) -> Result<Option<StoredCommandResult>> {
-    connection
+    let row = connection
         .query_row(
-            r#"
-            SELECT command_id, command_type, request_digest, request_digest_version,
-                   result_status, result_code, result_payload_json,
-                   result_entity_type, result_entity_id, created_at,
-                   actor_type, actor_id, camp_id
-            FROM event_log
-            WHERE event_type = 'command.result' AND command_id = ?1
-            "#,
+            "SELECT command_id, command_type, result_status, result_code, result_payload_json,
+                result_entity_type, result_entity_id, created_at, actor_type, actor_id,
+                source_agent_run_id, camp_id, command_client_id
+         FROM event_log WHERE event_type = 'command.result' AND command_id = ?1",
             [command_id],
             |row| {
-                let status = row.get::<_, String>(4)?;
-                let payload = row.get::<_, String>(6)?;
-                let result_entity_type = row.get::<_, Option<String>>(7)?;
-                let result_entity_id = row.get::<_, Option<String>>(8)?;
-                let result_entity = match (result_entity_type, result_entity_id) {
-                    (Some(entity_type), Some(entity_id)) => Some(EntityReference {
-                        entity_type,
-                        entity_id,
-                    }),
-                    _ => None,
-                };
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    status,
-                    row.get::<_, String>(5)?,
-                    payload,
-                    result_entity,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
                     row.get::<_, String>(9)?,
-                    row.get::<_, String>(10)?,
-                    row.get::<_, String>(11)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
                     row.get::<_, Option<String>>(12)?,
                 ))
             },
         )
-        .optional()?
-        .map(
-            |(
+        .optional()?;
+    row.map(
+        |(
+            command_id,
+            command_type,
+            status,
+            code,
+            payload,
+            entity_type,
+            entity_id,
+            recorded_at,
+            actor_type,
+            actor_id,
+            source_agent_run_id,
+            camp_id,
+            command_client_id,
+        )| {
+            Ok(StoredCommandResult {
                 command_id,
                 command_type,
-                request_digest,
-                request_digest_version,
-                status,
+                status: CommandResultStatus::parse(&status)?,
                 code,
-                payload,
-                result_entity,
+                payload: serde_json::from_str(&payload)
+                    .context("failed to decode persisted command result payload")?,
+                result_entity: entity_type.zip(entity_id).map(|(entity_type, entity_id)| {
+                    EntityReference {
+                        entity_type,
+                        entity_id,
+                    }
+                }),
                 recorded_at,
                 actor_type,
                 actor_id,
+                source_agent_run_id,
                 camp_id,
-            )| {
-                Ok(StoredCommandResult {
-                    command_id,
-                    command_type,
-                    request_digest,
-                    request_digest_version,
-                    status: CommandResultStatus::parse(&status)?,
-                    code,
-                    payload: serde_json::from_str(&payload)
-                        .context("failed to decode persisted command result payload")?,
-                    result_entity,
-                    recorded_at,
-                    actor_type,
-                    actor_id,
-                    camp_id,
-                })
-            },
-        )
-        .transpose()
+                command_client_id,
+            })
+        },
+    )
+    .transpose()
 }
 
 pub(crate) fn project_persisted_command_result_event_payload(
@@ -625,14 +604,14 @@ where
             event_id, task_id, turn_id, sequence, event_type, native_method,
             payload_json, camp_id, entity_type, entity_id, actor_type, actor_id,
             source_agent_run_id, execution_epoch, command_id, command_type,
-            request_digest, request_digest_version, result_status, result_code,
-            result_payload_json, result_entity_type, result_entity_id, created_at
+            result_status, result_code,
+            result_payload_json, result_entity_type, result_entity_id, created_at, command_client_id
         ) VALUES (
             ?1, NULL, NULL, NULL, 'command.result', NULL,
             ?2, ?3, ?4, ?5, ?6, ?7,
             ?8, ?9, ?10, ?11,
             ?12, ?13, ?14, ?15,
-            ?16, ?17, ?18, ?19
+            ?16, ?17, ?18
         )
         "#,
         params![
@@ -647,23 +626,20 @@ where
             envelope.execution_epoch,
             result.command_id,
             result.command_type,
-            result.request_digest,
-            result.request_digest_version,
             result.status.as_str(),
             result.code,
             result_payload_json,
             result_entity_type,
             result_entity_id,
             result.recorded_at,
+            result.command_client_id,
         ],
     )?;
     Ok(())
 }
 
-/// Replaces a content-derived command receipt with a terminal, plaintext-free
-/// receipt. Replays still use the same command-result record and are authorized
-/// by command type plus actor/Camp scope, but never compare or restore the
-/// erased request digest.
+/// Erases a withdrawn command's result content and any historical request
+/// digest. Its command identity and scope remain available for result lookup.
 pub(crate) fn erase_command_result_receipt(
     transaction: &Transaction<'_>,
     command_id: &str,
@@ -679,25 +655,24 @@ pub(crate) fn erase_command_result_receipt(
     let changed = transaction.execute(
         r#"
         UPDATE event_log
-        SET request_digest = '',
-            request_digest_version = ?2,
+        SET request_digest = NULL,
+            request_digest_version = NULL,
             result_status = 'applied',
             result_code = 'message.withdrawn',
-            result_payload_json = ?3,
+            result_payload_json = ?2,
             result_entity_type = 'camp_message',
-            result_entity_id = ?4
+            result_entity_id = ?3
         WHERE event_type = 'command.result'
           AND command_id = ?1
-          AND command_type = ?5
-          AND actor_type = ?6
-          AND actor_id = ?7
-          AND camp_id = ?8
+          AND command_type = ?4
+          AND actor_type = ?5
+          AND actor_id = ?6
+          AND camp_id = ?7
           AND result_entity_type = 'camp_message'
-          AND result_entity_id = ?4
+          AND result_entity_id = ?3
         "#,
         params![
             command_id,
-            ERASED_REQUEST_DIGEST_VERSION,
             payload,
             message_id,
             command_type,
@@ -753,42 +728,13 @@ mod tests {
 
     #[test]
     fn canonical_digest_ignores_json_object_key_order() {
-        let legacy = json!({"campId":"scope", "replyToCampMessageId":"message", "content":{"text":"threadId", "threadId":"quoted-user-data"}});
-        let current = json!({"threadId":"scope", "replyToThreadMessageId":"message", "content":{"text":"threadId", "threadId":"quoted-user-data"}});
-        assert_eq!(
-            crate::thread_compat::stored_command_payload(current).unwrap(),
-            legacy
-        );
-
         let left = system_command("command-1", json!({ "a": 1, "b": { "c": 2, "d": 3 } }));
         let right = system_command("command-1", json!({ "b": { "d": 3, "c": 2 }, "a": 1 }));
 
         assert_eq!(
-            request_digest(&left).unwrap(),
-            request_digest(&right).unwrap()
+            canonical_json_digest(&left.payload.payload).unwrap(),
+            canonical_json_digest(&right.payload.payload).unwrap()
         );
-    }
-
-    #[test]
-    fn execution_epoch_fences_processing_without_changing_command_semantics() {
-        let command = TestCommand {
-            payload: json!({ "value": 42 }),
-        };
-        let mut first = CommandEnvelope {
-            command_id: "agent-command".to_string(),
-            actor: ActorRef::Agent {
-                agent_id: "agent_2".to_string(),
-                source_agent_run_id: "run-1".to_string(),
-            },
-            camp_id: Some("camp-1".to_string()),
-            expected_versions: Vec::new(),
-            execution_epoch: Some(1),
-            payload: command.clone(),
-        };
-        let first_digest = request_digest(&first).unwrap();
-        first.execution_epoch = Some(2);
-
-        assert_eq!(first_digest, request_digest(&first).unwrap());
     }
 
     #[test]
@@ -1249,7 +1195,7 @@ mod tests {
     }
 
     #[test]
-    fn reusing_command_id_for_a_different_request_is_a_stable_conflict() {
+    fn command_identity_replays_the_first_result_and_rejects_a_different_scope() {
         let (mut database, directory) = database();
         let gateway = DomainCommandGateway;
         let first = system_command("command-1", json!({ "value": 1 }));
@@ -1257,18 +1203,27 @@ mod tests {
             .execute(&mut database, &first, |_| {
                 Ok(CommandHandlerResult::applied(
                     "test.applied",
-                    Value::Null,
+                    json!({ "value": 1 }),
                     None,
                 ))
             })
             .unwrap();
 
         let changed = system_command("command-1", json!({ "value": 2 }));
-        let error = gateway
+        let replay = gateway
             .execute(&mut database, &changed, |_| {
-                unreachable!("conflicting command must not run")
+                unreachable!("a repeated command ID must not run again")
             })
-            .expect_err("changed request should conflict");
+            .expect("same command identity should replay its first result");
+        assert!(replay.replayed);
+        assert_eq!(replay.result.payload, json!({ "value": 1 }));
+        let mut other_actor = changed.clone();
+        other_actor.actor = ActorRef::System {
+            component_id: "another-actor".to_string(),
+        };
+        let error = gateway
+            .replay_if_recorded(&database, &other_actor)
+            .expect_err("an ID belonging to another actor must not replay");
         assert!(matches!(
             error.downcast_ref::<CommandGatewayError>(),
             Some(CommandGatewayError::IdempotencyConflict { command_id })

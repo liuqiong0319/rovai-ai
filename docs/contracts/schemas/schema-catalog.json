@@ -31,7 +31,7 @@
       "file": "tool-interaction-measurement-v2.schema.json",
       "schemaUri": "https://schemas.rovai.invalid/contracts/tool-interaction-measurement-v2.schema.json",
       "schemaVersion": "2.0.0",
-      "digest": "sha256:830564c85714f09db074a13ee02651d276d9c4452e09acb31749d0bb8f198d4a"
+      "digest": "sha256:f5d53f4c9144e0af51fe46ca7f68a82164f360897ca3600ffa362e4260a21f7b"
     },
     {
       "file": "tool-use-judge-pack-v1.schema.json",

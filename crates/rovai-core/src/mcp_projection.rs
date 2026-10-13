@@ -25,7 +25,6 @@ use crate::{
     agent_runtime_adapter::{
         AgentRuntimeAdapterRegistry, ExternalMcpProjection, McpSameNamePolicy,
     },
-    command::canonical_json_digest,
     db::Database,
     mcp::{McpConfigIssue, McpConfigStore, McpServerDefinition},
 };
@@ -39,8 +38,6 @@ use crate::platform::private_storage::{
 const MCP_PROJECTION_SCHEMA_VERSION: u32 = 2;
 #[cfg(any(unix, windows))]
 const MAX_PROJECTION_BYTES: u64 = 2 * 1024 * 1024;
-pub const LEGACY_EMPTY_MCP_EXPOSURE_DIGEST: &str = "sha256:legacy-empty-mcp-exposure";
-pub const LEGACY_EMPTY_MCP_PROJECTION_DIGEST: &str = "sha256:legacy-empty-mcp-projection";
 pub const CLAUDE_CODE_MCP_MINIMUM_VERSION: &str = "1.0.44";
 pub const COPILOT_MCP_MINIMUM_VERSION: &str = "0.0.370";
 
@@ -109,17 +106,13 @@ pub struct McpProjectionRequest<'a> {
 #[derive(Debug, Clone)]
 pub struct PreparedMcpProjection {
     pub snapshot: McpExposureSnapshot,
-    pub exposure_digest: String,
     pub projection_digest: String,
     pub canonical_path: PathBuf,
     pub servers: BTreeMap<String, McpServerDefinition>,
 }
 
 impl PreparedMcpProjection {
-    pub fn finalize_native_name_conflicts(
-        &mut self,
-        native_mcp_server_names: &BTreeSet<String>,
-    ) -> Result<()> {
+    pub fn finalize_native_name_conflicts(&mut self, native_mcp_server_names: &BTreeSet<String>) {
         for entry in &mut self.snapshot.servers {
             if entry.status == McpExposureStatus::Ready
                 && self.snapshot.same_name_policy == Some(McpSameNamePolicy::NativeWinsSkip)
@@ -132,8 +125,6 @@ impl PreparedMcpProjection {
                 entry.reason = Some("native_mcp_name_conflict".to_string());
             }
         }
-        self.exposure_digest = canonical_json_digest(&serde_json::to_value(&self.snapshot)?)?;
-        Ok(())
     }
 }
 
@@ -145,13 +136,6 @@ struct ProjectionFile {
     adapter_kind: AdapterKind,
     exposure: McpExposureSnapshot,
     servers: BTreeMap<String, McpServerDefinition>,
-}
-
-#[derive(Debug, Clone)]
-struct FrozenProjection {
-    exposure: McpExposureSnapshot,
-    exposure_digest: String,
-    projection_digest: String,
 }
 
 #[derive(Debug, Clone)]
@@ -183,8 +167,8 @@ impl McpProjectionService {
             return self.load_and_validate(&target, request, frozen.as_ref());
         }
         if let Some(frozen) = frozen.as_ref() {
-            if frozen.projection_digest == LEGACY_EMPTY_MCP_PROJECTION_DIGEST {
-                let projection = empty_legacy_projection(request);
+            let projection = empty_legacy_projection(request);
+            if frozen == &projection.exposure {
                 self.publish_projection(request, &projection)?;
                 return self.load_and_validate(&target, request, Some(frozen));
             }
@@ -244,7 +228,7 @@ impl McpProjectionService {
     fn find_previous(
         &self,
         request: &McpProjectionRequest<'_>,
-        frozen: Option<&FrozenProjection>,
+        frozen: Option<&McpExposureSnapshot>,
     ) -> Result<Option<(Vec<u8>, String)>> {
         let run_root = self.run_root(request.agent_run_id);
         if !run_root.exists() {
@@ -270,7 +254,7 @@ impl McpProjectionService {
             }
             let (bytes, digest) = read_private_projection_bytes(&path)?;
             let projection = parse_projection(&bytes, request)?;
-            validate_projection_digest(&projection, &digest, frozen)?;
+            validate_projection(&projection, frozen)?;
             if let Some((_, previous_digest)) = found.as_ref()
                 && previous_digest != &digest
             {
@@ -367,32 +351,14 @@ impl McpProjectionService {
         &self,
         target: &Path,
         request: &McpProjectionRequest<'_>,
-        frozen: Option<&FrozenProjection>,
+        frozen: Option<&McpExposureSnapshot>,
     ) -> Result<PreparedMcpProjection> {
         ensure_private_directory(target)?;
         let canonical_path = target.join("canonical.json");
         let (bytes, projection_digest) = read_private_projection_bytes(&canonical_path)?;
         let projection = parse_projection(&bytes, request)?;
-        let original_exposure_digest =
-            canonical_json_digest(&serde_json::to_value(&projection.exposure)?)?;
-        validate_projection_digest(&projection, &projection_digest, frozen)?;
-        let (snapshot, exposure_digest) = if let Some(frozen) = frozen {
-            validate_frozen_exposure(&projection.exposure, &frozen.exposure)?;
-            (
-                frozen.exposure.clone(),
-                if frozen.exposure_digest == LEGACY_EMPTY_MCP_EXPOSURE_DIGEST {
-                    frozen.exposure_digest.clone()
-                } else {
-                    let digest = canonical_json_digest(&serde_json::to_value(&frozen.exposure)?)?;
-                    if digest != frozen.exposure_digest {
-                        anyhow::bail!("Frozen MCP exposure digest is invalid");
-                    }
-                    digest
-                },
-            )
-        } else {
-            (projection.exposure.clone(), original_exposure_digest)
-        };
+        validate_projection(&projection, frozen)?;
+        let snapshot = frozen.unwrap_or(&projection.exposure).clone();
         let ready_names = snapshot
             .servers
             .iter()
@@ -412,7 +378,6 @@ impl McpProjectionService {
             .collect();
         Ok(PreparedMcpProjection {
             snapshot,
-            exposure_digest,
             projection_digest,
             canonical_path,
             servers,
@@ -771,38 +736,19 @@ fn validate_request(request: &McpProjectionRequest<'_>) -> Result<()> {
 fn load_frozen_projection(
     database: &Database,
     agent_run_id: &str,
-) -> Result<Option<FrozenProjection>> {
+) -> Result<Option<McpExposureSnapshot>> {
     database
         .connection()
         .query_row(
             r#"
-            SELECT mcp_exposure_json, mcp_exposure_digest, mcp_projection_digest
+            SELECT mcp_exposure_json
             FROM context_manifest WHERE agent_run_id = ?1
             "#,
             [agent_run_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
+            |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|(json, exposure_digest, projection_digest)| {
-            let exposure = serde_json::from_str::<McpExposureSnapshot>(&json)
-                .context("stored MCP exposure is invalid")?;
-            if exposure_digest != LEGACY_EMPTY_MCP_EXPOSURE_DIGEST
-                && canonical_json_digest(&serde_json::to_value(&exposure)?)? != exposure_digest
-            {
-                anyhow::bail!("stored MCP exposure digest is invalid");
-            }
-            Ok(FrozenProjection {
-                exposure,
-                exposure_digest,
-                projection_digest,
-            })
-        })
+        .map(|json| serde_json::from_str(&json).context("stored MCP exposure is invalid"))
         .transpose()
 }
 
@@ -818,19 +764,15 @@ fn parse_projection(bytes: &[u8], request: &McpProjectionRequest<'_>) -> Result<
     Ok(projection)
 }
 
-fn validate_projection_digest(
+fn validate_projection(
     projection: &ProjectionFile,
-    projection_digest: &str,
-    frozen: Option<&FrozenProjection>,
+    frozen: Option<&McpExposureSnapshot>,
 ) -> Result<()> {
-    if let Some(frozen) = frozen
-        && frozen.projection_digest != LEGACY_EMPTY_MCP_PROJECTION_DIGEST
-        && frozen.projection_digest != projection_digest
-    {
-        anyhow::bail!("private MCP projection digest does not match the frozen manifest");
-    }
     if projection.exposure.schema_version != MCP_PROJECTION_SCHEMA_VERSION {
         anyhow::bail!("private MCP exposure schema is unsupported");
+    }
+    if let Some(frozen) = frozen {
+        validate_frozen_exposure(&projection.exposure, frozen)?;
     }
     Ok(())
 }
@@ -1354,9 +1296,7 @@ mod tests {
         let run_id = Uuid::new_v4().to_string();
         let codex_request = request(&run_id, 1, &root, AdapterKind::CodexCli);
         let mut prepared = service.prepare(&database, &store, &codex_request).unwrap();
-        prepared
-            .finalize_native_name_conflicts(&BTreeSet::from(["Docs".to_string()]))
-            .unwrap();
+        prepared.finalize_native_name_conflicts(&BTreeSet::from(["Docs".to_string()]));
         let entry = prepared
             .snapshot
             .servers
@@ -1376,9 +1316,7 @@ mod tests {
         let mut recovered = service
             .prepare(&database, &store, &recovered_request)
             .unwrap();
-        recovered
-            .finalize_native_name_conflicts(&BTreeSet::from(["docs".to_string()]))
-            .unwrap();
+        recovered.finalize_native_name_conflicts(&BTreeSet::from(["docs".to_string()]));
         assert_eq!(recovered.snapshot, prepared.snapshot);
         assert_eq!(recovered.servers, prepared.servers);
         drop(database);

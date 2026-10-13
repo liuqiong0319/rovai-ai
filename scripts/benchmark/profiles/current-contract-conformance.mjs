@@ -81,7 +81,7 @@ export const CURRENT_CONTRACT_PREREQUISITES = Object.freeze([
   },
   {
     id: 'built-in-transport-v31',
-    evidence: test('crates/rovai-core/src/builtin_tool_transport.rs', 'list_and_describe_share_one_digest')
+    evidence: test('crates/rovai-core/src/builtin_tool_transport.rs', 'list_and_describe_share_the_current_catalog')
   },
   {
     id: 'accepted-input-ack',

@@ -29,7 +29,7 @@
             "runtimeCompatibility": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["builtinToolCatalogDigest", "builtinToolContractVersion", "builtinToolIpcProtocolVersion", "operationProjectionSchemaVersion"],
+              "required": ["builtinToolContractVersion", "builtinToolIpcProtocolVersion", "operationProjectionSchemaVersion"],
               "properties": {
                 "builtinToolCatalogDigest": { "$ref": "https://schemas.rovai.invalid/v0.34/artifact-envelope.schema.json#/$defs/digest" },
                 "builtinToolContractVersion": { "type": "integer", "minimum": 1 },

@@ -302,6 +302,10 @@ impl ManagedProcessLaunchSpec {
         &self.environment
     }
 
+    pub(crate) fn environment_value(&self, key: &str) -> Option<&std::ffi::OsStr> {
+        environment_value(&self.environment, std::ffi::OsStr::new(key))
+    }
+
     pub fn stdin_policy(&self) -> ManagedStdinPolicy {
         self.stdin_policy
     }
@@ -360,7 +364,6 @@ fn capture_windows_runtime_entrypoint(
     )
 }
 
-#[cfg(windows)]
 fn environment_value<'a>(
     environment: &'a BTreeMap<OsString, OsString>,
     key: &std::ffi::OsStr,
@@ -1082,6 +1085,10 @@ mod tests {
         assert_eq!(
             environment.get(&OsString::from("PATH")),
             Some(&OsString::from("current"))
+        );
+        assert_eq!(
+            environment_value(&environment, std::ffi::OsStr::new("path")),
+            Some(std::ffi::OsStr::new("current"))
         );
     }
 

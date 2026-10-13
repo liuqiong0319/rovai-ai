@@ -367,8 +367,6 @@ function commandResult(payload: Record<string, unknown>): StoredCommandResult {
   return {
     commandId: 'command-1',
     commandType: 'skill.enabled.set',
-    requestDigest: 'sha256:request',
-    requestDigestVersion: 1,
     status: 'applied',
     code: 'skill_disabled',
     payload,

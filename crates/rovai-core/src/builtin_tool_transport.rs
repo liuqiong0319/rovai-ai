@@ -1,24 +1,21 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
+    sync::OnceLock,
 };
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::{
-    command::{canonical_json_digest, canonical_json_digest_with, write_canonical_json},
-    team_tool_catalog::builtin_tool_definitions,
-};
+use crate::team_tool_catalog::builtin_tool_definitions;
 
-pub const BUILTIN_TOOL_CONTRACT_VERSION: u32 = 37;
-pub const BUILTIN_TOOL_IPC_PROTOCOL_VERSION: u32 = 2;
-pub const BUILTIN_TOOL_ENVELOPE_VERSION: u32 = 1;
-pub const BUILTIN_TOOL_RECEIPT_VERSION: u32 = 1;
-pub const BUILTIN_TOOL_CLI_COMMAND_VERSION: u32 = 37;
+pub const BUILTIN_TOOL_CONTRACT_VERSION: u32 = 38;
+pub const BUILTIN_TOOL_IPC_PROTOCOL_VERSION: u32 = 3;
+pub const BUILTIN_TOOL_ENVELOPE_VERSION: u32 = 2;
+pub const BUILTIN_TOOL_CLI_COMMAND_VERSION: u32 = 38;
 pub const BUILTIN_TOOL_AGENT_OUTPUT_CONTRACT_VERSION: u32 = 10;
-pub const BUILTIN_TOOL_RUNTIME_CAPABILITY: &str = "builtin_cli.transport.v37";
+pub const BUILTIN_TOOL_RUNTIME_CAPABILITY: &str = "builtin_cli.transport.v38";
 pub const ROVAI_AGENT_CLI_ENV: &str = "ROVAI_AGENT_CLI";
 pub const ROVAI_CLI_CONTEXT_ENV: &str = "ROVAI_CLI_CONTEXT";
 pub const ROVAI_RUN_TMP_ENV: &str = "ROVAI_RUN_TMP";
@@ -418,7 +415,6 @@ pub struct BuiltinToolInvocationEnvelope {
     pub ok: bool,
     pub operation: String,
     pub request_id: String,
-    pub receipt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -427,14 +423,11 @@ pub struct BuiltinToolInvocationEnvelope {
 
 impl BuiltinToolInvocationEnvelope {
     pub fn success(operation: &str, request_id: &str, result: Value) -> Result<Self> {
-        let result = canonical_operation_result(result)?;
-        let receipt = builtin_tool_receipt(operation, request_id, true, &result)?;
         let envelope = Self {
             contract_version: BUILTIN_TOOL_ENVELOPE_VERSION,
             ok: true,
             operation: operation.to_string(),
             request_id: request_id.to_string(),
-            receipt,
             result: Some(result),
             error: None,
         };
@@ -443,14 +436,11 @@ impl BuiltinToolInvocationEnvelope {
     }
 
     pub fn rejected(operation: &str, request_id: &str, error: BuiltinToolError) -> Result<Self> {
-        let error_value = serde_json::to_value(&error)?;
-        let receipt = builtin_tool_receipt(operation, request_id, false, &error_value)?;
         let envelope = Self {
             contract_version: BUILTIN_TOOL_ENVELOPE_VERSION,
             ok: false,
             operation: operation.to_string(),
             request_id: request_id.to_string(),
-            receipt,
             result: None,
             error: Some(error),
         };
@@ -467,10 +457,9 @@ impl BuiltinToolInvocationEnvelope {
         }
         uuid::Uuid::parse_str(&self.request_id)
             .context("Built-in Tool envelope requestId must be a UUID")?;
-        let expected_receipt = match (self.ok, self.result.as_ref(), self.error.as_ref()) {
+        match (self.ok, self.result.as_ref(), self.error.as_ref()) {
             (true, Some(result), None) => {
                 validate_canonical_operation_result(result)?;
-                builtin_tool_receipt(&self.operation, &self.request_id, true, result)?
             }
             (false, None, Some(error)) => {
                 if error.code.trim().is_empty() || error.message.trim().is_empty() {
@@ -483,14 +472,9 @@ impl BuiltinToolInvocationEnvelope {
                 {
                     bail!("Built-in Tool error details must be an object");
                 }
-                let error = serde_json::to_value(error)?;
-                builtin_tool_receipt(&self.operation, &self.request_id, false, &error)?
             }
             _ => bail!("Built-in Tool envelope must contain exactly one of result or error"),
         };
-        if self.receipt != expected_receipt {
-            bail!("Built-in Tool envelope receipt does not cover its outcome");
-        }
         Ok(())
     }
 }
@@ -507,7 +491,6 @@ pub struct BuiltinToolListItem {
 #[serde(rename_all = "camelCase")]
 pub struct BuiltinToolList {
     pub contract_version: u32,
-    pub catalog_digest: String,
     pub operations: Vec<BuiltinToolListItem>,
 }
 
@@ -539,7 +522,6 @@ pub struct BuiltinToolEnvelopeContract {
 #[serde(rename_all = "camelCase")]
 pub struct BuiltinToolDescription {
     pub contract_version: u32,
-    pub catalog_digest: String,
     pub name: String,
     pub command: Vec<String>,
     pub summary: String,
@@ -554,19 +536,7 @@ pub struct BuiltinToolDescription {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-struct CatalogDigestDocument {
-    contract_version: u32,
-    ipc_protocol_version: u32,
-    envelope_contract_version: u32,
-    receipt_version: u32,
-    cli_command_version: u32,
-    agent_output_contract_version: u32,
-    operations: Vec<CatalogDigestOperation>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-struct CatalogDigestOperation {
+struct CatalogOperation {
     name: String,
     command: Vec<String>,
     summary: String,
@@ -598,17 +568,15 @@ pub fn builtin_tool_identity_by_command(
 }
 
 pub fn builtin_tool_list() -> Result<BuiltinToolList> {
-    let definitions = catalog_digest_operations()?;
-    let catalog_digest = builtin_tool_catalog_digest_from(&definitions)?;
+    let definitions = catalog_operations()?;
     Ok(BuiltinToolList {
         contract_version: BUILTIN_TOOL_CONTRACT_VERSION,
-        catalog_digest,
         operations: definitions
-            .into_iter()
+            .iter()
             .map(|definition| BuiltinToolListItem {
-                name: definition.name,
-                command: definition.command,
-                summary: definition.summary,
+                name: definition.name.clone(),
+                command: definition.command.clone(),
+                summary: definition.summary.clone(),
             })
             .collect(),
     })
@@ -616,15 +584,14 @@ pub fn builtin_tool_list() -> Result<BuiltinToolList> {
 
 pub fn builtin_tool_description(operation: &str) -> Result<BuiltinToolDescription> {
     let operation = crate::thread_compat::canonical_operation(operation);
-    let definitions = catalog_digest_operations()?;
-    let catalog_digest = builtin_tool_catalog_digest_from(&definitions)?;
+    let definitions = catalog_operations()?;
     let definition = definitions
-        .into_iter()
+        .iter()
         .find(|definition| definition.name == operation)
+        .cloned()
         .with_context(|| format!("unknown Built-in Tool operation: {operation}"))?;
     Ok(BuiltinToolDescription {
         contract_version: BUILTIN_TOOL_CONTRACT_VERSION,
-        catalog_digest,
         name: definition.name,
         command: definition.command,
         summary: definition.summary,
@@ -641,27 +608,18 @@ pub fn builtin_tool_description(operation: &str) -> Result<BuiltinToolDescriptio
     })
 }
 
-pub fn builtin_tool_catalog_digest() -> Result<String> {
-    let definitions = catalog_digest_operations()?;
-    builtin_tool_catalog_digest_from(&definitions)
+fn catalog_operations() -> Result<&'static [CatalogOperation]> {
+    static CATALOG: OnceLock<std::result::Result<Vec<CatalogOperation>, String>> = OnceLock::new();
+    CATALOG
+        .get_or_init(|| build_catalog_operations().map_err(|error| format!("{error:#}")))
+        .as_ref()
+        .map(Vec::as_slice)
+        .map_err(|error| anyhow::anyhow!(error.clone()))
 }
 
-fn builtin_tool_catalog_digest_from(definitions: &[CatalogDigestOperation]) -> Result<String> {
-    let digest = canonical_json_digest(&serde_json::to_value(CatalogDigestDocument {
-        contract_version: BUILTIN_TOOL_CONTRACT_VERSION,
-        ipc_protocol_version: BUILTIN_TOOL_IPC_PROTOCOL_VERSION,
-        envelope_contract_version: BUILTIN_TOOL_ENVELOPE_VERSION,
-        receipt_version: BUILTIN_TOOL_RECEIPT_VERSION,
-        cli_command_version: BUILTIN_TOOL_CLI_COMMAND_VERSION,
-        agent_output_contract_version: BUILTIN_TOOL_AGENT_OUTPUT_CONTRACT_VERSION,
-        operations: definitions.to_vec(),
-    })?)?;
-    Ok(format!("sha256:{digest}"))
-}
-
-fn catalog_digest_operations() -> Result<Vec<CatalogDigestOperation>> {
+fn build_catalog_operations() -> Result<Vec<CatalogOperation>> {
     let mut definitions_by_name = builtin_tool_definitions()
-        .into_iter()
+        .iter()
         .map(|definition| {
             let name = definition["name"]
                 .as_str()
@@ -679,7 +637,7 @@ fn catalog_digest_operations() -> Result<Vec<CatalogDigestOperation>> {
         let result_schema = definition["outputSchema"].clone();
         let agent_output_schema =
             crate::builtin_tool_cli_output::agent_output_schema(identity.operation)?;
-        operations.push(CatalogDigestOperation {
+        operations.push(CatalogOperation {
             name: identity.operation.to_string(),
             command: if identity.action.is_empty() {
                 vec![identity.group.to_string()]
@@ -1072,42 +1030,16 @@ pub fn recovery_for_operation_error(operation: &str, code: &str) -> BuiltinToolR
         .unwrap_or_else(|| recovery_for_error_code(code))
 }
 
-pub fn builtin_tool_receipt(
-    operation: &str,
-    request_id: &str,
-    ok: bool,
-    result_or_error: &Value,
-) -> Result<String> {
-    // Keep the receipt-v1 canonical preimage byte-for-byte compatible without
-    // rebuilding the potentially large result tree as an owned serde_json::Value.
-    let digest = canonical_json_digest_with(|writer| {
-        writer.write_all(b"{\"contractVersion\":")?;
-        serde_json::to_writer(&mut *writer, &BUILTIN_TOOL_RECEIPT_VERSION)?;
-        writer.write_all(b",\"domain\":\"rovai.builtin-tool-receipt.v1\",\"ok\":")?;
-        serde_json::to_writer(&mut *writer, &ok)?;
-        writer.write_all(b",\"operation\":")?;
-        serde_json::to_writer(&mut *writer, operation)?;
-        writer.write_all(b",\"requestId\":")?;
-        serde_json::to_writer(&mut *writer, request_id)?;
-        writer.write_all(b",\"resultOrError\":")?;
-        write_canonical_json(writer, result_or_error)?;
-        writer.write_all(b"}")?;
-        Ok(())
-    })?;
-    Ok(format!("sha256:{digest}"))
-}
-
 pub fn builtin_tool_envelope_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["contractVersion", "ok", "operation", "requestId", "receipt"],
+        "required": ["contractVersion", "ok", "operation", "requestId"],
         "properties": {
             "contractVersion": {"const": BUILTIN_TOOL_ENVELOPE_VERSION},
             "ok": {"type": "boolean"},
             "operation": {"type": "string"},
             "requestId": {"type": "string", "format": "uuid"},
-            "receipt": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
             "result": {"type": "object"},
             "error": {
                 "type": "object",
@@ -1168,9 +1100,9 @@ mod tests {
 
     #[test]
     fn cli_mapping_is_complete_unique_and_contract_valid() {
-        assert_eq!(BUILTIN_TOOL_CONTRACT_VERSION, 37);
-        assert_eq!(BUILTIN_TOOL_CLI_COMMAND_VERSION, 37);
-        assert_eq!(BUILTIN_TOOL_RUNTIME_CAPABILITY, "builtin_cli.transport.v37");
+        assert_eq!(BUILTIN_TOOL_CONTRACT_VERSION, 38);
+        assert_eq!(BUILTIN_TOOL_CLI_COMMAND_VERSION, 38);
+        assert_eq!(BUILTIN_TOOL_RUNTIME_CAPABILITY, "builtin_cli.transport.v38");
         validate_builtin_tool_contract().unwrap();
         let operations = BUILTIN_TOOL_CLI_IDENTITIES
             .iter()
@@ -1239,65 +1171,19 @@ mod tests {
     }
 
     #[test]
-    fn receipt_is_stable_and_covers_the_outcome() {
-        let first = builtin_tool_receipt("thread.list", "request-1", true, &json!({"threads": []}))
-            .unwrap();
-        let replay =
-            builtin_tool_receipt("thread.list", "request-1", true, &json!({"threads": []}))
-                .unwrap();
-        let changed = builtin_tool_receipt(
-            "thread.list",
-            "request-1",
-            true,
-            &json!({"threads": [{"threadId": "rvcamp_01h47kvsy5fk1shh6w1g60eecf"}]}),
-        )
-        .unwrap();
-        assert_eq!(first, replay);
-        assert_ne!(first, changed);
-        assert!(first.strip_prefix("sha256:").is_some_and(
-            |digest| digest.len() == 64 && digest.chars().all(|ch| ch.is_ascii_hexdigit())
-        ));
-    }
-
-    #[test]
-    fn receipt_v1_keeps_the_existing_canonical_digest_goldens() {
-        let cases = [
-            (
-                "request-nested",
-                true,
-                json!({"z": {"b": 2, "a": 1}, "a": [3, {"y": false, "x": null}]}),
-                "sha256:389b2f8a36e6fcd6dae1db47e458f4ee8d8808ba359f2faf01d10e63a2234a5f",
-            ),
-            (
-                "request-unicode",
-                true,
-                json!({"text": "花\n\"路\"\\终点", "emoji": "🌸"}),
-                "sha256:c742b2c0a482e4d2cca810ac78d651eb9e1aa3c687ee397e1aad4ca7cd480a2c",
-            ),
-            (
-                "request-number",
-                false,
-                json!({"code": "broken", "details": {"values": [0, -7, 42, 1.5]}}),
-                "sha256:71941838dfe46717927b8592b9b0c33da0206a0a4f8818d3aa56b211828bab1f",
-            ),
-        ];
-        for (request_id, ok, result_or_error, expected) in cases {
-            assert_eq!(
-                builtin_tool_receipt("camp.read", request_id, ok, &result_or_error).unwrap(),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn malformed_envelope_fails_receipt_and_operation_validation() {
+    fn malformed_envelope_fails_outcome_and_operation_validation() {
         let mut envelope = BuiltinToolInvocationEnvelope::success(
             "thread.list",
             "7b5db24c-4a43-4cab-9217-d982b08f7691",
             json!({"threads": [], "truncated": false}),
         )
         .unwrap();
-        envelope.receipt = format!("sha256:{}", "0".repeat(64));
+        envelope.error = Some(BuiltinToolError {
+            code: "unexpected".to_string(),
+            message: "result and error cannot coexist".to_string(),
+            recovery: BuiltinToolRecovery::Stop,
+            details: None,
+        });
         assert!(envelope.validate().is_err());
 
         let mut envelope = BuiltinToolInvocationEnvelope::success(
@@ -1311,16 +1197,19 @@ mod tests {
     }
 
     #[test]
-    fn list_and_describe_share_one_digest() {
+    fn list_and_describe_share_the_current_catalog() {
         let list = builtin_tool_list().unwrap();
         assert!(
-            list.catalog_digest.strip_prefix("sha256:").is_some_and(
-                |digest| digest.len() == 64 && digest.chars().all(|ch| ch.is_ascii_hexdigit())
-            )
+            serde_json::to_value(&list)
+                .unwrap()
+                .get("catalogDigest")
+                .is_none()
         );
         for operation in &list.operations {
             let description = builtin_tool_description(&operation.name).unwrap();
-            assert_eq!(description.catalog_digest, list.catalog_digest);
+            assert_eq!(description.name, operation.name);
+            assert_eq!(description.summary, operation.summary);
+            assert_eq!(description.command, operation.command);
             assert!(description.agent_output_schema.is_object());
             assert!(!description.projection_identity.is_empty());
             assert!(description.errors.iter().any(|error| {
@@ -1395,20 +1284,5 @@ mod tests {
                         && description.contains("User attention is message-local")
                 })
         );
-    }
-
-    #[test]
-    fn catalog_digest_changes_with_agent_facing_send_teaching() {
-        let current = catalog_digest_operations().unwrap();
-        let current_digest = builtin_tool_catalog_digest_from(&current).unwrap();
-        let mut legacy_teaching = current.clone();
-        let send = legacy_teaching
-            .iter_mut()
-            .find(|operation| operation.name == "thread.message.send")
-            .unwrap();
-        send.input_schema["properties"]["mentionUser"]["description"] =
-            json!("Mention the current user and create an Inbox notification.");
-        let legacy_digest = builtin_tool_catalog_digest_from(&legacy_teaching).unwrap();
-        assert_ne!(current_digest, legacy_digest);
     }
 }

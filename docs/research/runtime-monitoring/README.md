@@ -9,6 +9,9 @@ baseline_ref: "4b4fe088b15ef785cd76f54f221e5d87c9d639a4"
 
 # Rovai AI 运行监控指标可采集性审计
 
+2026-10-12 [15 类 Runtime 原生恢复与历史删除实测](native-session-resume-2026-10-12.md)：
+正常冷恢复均完成；Pi 正确降级，CodeBuddy 空历史假恢复，其余逐项区分结构化拒绝遗漏与保守失败。
+
 2026-10-06 [Command MCP 原生/ACP 交付 A/B](../command-code-runtime/mcp-delivery-ab-2026-10-06.md)：
 固定 1.74.1 + sub2api/gpt-6-sol，观察实际 Provider 工具集合；保持生产原生交付，提供上游复现及独立诊断正向对照。
 

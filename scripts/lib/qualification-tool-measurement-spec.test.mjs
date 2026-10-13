@@ -22,14 +22,12 @@ test('measurement pack seals opportunities, fixture and oracle and materializes 
 
     const pack = await verifyToolMeasurementPack(root, caseRecord)
     assert.equal(assertToolMeasurementRuntimeCompatibility(pack, {
-      builtinToolCatalogDigest: 'e'.repeat(64),
       builtinToolContractVersion: 1,
       builtinToolIpcProtocolVersion: 1,
       builtinToolEvidenceProjectionVersion: 2
     }), true)
     assert.throws(() => assertToolMeasurementRuntimeCompatibility(pack, {
-      builtinToolCatalogDigest: 'f'.repeat(64),
-      builtinToolContractVersion: 1,
+      builtinToolContractVersion: 2,
       builtinToolIpcProtocolVersion: 1,
       builtinToolEvidenceProjectionVersion: 2
     }), /incompatible/)
@@ -139,7 +137,6 @@ async function writePack(root, caseRecord) {
     partition: 'holdout',
     projectionPolicyId: 'qualification-tool-measurement-v2',
     runtimeCompatibility: {
-      builtinToolCatalogDigest: `sha256:${'e'.repeat(64)}`,
       builtinToolContractVersion: 1,
       builtinToolIpcProtocolVersion: 1,
       operationProjectionSchemaVersion: 2

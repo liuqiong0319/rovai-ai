@@ -1591,6 +1591,8 @@ export function QuickChatWorkspace({
   )
 }
 
+type PendingMemberMentionProfile = Pick<AgentProfile, 'agentId' | 'displayName'>
+const EMPTY_PENDING_MEMBER_PROFILES: readonly PendingMemberMentionProfile[] = []
 const EMPTY_CAMP_MESSAGES: ThreadMessageView[] = []
 const EMPTY_LIVE_RUNTIME_EVENTS: LiveRuntimeEvent[] = []
 
@@ -2153,6 +2155,18 @@ export function ThreadWorkspace({
     () => new Map(agents.map((agent) => [agent.agentId, agent])),
     [agents]
   )
+  const pendingMemberProfiles = useMemo(() => {
+    const mentionedIds = new Set(optimisticMessages.flatMap((message) =>
+      (message.content ?? []).flatMap((segment) => segment.kind === 'member_mention' ? [segment.agentId] : [])
+    ))
+    // 受理回执先于名册投影时，只补展示资料，不推断成员资格。
+    return agents.filter((agent) => mentionedIds.has(agent.agentId)
+      && !memberById.has(agent.agentId) && agent.presence !== 'removed')
+  }, [optimisticMessages, agents, memberById])
+  const messageMentionNames = useMemo(
+    () => [...snapshot.members, ...pendingMemberProfiles],
+    [snapshot.members, pendingMemberProfiles]
+  )
   const memberFast = useThreadMemberFast(snapshot, profileById, installations, onNotify)
   const composerRosterMembers = useMemo(
     () => snapshot.members.map((member) => ({
@@ -2419,10 +2433,10 @@ export function ThreadWorkspace({
     [executionProcesses]
   )
   const anchorText = useCallback((message: ThreadMessageView) => message.content?.length
-    ? structuredThreadContentPlainText(message.content, snapshot.members, currentUserName)
-    : message.body, [snapshot.members, currentUserName])
+    ? structuredThreadContentPlainText(message.content, messageMentionNames, currentUserName)
+    : message.body, [messageMentionNames, currentUserName])
   const anchorNavigation = useThreadUserAnchors(snapshot.thread.id, client, snapshot.messages, optimisticMessages,
-    JSON.stringify([currentUserName, snapshot.members.map(member => [member.agentId, agents.find(agent => agent.agentId === member.agentId)?.displayName ?? member.displayName])]), anchorText, userAnchorNavigation, workspaceEntrySnapshotReady)
+    JSON.stringify([currentUserName, messageMentionNames.map(member => [member.agentId, agents.find(agent => agent.agentId === member.agentId)?.displayName ?? member.displayName])]), anchorText, userAnchorNavigation, workspaceEntrySnapshotReady)
   const visibleThreadMessages = useMemo(() => mergeNavigationMessages(
     anchoredMessages, anchorNavigation.navigation.windowMessages(), optimisticMessages, snapshot.messages
   ).filter(message => !message.missionStart),
@@ -4276,7 +4290,7 @@ export function ThreadWorkspace({
     body: string,
     content: StructuredThreadMessageContent | null
   ): void => {
-    const structuredClipboard = createStructuredMessageClipboardData(content, composerRosterMembers, currentUserName)
+    const structuredClipboard = createStructuredMessageClipboardData(content, messageMentionNames, currentUserName)
     void writeClipboardText(
       structuredClipboard?.text ?? body,
       structuredClipboard?.html
@@ -5288,7 +5302,7 @@ export function ThreadWorkspace({
                                   <ReplyParentQuote
                                     parent={replyParent}
                                     projectedBody={replyParent?.content
-                                      ? structuredThreadContentPlainText(replyParent.content, snapshot.members, currentUserName)
+                                      ? structuredThreadContentPlainText(replyParent.content, messageMentionNames, currentUserName)
                                       : replyParent?.body ?? ''}
                                     authorLabel={replyParent
                                       ? campMessageAuthorLabel(replyParent, memberById, currentUserName)
@@ -5318,6 +5332,7 @@ export function ThreadWorkspace({
                                             body={displayBody}
                                             content={campMessage.content}
                                             members={snapshot.members}
+                                            pendingMemberProfiles={pendingMemberProfiles}
                                             onActivateMemberMention={openMemberProfilePopover}
                                             onFileReference={(rawReference, source, target) => {
                                               if (!filePreview) return
@@ -5340,6 +5355,7 @@ export function ThreadWorkspace({
                                             body={displayBody}
                                             content={campMessage.content}
                                             members={snapshot.members}
+                                            pendingMemberProfiles={pendingMemberProfiles}
                                             leadingRecipientAgentId={defaultRecipientAgentId}
                                             truncate={humanAuthored}
                                             forceExpanded={isConversationFindCurrent || quoteSourceId === campMessage.id}
@@ -9586,6 +9602,7 @@ export function TruncatedStructuredMessageBody({
   body,
   content,
   members,
+  pendingMemberProfiles = EMPTY_PENDING_MEMBER_PROFILES,
   leadingRecipientAgentId,
   truncate,
   forceExpanded,
@@ -9599,6 +9616,7 @@ export function TruncatedStructuredMessageBody({
   body: string
   content: StructuredThreadMessageContent | null
   members: ThreadSnapshot['members']
+  pendingMemberProfiles?: readonly PendingMemberMentionProfile[]
   leadingRecipientAgentId?: string | null
   truncate: boolean
   forceExpanded: boolean
@@ -9628,6 +9646,7 @@ export function TruncatedStructuredMessageBody({
       body={displayBody}
       content={displayContent}
       members={members}
+      pendingMemberProfiles={pendingMemberProfiles}
       leadingRecipientAgentId={leadingRecipientAgentId}
       renderLeadingCurrentUserMarkdown={renderLeadingCurrentUserMarkdown}
       onActivateCurrentUserMention={onActivateCurrentUserMention}
@@ -9664,12 +9683,14 @@ export function AgentMessageMarkdownBody({
   body,
   content,
   members,
+  pendingMemberProfiles = EMPTY_PENDING_MEMBER_PROFILES,
   onActivateMemberMention,
   onFileReference
 }: {
   body: string
   content: StructuredThreadMessageContent | null
   members: ThreadSnapshot['members']
+  pendingMemberProfiles?: readonly PendingMemberMentionProfile[]
   onActivateMemberMention(agentId: string, trigger: HTMLElement, focusPanel: boolean): void
   onFileReference?: FileReferenceActivation
 }): JSX.Element {
@@ -9681,7 +9702,7 @@ export function AgentMessageMarkdownBody({
     else if (segment.kind !== 'text' || segment.text.trim().length > 0) break
   }
   const markdownBody = content && prefixLength > 0
-    ? structuredThreadContentMarkdownText(content.slice(prefixLength), members)
+    ? structuredThreadContentMarkdownText(content.slice(prefixLength), [...pendingMemberProfiles, ...members])
     : body
   if (!content || prefixLength === 0) {
     return <SafeMarkdown onFileReference={onFileReference}>{body}</SafeMarkdown>
@@ -9695,6 +9716,7 @@ export function AgentMessageMarkdownBody({
       body=""
       content={content.slice(0, prefixLength)}
       members={members}
+      pendingMemberProfiles={pendingMemberProfiles}
       onActivateMemberMention={onActivateMemberMention}
     />
   )
@@ -9718,6 +9740,7 @@ export function StructuredMessageBody({
   body,
   content,
   members,
+  pendingMemberProfiles = EMPTY_PENDING_MEMBER_PROFILES,
   leadingRecipientAgentId,
   inline = false,
   renderLeadingCurrentUserMarkdown = false,
@@ -9730,6 +9753,7 @@ export function StructuredMessageBody({
   body: string
   content: StructuredThreadMessageContent | null
   members: ThreadSnapshot['members']
+  pendingMemberProfiles?: readonly PendingMemberMentionProfile[]
   leadingRecipientAgentId?: string | null
   inline?: boolean
   renderLeadingCurrentUserMarkdown?: boolean
@@ -9744,18 +9768,21 @@ export function StructuredMessageBody({
   onFileReference?: FileReferenceActivation
 }): JSX.Element {
   const memberById = new Map(members.map((member) => [member.agentId, member]))
+  const pendingProfileById = new Map(pendingMemberProfiles.map((profile) => [profile.agentId, profile]))
+  const mentionNames = [...pendingMemberProfiles, ...members]
   const leadingRecipientPrefix = leadingRecipientAgentId ? (
     <span className="default-recipient-mention-prefix" data-quote-exclude="">
       <MemberMentionToken
         agentId={leadingRecipientAgentId}
         member={memberById.get(leadingRecipientAgentId)}
+        pendingProfile={pendingProfileById.get(leadingRecipientAgentId)}
         onActivate={onActivateMemberMention}
       />
       {body.length > 0 && !/^\s/u.test(body) ? ' ' : ''}
     </span>
   ) : null
   const markdownBody = renderLeadingCurrentUserMarkdown && content !== null
-    ? projectLeadingCurrentUserMentionMarkdownBody(content, members)
+    ? projectLeadingCurrentUserMentionMarkdownBody(content, mentionNames)
     : null
   if (content === null) {
     return <p>{leadingRecipientPrefix}<FileReferenceText text={body} onActivate={onFileReference} /></p>
@@ -9777,7 +9804,7 @@ export function StructuredMessageBody({
     )
   }
   if (renderLeadingCurrentUserMarkdown && content.some((segment) => segment.kind === 'current_user_mention')) {
-    const source = structuredThreadContentMarkdownText(content, members)
+    const source = structuredThreadContentMarkdownText(content, mentionNames)
     const prefix = markdownInlineContentPrefix(source)
     // Every CurrentUser occurrence has the same identity. Keep its placeholder
     // identical too, so Markdown reference labels match Core's quote projection.
@@ -9785,7 +9812,7 @@ export function StructuredMessageBody({
     const inlineContent = { [token]: <CurrentUserMentionToken onActivate={onActivateCurrentUserMention} /> }
     const markdown = content.map((segment, index) => {
       if (segment.kind !== 'current_user_mention') {
-        return structuredThreadContentMarkdownText([segment], members)
+        return structuredThreadContentMarkdownText([segment], mentionNames)
       }
       return token + (index === 0 && content.length > 1 ? ' ' : '')
     }).join('')
@@ -9872,6 +9899,7 @@ export function StructuredMessageBody({
             key={`member-${index}-${segment.agentId}`}
             agentId={segment.agentId}
             member={memberById.get(segment.agentId)}
+            pendingProfile={pendingProfileById.get(segment.agentId)}
             onActivate={onActivateMemberMention}
           />
         )
@@ -9883,10 +9911,12 @@ export function StructuredMessageBody({
 function MemberMentionToken({
   agentId,
   member,
+  pendingProfile,
   onActivate
 }: {
   agentId: string
   member: ThreadSnapshot['members'][number] | undefined
+  pendingProfile?: PendingMemberMentionProfile
   onActivate?(agentId: string, trigger: HTMLElement, focusPanel: boolean): void
 }): JSX.Element {
   const available = Boolean(
@@ -9894,6 +9924,8 @@ function MemberMentionToken({
     && member.membershipStatus === 'active'
     && member.profilePresence !== 'removed'
   )
+  const pending = !member && Boolean(pendingProfile)
+  const displayName = member?.displayName ?? pendingProfile?.displayName ?? uiAttribute('不可用队员')
   const interactive = Boolean(available && onActivate)
   const showMemberProfile = (
     trigger: HTMLElement,
@@ -9906,14 +9938,14 @@ function MemberMentionToken({
   }
   return (
     <span
-      className={`message-mention-token${available ? '' : ' is-unavailable'}${interactive ? ' is-interactive' : ''}`}
+      className={`message-mention-token${available || pending ? '' : ' is-unavailable'}${interactive ? ' is-interactive' : ''}`}
       data-agent-id={agentId}
       role={interactive ? 'button' : undefined}
       tabIndex={interactive ? 0 : undefined}
-      aria-label={interactive && member ? uiAttribute("查看{0}的基础信息", String(member.displayName)) : undefined}
+      aria-label={pending ? uiAttribute('队员 {0} 的名册正在同步', displayName) : interactive && member ? uiAttribute("查看{0}的基础信息", String(member.displayName)) : undefined}
       aria-haspopup={interactive ? 'dialog' : undefined}
       aria-expanded={interactive ? false : undefined}
-      title={available && member ? uiAttribute("查看{0}的基础信息", String(member.displayName)) : uiAttribute("该队员已不可用")}
+      title={pending ? uiAttribute('正在同步队员名册') : available && member ? uiAttribute("查看{0}的基础信息", String(member.displayName)) : uiAttribute("该队员已不可用")}
       onClick={(event) => showMemberProfile(event.currentTarget, true, false)}
       onKeyDown={(event) => {
         if ((event.key !== 'Enter' && event.key !== ' ') || !interactive) return
@@ -9921,7 +9953,7 @@ function MemberMentionToken({
         showMemberProfile(event.currentTarget, false, true)
       }}
     >
-      @{member?.displayName ?? uiAttribute("不可用队员")}
+      @{displayName}
     </span>
   )
 }

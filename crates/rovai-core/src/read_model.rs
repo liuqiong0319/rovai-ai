@@ -608,8 +608,8 @@ pub struct ContextManifestView {
     pub raw_message_count: usize,
     pub previous_accepted_public_boundary_sequence: i64,
     pub context_delivery_profile_version: i64,
-    pub context_delivery_profile: Value,
-    pub context_delivery_profile_digest: String,
+    pub context_delivery_profile: Option<Value>,
+    pub context_delivery_profile_digest: Option<String>,
     pub originating_public_user_message_ref: Option<Value>,
     pub recent_message_count: usize,
     pub omitted_message_count: Option<i64>,
@@ -619,30 +619,30 @@ pub struct ContextManifestView {
     pub collaboration_state_digest: String,
     pub collaboration_state_included: bool,
     pub shared_message_evidence: Vec<Value>,
-    pub shared_message_evidence_digest: String,
+    pub shared_message_evidence_digest: Option<String>,
     pub run_fact_refs: Vec<RunFactRefView>,
-    pub run_fact_payload: Value,
-    pub run_fact_digest: String,
+    pub run_fact_payload: Option<Value>,
+    pub run_fact_digest: Option<String>,
     pub workspace_fact: Option<Value>,
     pub workspace_fact_digest: Option<String>,
     pub workspace_fact_included: bool,
     pub current_input_source: Value,
     pub attachment_refs: Vec<ThreadAttachmentRefView>,
-    pub attachment_digest: String,
+    pub attachment_digest: Option<String>,
     pub skill_exposure: SkillExposureSnapshot,
-    pub skill_exposure_digest: String,
+    pub skill_exposure_digest: Option<String>,
     pub current_input_skill_resolution: CurrentInputSkillResolution,
-    pub current_input_skill_resolution_digest: String,
+    pub current_input_skill_resolution_digest: Option<String>,
     pub message_projection_audience: String,
-    pub a2a_guidance_evidence: Value,
-    pub a2a_guidance_evidence_digest: String,
+    pub a2a_guidance_evidence: Option<Value>,
+    pub a2a_guidance_evidence_digest: Option<String>,
     pub mcp_exposure: McpExposureSnapshot,
-    pub mcp_exposure_digest: String,
-    pub mcp_projection_digest: String,
-    pub self_active_task_evidence: Value,
-    pub self_active_task_evidence_digest: String,
+    pub mcp_exposure_digest: Option<String>,
+    pub mcp_projection_digest: Option<String>,
+    pub self_active_task_evidence: Option<Value>,
+    pub self_active_task_evidence_digest: Option<String>,
     pub formatter_version: i64,
-    pub rendered_payload_digest: String,
+    pub rendered_payload_digest: Option<String>,
     pub delivery: Option<RuntimeInputDeliveryView>,
     pub created_at: String,
 }
@@ -1733,13 +1733,13 @@ impl ReadModelService {
                 |manifest| {
                     Ok(AgentRunDiagnosticContextManifestView {
                         manifest_id: Some(manifest.get(0)?),
-                        rendered_payload_digest: Some(manifest.get(1)?),
+                        rendered_payload_digest: manifest.get(1)?,
                         charter_delivery_mode: Some(manifest.get(2)?),
                         camp_message_boundary_sequence: Some(manifest.get(3)?),
-                        skill_exposure_digest: Some(manifest.get(4)?),
-                        mcp_exposure_digest: Some(manifest.get(5)?),
-                        mcp_projection_digest: Some(manifest.get(6)?),
-                        attachment_digest: Some(manifest.get(7)?),
+                        skill_exposure_digest: manifest.get(4)?,
+                        mcp_exposure_digest: manifest.get(5)?,
+                        mcp_projection_digest: manifest.get(6)?,
+                        attachment_digest: manifest.get(7)?,
                     })
                 },
             )
@@ -3806,26 +3806,26 @@ fn load_context_manifests(
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
                 row.get::<_, String>(7)?,
-                row.get::<_, String>(8)?,
+                row.get::<_, Option<String>>(8)?,
                 row.get::<_, String>(9)?,
                 row.get::<_, String>(10)?,
-                row.get::<_, String>(11)?,
+                row.get::<_, Option<String>>(11)?,
                 row.get::<_, String>(12)?,
-                row.get::<_, String>(13)?,
+                row.get::<_, Option<String>>(13)?,
                 row.get::<_, String>(14)?,
-                row.get::<_, String>(15)?,
+                row.get::<_, Option<String>>(15)?,
                 row.get::<_, String>(16)?,
-                row.get::<_, String>(17)?,
-                row.get::<_, String>(18)?,
+                row.get::<_, Option<String>>(17)?,
+                row.get::<_, Option<String>>(18)?,
                 row.get::<_, i64>(19)?,
-                row.get::<_, String>(20)?,
+                row.get::<_, Option<String>>(20)?,
                 row.get::<_, String>(21)?,
                 row.get::<_, i64>(22)?,
                 row.get::<_, i64>(23)?,
                 row.get::<_, i64>(24)?,
                 row.get::<_, i64>(25)?,
-                row.get::<_, String>(26)?,
-                row.get::<_, String>(27)?,
+                row.get::<_, Option<String>>(26)?,
+                row.get::<_, Option<String>>(27)?,
                 row.get::<_, Option<String>>(28)?,
                 row.get::<_, String>(29)?,
                 row.get::<_, Option<i64>>(30)?,
@@ -3844,19 +3844,19 @@ fn load_context_manifests(
                 row.get::<_, Option<String>>(43)?,
                 row.get::<_, bool>(44)?,
                 row.get::<_, String>(45)?,
-                row.get::<_, String>(46)?,
-                row.get::<_, String>(47)?,
+                row.get::<_, Option<String>>(46)?,
+                row.get::<_, Option<String>>(47)?,
                 row.get::<_, Option<bool>>(48)?,
                 row.get::<_, Option<i64>>(49)?,
                 row.get::<_, Option<String>>(50)?,
                 row.get::<_, Option<i64>>(51)?,
                 row.get::<_, Option<i64>>(52)?,
                 row.get::<_, String>(53)?,
-                row.get::<_, String>(54)?,
-                row.get::<_, String>(55)?,
+                row.get::<_, Option<String>>(54)?,
+                row.get::<_, Option<String>>(55)?,
                 row.get::<_, String>(56)?,
-                row.get::<_, String>(57)?,
-                row.get::<_, String>(58)?,
+                row.get::<_, Option<String>>(57)?,
+                row.get::<_, Option<String>>(58)?,
                 row.get::<_, Option<String>>(59)?,
                 row.get::<_, Option<String>>(60)?,
                 row.get::<_, bool>(61)?,
@@ -3871,13 +3871,25 @@ fn load_context_manifests(
                 .context("ContextManifest Run Fact references are invalid")?;
             let shared_message_evidence = serde_json::from_str::<Vec<Value>>(&row.45)
                 .context("ContextManifest Shared Message evidence is invalid")?;
-            let run_fact_payload = serde_json::from_str::<Value>(&row.47)
+            let run_fact_payload = row
+                .47
+                .as_deref()
+                .map(serde_json::from_str::<Value>)
+                .transpose()
                 .context("ContextManifest Run Fact payload is invalid")?;
             let omission_entries = serde_json::from_str::<Vec<Value>>(&row.53)
                 .context("ContextManifest omission evidence is invalid")?;
-            let self_active_task_evidence = serde_json::from_str::<Value>(&row.54)
+            let self_active_task_evidence = row
+                .54
+                .as_deref()
+                .map(serde_json::from_str::<Value>)
+                .transpose()
                 .context("ContextManifest Self Active Task evidence is invalid")?;
-            let a2a_guidance_evidence = serde_json::from_str::<Value>(&row.57)
+            let a2a_guidance_evidence = row
+                .57
+                .as_deref()
+                .map(serde_json::from_str::<Value>)
+                .transpose()
                 .context("ContextManifest A2A Guidance evidence is invalid")?;
             let current_input_source = serde_json::from_str::<Value>(&row.9)
                 .context("ContextManifest Current Input source is invalid")?;
@@ -3890,7 +3902,11 @@ fn load_context_manifests(
                     .context("ContextManifest Current Input Skill resolution is invalid")?;
             let mcp_exposure = serde_json::from_str::<McpExposureSnapshot>(&row.16)
                 .context("ContextManifest MCP exposure is invalid")?;
-            let context_delivery_profile = serde_json::from_str(&row.26)
+            let context_delivery_profile = row
+                .26
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
                 .context("ContextManifest delivery profile is invalid")?;
             let originating_public_user_message_ref = row
                 .28

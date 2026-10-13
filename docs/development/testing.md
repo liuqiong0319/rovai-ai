@@ -808,7 +808,7 @@ required 模式，防止未来迁移到 macOS runner 时把环境阻断当成通
 
 启动页面与 authority gate 的组合回归运行 `pnpm test:startup-presentation`。它在真实 Electron 中挂载生产 `App` 与 CSS，
 仅替换本机 API 和反馈时钟：验证 null/starting、四类恢复目标、迁移、ready 交接、首次训练、订阅竞态与明确阻断；
-同时检查 400ms 前无反馈、超时反馈只在内容区、未准入时没有权威请求、未知导航不显示空态。Main Window Session
+同时检查首帧即显示不透明整窗品牌画布、就绪交接持续覆盖、未准入时没有权威请求、未知导航不显示空态。Main Window Session
 延后冻结恢复目标与关闭窗口后的迟到读取由 `desktop-session.test.ts` 单独拥有。
 
 夹具创建临时绝对 `userData`，不启动 Core/SQLite/Runtime，也不读取日常数据；它是生产组件组合测试，不冒充真实数据库
@@ -1446,6 +1446,27 @@ ACP 覆盖广告 load 后实际返回 `-32601` 的新建成功/失败、resume �
 同码不得降级。定向重跑可用 `node scripts/smoke-member-environment-upgrade.mjs --adapter-regressions`，不冒充跨版本验收。
 Pi 原 session-header owner 保留缺文件/父目录矩阵，增加旧 locator 精确 ID 回读、错 ID 拒绝及新文件优先；
 ACP 原终端协议 owner 在相同脱敏断言之外检查结构化错误码仍存在。不新增 Rust 测试函数或平行 Core harness。
+
+真实 CLI 审计后的修复继续扩展错误字段 owner `acp_rpc_error_keeps_only_allowlisted_bounded_fields`，
+覆盖 Copilot / Qwen / Qoder / ZCode 的 Adapter 范围、精确目标、错误文本反例和字段长度上限。
+原 ACP 终端 wire owner 同时检查 Qoder 所需的机器字段经过响应通道后仍可用，保留脱敏断言。
+PR #721 的 P2 补正继续扩展同一 `kimi_038_fixture_uses_the_standard_terminal_wire_lifecycle` owner：
+配置短凭据 `test`，令 Session ID、URI 和 `/work/test/project` 路径包含该值，另覆盖原因码与凭据碰撞。
+实际经过 `complete_pending()` 和 oneshot 响应通道后，Qoder/Copilot/Qwen 仍能识别精确目标，
+Display / Debug / anyhow 的普通及 alternate 格式均不暴露凭据；不新增 Rust 测试函数或真实 CLI 调用。
+新增两个扩展层 owner，均有独立的修复前失败语义：
+
+- `codebuddy_restore_verifies_only_the_exact_file_in_the_launch_environment`：最小临时文件夹验证缺少精确
+  历史才能降级，其他文件不能冒充目标；启动时的配置目录不会被后续修改取代，非法目标/文件类型仍报普通错误。
+  原 usage 路径测试不拥有恢复结论，协议测试不能证明本机文件边界，无需 Core / 数据库 fixture。
+- `only_the_native_resume_rejection_authorizes_session_replacement`：内存双工协议验证 ZCode 原生错误到
+  ACP 的来源传递；resume 的明确拒绝能到达 Core，而初始化、订阅、权限、模型同码不能触发替换。
+  原选模成功测试不覆盖错误来源；纯映射测试不足以验证桥接响应与原生请求的关联，不启动真实 CLI。
+
+最小命令：`cargo test -p rovai-core --features extended-tests --lib codebuddy_restore_verifies`、
+`cargo test -p rovai-core --features extended-tests --lib only_the_native_resume_rejection`；相关 ACP、ZCode
+与 native_usage owner 另做定向回归。真实 Runtime 验收和未测范围见
+[15 类 Runtime 实测与五类修复复测](../research/runtime-monitoring/native-session-resume-2026-10-12.md)。
 
 Rust 复用原 owner 并保持所有仍有效的保护：
 

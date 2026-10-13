@@ -307,10 +307,10 @@ try {
     }
     const invalidEnvelopeEvidence = terminalEvidence.find((entry) => {
       const envelope = entry.payload?.coreEnvelope
-      return envelope?.contractVersion !== 1
+      return envelope?.contractVersion !== 2
         || envelope.operation !== entry.payload?.canonicalTool
         || !/^[0-9a-f-]{36}$/.test(envelope.requestId ?? '')
-        || !/^sha256:[0-9a-f]{64}$/.test(envelope.receipt ?? '')
+        || Object.hasOwn(envelope, 'receipt')
         || (envelope.ok ? typeof envelope.result !== 'object' : typeof envelope.error !== 'object')
     })
     if (invalidEnvelopeEvidence) {

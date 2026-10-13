@@ -34,8 +34,6 @@ const profile: AgentProfile = {
 const receipt = (version: number): StoredCommandResult => ({
   commandId: 'test',
   commandType: 'members.update',
-  requestDigest: 'test',
-  requestDigestVersion: 1,
   recordedAt: '',
   status: 'applied',
   code: 'agent_profile.updated',

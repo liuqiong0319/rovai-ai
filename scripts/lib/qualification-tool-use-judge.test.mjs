@@ -232,7 +232,6 @@ function fixture({ title = 'Use prior context when it is necessary' } = {}) {
     measurementSpec: {
       specificationId: 'tool-use-judge-fixture',
       runtimeCompatibility: {
-        builtinToolCatalogDigest: `sha256:${'e'.repeat(64)}`,
         builtinToolContractVersion: 1,
         builtinToolIpcProtocolVersion: 1,
         operationProjectionSchemaVersion: 2

@@ -1,7 +1,7 @@
 ---
 document_type: architecture-index
 authority: long-lived-architecture-routing
-last_updated: 2026-10-08
+last_updated: 2026-10-12
 ---
 
 # 长期系统架构
@@ -10,6 +10,8 @@ last_updated: 2026-10-08
 
 本目录保存跨版本长期存在的组件结构、职责和权威边界。字段级 wire shape 归
 [`docs/contracts/`](../contracts/README.md)，决策理由归[版本决策](../decisions/README.md)，实施状态归当前 Version 文档。[当前基础架构不变量](foundational-invariants.md)收敛跨多个主题的长期边界，专题 Architecture 在此基础上说明组件组合。
+
+当前数据库、快照和命令精简边界见[基础不变量](foundational-invariants.md)与[输入快照存储](../contracts/input-snapshot-storage-v1.md)。
 
 <!-- architecture-index:begin -->
 | 架构 | 内容 |

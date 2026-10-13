@@ -4,7 +4,6 @@ use crate::message_quote::{
     quote_scalar_count,
 };
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -51,8 +50,8 @@ use crate::{
         current_public_camp_batch_context_delivery_profile, unicode_scalar_count,
     },
     current_input_skill::{
-        CurrentInputSkillLink, SkillSelectionSnapshot, parse_skill_selection_snapshot,
-        resolve_current_input_skills, validate_persisted_resolution,
+        CurrentInputSkillLink, CurrentInputSkillResolution, SkillSelectionSnapshot,
+        parse_skill_selection_snapshot, resolve_current_input_skills,
     },
     db::Database,
     managed_attachment::resolve_managed_attachment_path,
@@ -67,29 +66,6 @@ pub const CONTEXT_FORMATTER_VERSION: i64 = AGENT_RUN_CONTEXT_FORMATTER_VERSION;
 pub const DEFAULT_MAX_CONTEXT_PAYLOAD_BYTES: usize = 96 * 1024;
 const MIN_CONTEXT_PAYLOAD_BYTES: usize = 8 * 1024;
 const DELIVERY_FIRST_PAYLOAD_BOOTSTRAP_RESERVE_BYTES: usize = 32 * 1024;
-fn context_manifest_is_dispatchable(
-    manifest_version: i64,
-    formatter_version: i64,
-    profile_version: i64,
-    invocation_kind: &str,
-) -> bool {
-    if invocation_kind == "batch" {
-        (manifest_version == PUBLIC_CAMP_BATCH_CONTEXT_MANIFEST_VERSION
-            && formatter_version == PUBLIC_CAMP_BATCH_CONTEXT_FORMATTER_VERSION
-            && profile_version == 10)
-            || (manifest_version == 32 && formatter_version == 32 && profile_version == 10)
-            || (manifest_version == 31 && formatter_version == 31 && profile_version == 10)
-            || (manifest_version == 30 && formatter_version == 30 && profile_version == 10)
-            || (manifest_version == 29 && formatter_version == 29 && profile_version == 9)
-    } else {
-        (manifest_version == CONTEXT_MANIFEST_VERSION
-            && formatter_version == CONTEXT_FORMATTER_VERSION
-            && profile_version == 7)
-            || (manifest_version == 27 && formatter_version == 27 && profile_version == 7)
-            || (manifest_version == 26 && formatter_version == 26 && profile_version == 6)
-    }
-}
-
 fn run_facts_schema_version(manifest_version: i64, invocation_kind: &str) -> i64 {
     if invocation_kind == "batch" {
         match manifest_version {
@@ -191,17 +167,16 @@ pub struct MaterializeContextRequest<'a> {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FrozenDeliveryContext {
     pub rendered_payload: String,
-    pub rendered_payload_digest: String,
-    pub runtime_payload: String,
-    pub runtime_payload_digest: String,
+    // Old queued inputs may contain a distinct prepared Runtime payload. New
+    // previews store only the Dynamic Context and compose Bootstrap at delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_payload: Option<String>,
     pub charter_delivery_mode: CharterDeliveryMode,
     pub bootstrap_in_runtime_payload: bool,
     pub camp_message_boundary_sequence: i64,
     pub conversation_message_boundary_sequence: i64,
     pub collaboration_state_digest: String,
     pub message_projection_audience: String,
-    pub a2a_guidance_evidence: Value,
-    pub a2a_guidance_evidence_digest: String,
     pub manifest_selection: Value,
 }
 
@@ -481,24 +456,22 @@ impl ContextService {
             .connection()
             .query_row(
                 r#"
-                SELECT skill_exposure_json, skill_exposure_digest
+                SELECT skill_exposure_json
                 FROM context_manifest WHERE agent_run_id = ?1
                 "#,
                 [agent_run_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| row.get::<_, String>(0),
             )
             .optional()?;
-        if let Some((snapshot_json, digest)) = existing {
+        if let Some(snapshot_json) = existing {
             let persisted_snapshot: SkillExposureSnapshot = serde_json::from_str(&snapshot_json)
                 .context("stored ContextManifest Skill exposure is invalid")?;
-            if persisted_snapshot.schema_version != 2
-                || canonical_json_digest(&serde_json::to_value(&persisted_snapshot)?)? != digest
-            {
-                anyhow::bail!("stored ContextManifest Skill exposure digest is invalid");
+            if persisted_snapshot.schema_version != 2 {
+                anyhow::bail!("stored ContextManifest Skill exposure schema is invalid");
             }
             return Ok(PreparedSkillExposure {
+                digest: canonical_json_digest(&serde_json::to_value(&persisted_snapshot)?)?,
                 snapshot: persisted_snapshot,
-                digest,
             });
         }
         // v1.68 no longer projects Skills into user projects. Frozen older
@@ -566,25 +539,10 @@ impl ContextService {
             fallback_skill_exposure = PreparedSkillExposure { snapshot, digest };
             &fallback_skill_exposure
         };
-        let fallback_mcp_snapshot;
-        let fallback_mcp_exposure_digest;
-        let (mcp_exposure, mcp_exposure_digest, mcp_projection_digest) =
-            if let Some(prepared) = prepared_mcp_projection {
-                (
-                    &prepared.snapshot,
-                    prepared.exposure_digest.as_str(),
-                    prepared.projection_digest.as_str(),
-                )
-            } else {
-                fallback_mcp_snapshot = McpExposureSnapshot::default();
-                fallback_mcp_exposure_digest =
-                    canonical_json_digest(&serde_json::to_value(&fallback_mcp_snapshot)?)?;
-                (
-                    &fallback_mcp_snapshot,
-                    fallback_mcp_exposure_digest.as_str(),
-                    crate::mcp_projection::LEGACY_EMPTY_MCP_PROJECTION_DIGEST,
-                )
-            };
+        let fallback_mcp_snapshot = McpExposureSnapshot::default();
+        let mcp_exposure = prepared_mcp_projection
+            .map(|prepared| &prepared.snapshot)
+            .unwrap_or(&fallback_mcp_snapshot);
         let binding_identity_compatible =
             snapshot.native_binding_id.is_some() && snapshot.native_binding_generation >= 1;
         let requires_new_native_session =
@@ -634,8 +592,6 @@ impl ContextService {
                 &bootstrap_evidence,
                 prepared_skill_exposure,
                 mcp_exposure,
-                mcp_exposure_digest,
-                mcp_projection_digest,
                 request,
                 expected_binding_generation,
                 requires_new_native_session,
@@ -657,8 +613,6 @@ impl ContextService {
             Some(_) => current_public_camp_batch_context_delivery_profile()?,
             None => current_context_delivery_profile()?,
         };
-        let profile_json = profile.frozen_json()?;
-        let profile_digest = profile.canonical_digest()?;
         let batch_model_context = (snapshot.invocation_kind == "batch")
             .then(|| {
                 load_batch_model_context(
@@ -937,8 +891,6 @@ impl ContextService {
             }
             return Err(ContextPayloadTooLarge { max_payload_bytes }.into());
         };
-        let self_active_tasks_projection =
-            self_active_task_projection(&self_active_tasks, self_active_task_omitted_count);
         let manifest_attachment_refs = batch_model_context
             .as_ref()
             .map(BatchModelContext::attachment_refs)
@@ -959,11 +911,6 @@ impl ContextService {
                 &snapshot.camp_id,
                 referenced_attachment_ids,
             )?;
-        let self_active_task_evidence = self_active_task_evidence(
-            &self_active_tasks,
-            self_active_task_omitted_count,
-            self_active_tasks_projection.as_ref(),
-        )?;
         let mut raw_message_refs = if let Some(batch) = batch_model_context.as_ref() {
             batch.raw_message_refs()
         } else {
@@ -1009,16 +956,13 @@ impl ContextService {
                     .unwrap_or_else(|| current_input.id.clone()),
             });
         }
-        let payload_digest = sha256_text(&payload);
         let blob = blob_store.put_bytes(
             database,
             payload.as_bytes(),
             "text/plain; charset=utf-8",
             "sensitive",
         )?;
-        if format!("sha256:{}", blob.sha256) != payload_digest {
-            anyhow::bail!("Rendered context Blob digest does not match the payload");
-        }
+        let payload_digest = format!("sha256:{}", blob.sha256);
         let manifest_id = Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().to_rfc3339();
         let collaboration_state_included = collaboration_state_section.is_some();
@@ -1027,10 +971,8 @@ impl ContextService {
         } else {
             shared_conversation.projection_evidence()
         };
-        let shared_message_evidence_digest =
-            canonical_json_digest(&serde_json::to_value(&shared_message_evidence)?)?;
         let current_input_source = if let Some(batch) = batch_model_context.as_ref() {
-            let mut evidence = batch.run_input_evidence(&current_input_skill_resolution.links);
+            let mut evidence = batch.run_input_evidence();
             evidence["invocationKind"] = json!(snapshot.invocation_kind);
             evidence
         } else {
@@ -1039,16 +981,13 @@ impl ContextService {
                 "sourceCampMessageId": current_input.source_camp_message_id,
                 "conversationMessageId": current_input.source_conversation_message_id,
                 "sourceContentDigest": current_input.source_content_digest,
-                "projectedBodyDigest": current_input.projected_body_digest,
                 "missionStart": mission_start_evidence(database.context_connection(),&snapshot,&current_input)?,
-                "projectedInputDigest": canonical_json_digest(&current_input_value)?,
+
                 "quotedInputEvidence": current_input.quote_evidence(),
                 "mentionsCurrentUser": current_input.mentions_current_user,
                 "gatherCompletion": gather_completion_manifest_evidence(&snapshot, &current_input)?,
             })
         };
-        let attachment_digest =
-            canonical_json_digest(&serde_json::to_value(&manifest_attachment_refs)?)?;
         let originating_public_user_message_ref = (snapshot.invocation_kind != "batch")
             .then(|| {
                 shared_conversation
@@ -1193,8 +1132,8 @@ impl ContextService {
                 global_public_message_boundary,
                 previous_accepted_public_boundary_sequence,
                 profile.profile_version,
-                serde_json::to_string(&profile_json)?,
-                profile_digest,
+                None::<String>,
+                None::<String>,
                 originating_public_user_message_ref
                     .as_ref()
                     .map(serde_json::to_string)
@@ -1203,7 +1142,7 @@ impl ContextService {
                 serde_json::to_string(&reference_closure_refs)?,
                 serde_json::to_string(&omission_entries)?,
                 serde_json::to_string(&shared_message_evidence)?,
-                shared_message_evidence_digest,
+                None::<String>,
                 omitted_message_count,
                 omitted_message_sequence_start,
                 omitted_message_sequence_end,
@@ -1211,23 +1150,23 @@ impl ContextService {
                 collaboration_state_digest,
                 i64::from(collaboration_state_included),
                 serde_json::to_string(&rendered_run_facts.references)?,
-                &rendered_run_facts.payload_json,
-                &rendered_run_facts.digest,
+                None::<String>,
+                None::<String>,
                 serde_json::to_string(&current_input_source)?,
                 serde_json::to_string(&manifest_attachment_refs)?,
-                attachment_digest,
+                None::<String>,
                 serde_json::to_string(&prepared_skill_exposure.snapshot)?,
-                prepared_skill_exposure.digest,
+                None::<String>,
                 serde_json::to_string(&current_input_skill_resolution.resolution)?,
-                current_input_skill_resolution.digest,
+                None::<String>,
                 serde_json::to_string(mcp_exposure)?,
-                mcp_exposure_digest,
-                mcp_projection_digest,
-                serde_json::to_string(&self_active_task_evidence)?,
-                canonical_json_digest(&serde_json::to_value(&self_active_task_evidence)?)?,
+                None::<String>,
+                None::<String>,
+                None::<String>,
+                None::<String>,
                 AGENT_MESSAGE_PROJECTION_AUDIENCE,
-                serde_json::to_string(&a2a_guidance.evidence)?,
-                a2a_guidance.evidence_digest,
+                None::<String>,
+                None::<String>,
                 context_manifest_version,
                 run_facts_schema_version,
                 camp_attachment_view_receipt
@@ -1240,7 +1179,7 @@ impl ContextService {
                 camp_attachment_view_receipt_digest,
                 context_formatter_version,
                 blob.id,
-                payload_digest,
+                None::<String>,
                 created_at,
                 workspace_fact
                     .value
@@ -1254,17 +1193,21 @@ impl ContextService {
         )?;
         let persisted_manifest_id = if inserted != 1 {
             let (existing_id, existing_digest): (String, String) = transaction.query_row(
-                "SELECT id, rendered_payload_digest FROM context_manifest WHERE agent_run_id = ?1",
+                "SELECT id, rendered_payload_blob_id FROM context_manifest WHERE agent_run_id = ?1",
                 [&snapshot.agent_run_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
-            if existing_digest != payload_digest {
+            if existing_digest != blob.id {
                 anyhow::bail!("AgentRun already has a different immutable ContextManifest");
             }
             existing_id
         } else {
             if let Some(additional_skills) = &additional_skills {
-                persist_additional_skills_evidence(&transaction, &manifest_id, additional_skills)?;
+                persist_additional_skill_omissions(
+                    &transaction,
+                    &manifest_id,
+                    &additional_skills.omitted,
+                )?;
             }
             for camp in &history_camps {
                 transaction.execute(
@@ -1295,27 +1238,22 @@ impl ContextService {
                     "historyCampCount": history_camps.len(),
                     "previousAcceptedPublicBoundarySequence": previous_accepted_public_boundary_sequence,
                     "contextDeliveryProfileVersion": profile.profile_version,
-                    "contextDeliveryProfileDigest": profile_digest,
+
                     "recentMessageCount": shared_conversation.recent_messages.len(),
                     "referenceClosureMessageCount": shared_conversation.reference_closure.len(),
                     "contextOmissionCount": omission_entries.len(),
-                    "sharedMessageEvidenceDigest": shared_message_evidence_digest,
+
                     "omittedMessageCount": omitted_message_count,
                     "omittedMessageSequenceStart": omitted_message_sequence_start,
                     "omittedMessageSequenceEnd": omitted_message_sequence_end,
                     "bootstrapEvidenceId": bootstrap_evidence.evidence_id,
                     "collaborationStateDigest": collaboration_state_digest,
                     "collaborationStateIncluded": collaboration_state_included,
-                    "runFactDigest": rendered_run_facts.digest,
-                    "attachmentDigest": attachment_digest,
-                    "skillExposureDigest": prepared_skill_exposure.digest,
-                    "currentInputSkillResolutionDigest": current_input_skill_resolution.digest,
-                    "mcpExposureDigest": mcp_exposure_digest,
-                    "selfActiveTaskEvidenceDigest": canonical_json_digest(&serde_json::to_value(&self_active_task_evidence)?)?,
+
                     "messageProjectionAudience": AGENT_MESSAGE_PROJECTION_AUDIENCE,
-                    "a2aGuidanceEvidenceDigest": a2a_guidance.evidence_digest,
+
                     "campAttachmentViewReceiptDigest": camp_attachment_view_receipt_digest,
-                    "dynamicPayloadDigest": payload_digest,
+
                 }),
             )?;
             manifest_id
@@ -1544,8 +1482,6 @@ impl ContextService {
                 return Err(ContextPayloadTooLarge { max_payload_bytes }.into());
             }
         };
-        let self_active_tasks_projection =
-            self_active_task_projection(&self_active_tasks, self_active_task_omitted_count);
         let referenced_attachment_ids =
             final_referenced_attachment_ids(&attachment_refs, &shared_conversation);
         let (camp_attachment_view_receipt, camp_attachment_view_receipt_digest) =
@@ -1554,11 +1490,6 @@ impl ContextService {
                 &snapshot.camp_id,
                 referenced_attachment_ids,
             )?;
-        let self_active_task_evidence = self_active_task_evidence(
-            &self_active_tasks,
-            self_active_task_omitted_count,
-            self_active_tasks_projection.as_ref(),
-        )?;
         let mut raw_message_refs = shared_conversation
             .originating_public_user_message
             .iter()
@@ -1619,13 +1550,10 @@ impl ContextService {
             })
             .collect::<Vec<_>>();
         let shared_message_evidence = shared_conversation.projection_evidence();
-        let shared_message_evidence_digest =
-            canonical_json_digest(&serde_json::to_value(&shared_message_evidence)?)?;
         let manifest_selection = json!({
             "previousAcceptedPublicBoundarySequence": previous_boundary,
             "contextDeliveryProfileVersion": profile.profile_version,
-            "contextDeliveryProfileJson": profile.frozen_json()?,
-            "contextDeliveryProfileDigest": profile.canonical_digest()?,
+
             "originatingPublicUserMessageRef": shared_conversation.originating_public_user_message.as_ref().map(|message| EntityReference {
                 entity_type: "camp_message".to_string(),
                 entity_id: message.message_id.clone(),
@@ -1634,7 +1562,7 @@ impl ContextService {
             "referenceClosureRefs": reference_closure_refs,
             "omissionEntries": shared_conversation.omission_entries,
             "sharedMessageEvidence": shared_message_evidence,
-            "sharedMessageEvidenceDigest": shared_message_evidence_digest,
+
             "omittedMessageCount": shared_conversation.omitted_messages.as_ref().map(|omitted| omitted.count as i64),
             "omittedMessageSequenceStart": shared_conversation.omitted_messages.as_ref().map(|omitted| omitted.sequence_start),
             "omittedMessageSequenceEnd": shared_conversation.omitted_messages.as_ref().map(|omitted| omitted.sequence_end),
@@ -1642,44 +1570,36 @@ impl ContextService {
             "collaborationStateDigest": collaboration_state_digest.clone(),
             "collaborationStateIncluded": collaboration_state_section.is_some(),
             "runFactRefs": rendered_run_facts.references,
-            "runFactPayload": rendered_run_facts.payload_json,
-            "runFactDigest": rendered_run_facts.digest,
+
             "currentInputSource": {
                 "invocationKind": snapshot.invocation_kind,
                 "sourceCampMessageId": current_input.source_camp_message_id,
                 "conversationMessageId": current_input.source_conversation_message_id,
                 "sourceContentDigest": current_input.source_content_digest,
-                "projectedBodyDigest": current_input.projected_body_digest,
             "missionStart": mission_start_evidence(transaction,&snapshot,&current_input)?,
-            "projectedInputDigest": canonical_json_digest(&current_input_value)?,
+
             "quotedInputEvidence": current_input.quote_evidence(),
                 "mentionsCurrentUser": current_input.mentions_current_user,
                 "gatherCompletion": gather_completion_manifest_evidence(&snapshot, &current_input)?,
             },
             "attachmentRefs": attachment_refs,
-            "attachmentDigest": canonical_json_digest(&serde_json::to_value(&attachment_refs)?)?,
-            "selfActiveTaskEvidence": self_active_task_evidence,
+
             "messageProjectionAudience": AGENT_MESSAGE_PROJECTION_AUDIENCE,
-            "a2aGuidanceEvidence": a2a_guidance.evidence.clone(),
-            "a2aGuidanceEvidenceDigest": a2a_guidance.evidence_digest.clone(),
+
             "contextManifestVersion": CONTEXT_MANIFEST_VERSION,
             "runFactsSchemaVersion": 6,
             "workspaceFact": workspace_fact.value,
             "workspaceFactDigest": workspace_fact.digest,
             "workspaceFactIncluded": workspace_fact.included,
-            "additionalSkillsSection": additional_skills.section,
-            "additionalSkillsSectionDigest": sha256_text(&additional_skills.section),
+
             "additionalSkillsOmitted": additional_skills.omitted,
             "missionDetailsVersion": mission_details_version,
             "campAttachmentViewReceiptVersion": camp_attachment_view_receipt.as_ref().map(|_| CAMP_ATTACHMENT_VIEW_RECEIPT_VERSION),
             "campAttachmentViewReceipt": camp_attachment_view_receipt,
             "campAttachmentViewReceiptDigest": camp_attachment_view_receipt_digest,
         });
-        let digest = sha256_text(&payload);
         Ok(FrozenDeliveryContext {
-            rendered_payload_digest: digest.clone(),
-            runtime_payload_digest: digest,
-            runtime_payload: payload.clone(),
+            runtime_payload: None,
             rendered_payload: payload,
             bootstrap_in_runtime_payload: false,
             charter_delivery_mode: request.charter_delivery_mode,
@@ -1687,8 +1607,6 @@ impl ContextService {
             conversation_message_boundary_sequence: snapshot.conversation_message_boundary_sequence,
             collaboration_state_digest,
             message_projection_audience: AGENT_MESSAGE_PROJECTION_AUDIENCE.to_string(),
-            a2a_guidance_evidence: a2a_guidance.evidence,
-            a2a_guidance_evidence_digest: a2a_guidance.evidence_digest,
             manifest_selection,
         })
     }
@@ -1702,11 +1620,6 @@ impl ContextService {
         if !valid_agent_projection_audience(&frozen.message_projection_audience) {
             anyhow::bail!("Frozen Delivery Context projection audience is invalid");
         }
-        validate_a2a_guidance_evidence(
-            &frozen.a2a_guidance_evidence,
-            &frozen.a2a_guidance_evidence_digest,
-            &frozen.rendered_payload,
-        )?;
         validate_frozen_view_receipt(&snapshot, frozen)?;
         validate_frozen_current_input_source(transaction, &snapshot, frozen)
     }
@@ -1827,17 +1740,16 @@ impl ContextService {
         delivery_id: &str,
         original_payload: &str,
     ) -> Result<PiRuntimeInputProjection> {
-        let (
-            attachment_refs_json,
-            attachment_digest,
-            dynamic_payload_digest,
-            status,
-            dispatch_started_at,
-        ): (String, String, String, String, Option<String>) = database
+        let (attachment_refs_json, dynamic_payload_digest, status, dispatch_started_at): (
+            String,
+            String,
+            String,
+            Option<String>,
+        ) = database
             .connection()
             .query_row(
                 r#"
-                SELECT manifest.attachment_refs_json, manifest.attachment_digest,
+                SELECT manifest.attachment_refs_json,
                        delivery.dynamic_payload_digest,
                        delivery.status, delivery.dispatch_started_at
                 FROM runtime_input_delivery AS delivery
@@ -1846,15 +1758,7 @@ impl ContextService {
                 WHERE delivery.id = ?1
                 "#,
                 [delivery_id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .context("Pi Runtime Input Delivery projection is unavailable")?;
         if status != "prepared" || dispatch_started_at.is_some() {
@@ -1865,9 +1769,6 @@ impl ContextService {
         }
         let attachment_value: Value = serde_json::from_str(&attachment_refs_json)
             .context("Pi ContextManifest attachment refs are invalid")?;
-        if canonical_json_digest(&attachment_value)? != attachment_digest {
-            anyhow::bail!("Pi ContextManifest attachment refs digest is invalid");
-        }
         let attachments: Vec<PiRuntimeAttachment> = serde_json::from_value(attachment_value)
             .context("Pi ContextManifest attachment refs have an invalid shape")?;
         Ok(PiRuntimeInputProjection { attachments })
@@ -2103,7 +2004,7 @@ impl ContextService {
         let row = transaction
             .query_row(
                 r#"
-                SELECT context_manifest.rendered_payload_digest,
+                SELECT 'sha256:' || managed_blob.sha256,
                        context_manifest.native_binding_generation,
                        context_manifest.camp_message_boundary_sequence,
                        conversation.native_binding_id,
@@ -2120,6 +2021,7 @@ impl ContextService {
                        context_manifest.camp_attachment_view_receipt_json,
                        context_manifest.camp_attachment_view_receipt_digest
                 FROM context_manifest
+                JOIN managed_blob ON managed_blob.id = context_manifest.rendered_payload_blob_id
                 JOIN agent_run ON agent_run.id = context_manifest.agent_run_id
                 JOIN conversation ON conversation.id = agent_run.conversation_id
                 LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
@@ -2167,16 +2069,6 @@ impl ContextService {
             };
         if row.5 != "running" || row.6 != execution_epoch {
             anyhow::bail!("AgentRun or Native Binding changed before input delivery");
-        }
-        if !context_manifest_is_dispatchable(row.10, row.11, row.12, &row.13)
-            || row.14 != run_facts_schema_version(row.10, &row.13)
-        {
-            anyhow::bail!("ContextManifest version evidence cannot be dispatched");
-        }
-        if row.13 == "batch"
-            && frozen_batch_context_manifest_version(&transaction, agent_run_id)? != row.10
-        {
-            anyhow::bail!("ContextManifest does not match its frozen RunInput version");
         }
         let (runtime_attachment_auth_receipt, runtime_attachment_auth_receipt_digest) =
             optional_legacy_runtime_auth(
@@ -4208,7 +4100,7 @@ impl BatchModelContext {
             .collect()
     }
 
-    fn run_input_evidence(&self, skill_links: &[CurrentInputSkillLink]) -> Value {
+    fn run_input_evidence(&self) -> Value {
         json!({
             "inputMessageIds": self
                 .run_input_messages
@@ -4230,8 +4122,7 @@ impl BatchModelContext {
                     )
                 })
                 .collect::<Vec<_>>(),
-            "projectedInputDigest": canonical_json_digest(&self.run_input_projection(skill_links))
-                .expect("batch RUN_INPUT projection must be canonical JSON"),
+
         })
     }
 
@@ -4837,7 +4728,6 @@ struct SharedMessageAttachmentEvidence {
 #[serde(rename_all = "camelCase")]
 struct SharedMessageProjectionEvidence {
     quoted_input_evidence: Vec<Value>,
-    projected_input_digest: String,
     quote_scalar_count: usize,
     selection_kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4854,7 +4744,6 @@ struct SharedMessageProjectionEvidence {
     default_recipient_mention: Option<DefaultRecipientMention>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reply_to_message_id: Option<String>,
-    projected_body_digest: String,
     mentions_current_user: bool,
     body_length: usize,
     body_truncated: bool,
@@ -4872,7 +4761,6 @@ impl SharedMessageProjectionEvidence {
         Self {
             quoted_input_evidence: message.quotes.iter().map(|quote| json!({"quoteId":quote.quote_id,"source":quote.source,
                 "sourceContentDigest":quote.source_content_digest,"snapshotDigest":quote.snapshot_digest})).collect(),
-            projected_input_digest: sha256_text(&serde_json::to_string(&message.model_projection()).expect("serializable shared message")),
             quote_scalar_count: quote_scalar_count(&message.quotes),
             selection_kind,
             reference_distance,
@@ -4885,7 +4773,6 @@ impl SharedMessageProjectionEvidence {
             content_digest: message.content_digest.clone(),
             default_recipient_mention: message.default_recipient_mention.clone(),
             reply_to_message_id: message.reply_to_message_id.clone(),
-            projected_body_digest: sha256_text(&message.body),
             mentions_current_user: message.mentions_current_user,
             body_length: message.body_length,
             body_truncated: message.body_truncated,
@@ -4919,7 +4806,6 @@ struct RunFactRef {
 struct RenderedRunFacts {
     references: Vec<RunFactRef>,
     payload_json: String,
-    digest: String,
 }
 
 impl RenderedRunFacts {
@@ -4968,11 +4854,9 @@ fn render_run_facts(run_facts: &RunFacts) -> Result<RenderedRunFacts> {
         }
     }
     let payload_json = serde_json::to_string(run_facts)?;
-    let digest = sha256_text(&payload_json);
     Ok(RenderedRunFacts {
         references,
         payload_json,
-        digest,
     })
 }
 
@@ -5865,7 +5749,6 @@ struct CurrentInput {
     source_camp_message_id: Option<String>,
     source_conversation_message_id: Option<String>,
     source_content_digest: String,
-    projected_body_digest: String,
     mentions_current_user: bool,
 }
 
@@ -6267,7 +6150,6 @@ fn load_current_input_body<R: ContextReadConnection>(
             source_camp_message_id: Some(message_id),
             source_conversation_message_id: None,
             source_content_digest: content_digest,
-            projected_body_digest: sha256_text(&body),
             mentions_current_user,
         });
     }
@@ -6415,7 +6297,6 @@ fn load_current_input_body<R: ContextReadConnection>(
             source_camp_message_id: Some(row.2),
             source_conversation_message_id: None,
             source_content_digest: row.5.clone(),
-            projected_body_digest: row.5,
             mentions_current_user: false,
         });
     }
@@ -6437,7 +6318,6 @@ fn load_current_input_body<R: ContextReadConnection>(
                         source_camp_message_id: Some(camp_message_id.to_string()),
                         source_conversation_message_id: None,
                         source_content_digest: camp_message.content_digest,
-                        projected_body_digest: canonical_json_digest(&payload)?,
                         mentions_current_user: false,
                     });
                 }
@@ -6447,7 +6327,6 @@ fn load_current_input_body<R: ContextReadConnection>(
                 camp_message.stored_body,
                 camp_message.structured_content_json,
             )?;
-            let projected_body_digest = sha256_text(&body);
             Ok(CurrentInput {
                 quotes: Vec::new(),
                 id: camp_message.id,
@@ -6459,7 +6338,6 @@ fn load_current_input_body<R: ContextReadConnection>(
                 source_camp_message_id: Some(camp_message_id.to_string()),
                 source_conversation_message_id: None,
                 source_content_digest: camp_message.content_digest,
-                projected_body_digest,
                 mentions_current_user,
             })
         }
@@ -6522,7 +6400,6 @@ fn load_current_input_body<R: ContextReadConnection>(
                     source_camp_message_id: None,
                     source_conversation_message_id: Some(conversation_message_id.to_string()),
                     source_content_digest: body_digest.clone(),
-                    projected_body_digest: body_digest,
                     mentions_current_user: false,
                 });
             }
@@ -6562,7 +6439,6 @@ fn load_current_input_body<R: ContextReadConnection>(
                 source_camp_message_id: None,
                 source_conversation_message_id: Some(conversation_message_id.to_string()),
                 source_content_digest: body_digest.clone(),
-                projected_body_digest: body_digest,
                 mentions_current_user: false,
             })
         }
@@ -6767,24 +6643,6 @@ struct SelectedSelfActiveTask {
     updated_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SelfActiveTaskReference {
-    task_id: String,
-    updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SelfActiveTaskEvidence {
-    included: bool,
-    selected_task_refs: Vec<SelfActiveTaskReference>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    omitted_count: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    projection_digest: Option<String>,
-}
-
 fn self_active_task_projection(
     selected: &[SelectedSelfActiveTask],
     omitted_count: usize,
@@ -6795,29 +6653,6 @@ fn self_active_task_projection(
     Some(SelfActiveTaskProjection {
         tasks: selected.iter().map(|task| task.item.clone()).collect(),
         omitted_count: (omitted_count > 0).then_some(omitted_count),
-    })
-}
-
-fn self_active_task_evidence(
-    selected: &[SelectedSelfActiveTask],
-    omitted_count: usize,
-    projection: Option<&SelfActiveTaskProjection>,
-) -> Result<SelfActiveTaskEvidence> {
-    let projection_digest = projection
-        .map(serde_json::to_value)
-        .transpose()?
-        .map(|projection_value| sha256_text(&projection_value.to_string()));
-    Ok(SelfActiveTaskEvidence {
-        included: projection.is_some(),
-        selected_task_refs: selected
-            .iter()
-            .map(|task| SelfActiveTaskReference {
-                task_id: task.item.task_id.clone(),
-                updated_at: task.updated_at.clone(),
-            })
-            .collect(),
-        omitted_count: (omitted_count > 0).then_some(omitted_count),
-        projection_digest,
     })
 }
 
@@ -6991,60 +6826,6 @@ fn prepare_workspace_fact<R: ContextReadConnection>(
     })
 }
 
-fn validate_workspace_evidence(
-    payload: &str,
-    workspace: Option<&str>,
-    digest: Option<&str>,
-    included: bool,
-) -> Result<()> {
-    let section = payload
-        .split_once("[WORKSPACE]\n")
-        .and_then(|(_, value)| value.split_once("\n[/WORKSPACE]").map(|(value, _)| value));
-    let Some(workspace) = workspace else {
-        anyhow::ensure!(
-            digest.is_none() && !included && section.is_none(),
-            "Workspace evidence is incomplete"
-        );
-        return Ok(());
-    };
-    let value: Value = serde_json::from_str(workspace)?;
-    let fields = value
-        .as_object()
-        .context("Workspace evidence must be an object")?;
-    anyhow::ensure!(
-        fields
-            .keys()
-            .all(|key| matches!(key.as_str(), "workingDirectory" | "branch"))
-            && value["workingDirectory"]
-                .as_str()
-                .is_some_and(|path| Path::new(path).is_absolute()),
-        "Workspace evidence contains invalid fields"
-    );
-    anyhow::ensure!(
-        fields
-            .get("branch")
-            .is_none_or(|branch| branch.is_null() || branch.is_string()),
-        "Workspace branch evidence is invalid"
-    );
-    anyhow::ensure!(
-        Some(canonical_json_digest(&value)?.as_str()) == digest,
-        "Workspace evidence digest is invalid"
-    );
-    if included {
-        anyhow::ensure!(
-            serde_json::from_str::<Value>(section.context("Workspace section is missing")?)?
-                == value,
-            "Workspace section differs from evidence"
-        );
-    } else {
-        anyhow::ensure!(
-            section.is_none(),
-            "Omitted workspace unexpectedly reached the model"
-        );
-    }
-    Ok(())
-}
-
 struct RenderPayloadInput<'a> {
     collaboration_state: Option<&'a Value>,
     self_active_tasks: Option<&'a SelfActiveTaskProjection>,
@@ -7154,14 +6935,14 @@ fn prepare_additional_skills(
     Ok(PreparedAdditionalSkills { section, omitted })
 }
 
-fn persist_additional_skills_evidence(
+fn persist_additional_skill_omissions(
     transaction: &Transaction<'_>,
     manifest_id: &str,
-    prepared: &PreparedAdditionalSkills,
+    omitted: &[String],
 ) -> Result<()> {
     transaction.execute(
-        "INSERT INTO context_additional_skills_evidence(context_manifest_id, section_text, section_digest, omitted_json) VALUES (?1, ?2, ?3, ?4)",
-        params![manifest_id, prepared.section, sha256_text(&prepared.section), serde_json::to_string(&prepared.omitted)?],
+        "INSERT INTO context_additional_skills_evidence(context_manifest_id, section_text, section_digest, omitted_json) VALUES (?1, NULL, NULL, ?2)",
+        params![manifest_id, serde_json::to_string(omitted)?],
     )?;
     Ok(())
 }
@@ -7169,8 +6950,6 @@ fn persist_additional_skills_evidence(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreparedA2aGuidance {
     payload_json: Option<String>,
-    evidence: Value,
-    evidence_digest: String,
 }
 
 fn prepare_a2a_guidance<R: ContextReadConnection>(
@@ -7204,31 +6983,14 @@ fn prepare_a2a_guidance<R: ContextReadConnection>(
     } else {
         None
     };
-    let payload = variant.as_deref().map(a2a_guidance_payload).transpose()?;
-    let (payload_json, evidence) = if let Some(payload) = payload {
-        let payload_json = serde_json::to_string(&payload)?;
-        let evidence = json!({
-            "schemaVersion": 3,
-            "included": true,
-            "variant": variant.context("included A2A guidance has no variant")?,
-            "payloadDigest": sha256_text(&payload_json),
-        });
-        (Some(payload_json), evidence)
-    } else {
-        (
-            None,
-            json!({
-                "schemaVersion": 3,
-                "included": false,
-            }),
-        )
-    };
-    let evidence_digest = canonical_json_digest(&evidence)?;
-    Ok(PreparedA2aGuidance {
-        payload_json,
-        evidence,
-        evidence_digest,
-    })
+    let payload_json = variant
+        .as_deref()
+        .map(a2a_guidance_payload)
+        .transpose()?
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    Ok(PreparedA2aGuidance { payload_json })
 }
 
 fn a2a_guidance_payload(variant: &str) -> Result<Value> {
@@ -7256,63 +7018,6 @@ fn a2a_guidance_payload_version(variant: &str, version: i64) -> Result<Value> {
         })),
         other => anyhow::bail!("unsupported A2A guidance variant {other}"),
     }
-}
-
-fn validate_a2a_guidance_evidence(
-    evidence: &Value,
-    evidence_digest: &str,
-    rendered_payload: &str,
-) -> Result<()> {
-    if canonical_json_digest(evidence)? != evidence_digest {
-        anyhow::bail!("A2A guidance evidence digest is invalid");
-    }
-    let version = evidence
-        .get("schemaVersion")
-        .and_then(Value::as_i64)
-        .filter(|version| matches!(version, 1 | 2 | 3))
-        .context("A2A guidance evidence version is invalid")?;
-    match evidence.get("included").and_then(Value::as_bool) {
-        Some(false) if evidence == &json!({"schemaVersion": version, "included": false}) => {
-            if rendered_payload.contains("[A2A_GUIDANCE]\n") {
-                anyhow::bail!("A2A guidance section exists without inclusion evidence");
-            }
-        }
-        Some(true) => {
-            let object = evidence
-                .as_object()
-                .context("included A2A guidance evidence is not an object")?;
-            if object.len() != 4 {
-                anyhow::bail!("included A2A guidance evidence shape is invalid");
-            }
-            let variant = evidence
-                .get("variant")
-                .and_then(Value::as_str)
-                .context("included A2A guidance has no variant")?;
-            let payload_digest = evidence
-                .get("payloadDigest")
-                .and_then(Value::as_str)
-                .context("included A2A guidance has no payload digest")?;
-            let payload_json = rendered_payload
-                .split_once("[A2A_GUIDANCE]\n")
-                .map(|(_, suffix)| suffix)
-                .and_then(|suffix| {
-                    suffix
-                        .split_once("\n[/A2A_GUIDANCE]\n\n")
-                        .map(|(payload, _)| payload)
-                })
-                .context("included A2A guidance section is missing")?;
-            if sha256_text(payload_json) != payload_digest {
-                anyhow::bail!("A2A guidance payload digest is invalid");
-            }
-            let expected_payload_json =
-                serde_json::to_string(&a2a_guidance_payload_version(variant, version)?)?;
-            if payload_json != expected_payload_json {
-                anyhow::bail!("A2A guidance payload does not match its variant");
-            }
-        }
-        _ => anyhow::bail!("A2A guidance evidence shape is invalid"),
-    }
-    Ok(())
 }
 
 fn append_json_section(output: &mut String, name: &str, value: &Value) -> Result<()> {
@@ -7397,51 +7102,26 @@ fn load_existing_manifest(
         .connection()
         .query_row(
             r#"
-            SELECT manifest.id, manifest.native_binding_generation,
+            SELECT manifest.id,
+                   manifest.native_binding_generation,
                    manifest.camp_message_boundary_sequence,
                    manifest.rendered_payload_blob_id,
-                   manifest.rendered_payload_digest,
+                   'sha256:' || blob.sha256,
                    manifest.collaboration_state_digest,
                    manifest.mcp_exposure_json,
-                   manifest.mcp_exposure_digest,
-                   manifest.mcp_projection_digest,
                    bootstrap.id,
                    bootstrap.session_charter_blob_id,
                    bootstrap.session_charter_digest,
                    bootstrap.memory_entrypoint_blob_id,
                    bootstrap.memory_entrypoint_digest,
                    bootstrap.delivery_mode,
-                   manifest.formatter_version,
-                   manifest.context_delivery_profile_version,
-                   manifest.context_delivery_profile_json,
-                   manifest.context_delivery_profile_digest,
-                   EXISTS(
-                       SELECT 1 FROM runtime_input_delivery AS delivery
-                       WHERE delivery.context_manifest_id = manifest.id
-                   ),
-                   (
-                       SELECT delivery.bootstrap_redelivery_revision
-                       FROM runtime_input_delivery AS delivery
-                       WHERE delivery.context_manifest_id = manifest.id
-                       ORDER BY delivery.prepared_at DESC, delivery.id DESC
-                       LIMIT 1
-                   ),
-                   manifest.shared_message_evidence_json,
-                   manifest.shared_message_evidence_digest,
-                   manifest.run_fact_payload_json,
-                   manifest.run_fact_digest,
-                   manifest.self_active_task_evidence_json,
-                   manifest.self_active_task_evidence_digest,
+                   EXISTS(SELECT 1 FROM runtime_input_delivery WHERE context_manifest_id=manifest.id),
+                   (SELECT bootstrap_redelivery_revision FROM runtime_input_delivery WHERE context_manifest_id=manifest.id ORDER BY prepared_at DESC,id DESC LIMIT 1),
                    manifest.skill_exposure_json,
-                   manifest.skill_exposure_digest,
                    manifest.current_input_skill_resolution_json,
-                   manifest.current_input_skill_resolution_digest,
-                   manifest.message_projection_audience,
-                   manifest.a2a_guidance_evidence_json,
-                   manifest.a2a_guidance_evidence_digest,
-                   manifest.context_manifest_version,
-                   manifest.run_facts_schema_version
+                   manifest.message_projection_audience
             FROM context_manifest AS manifest
+            JOIN managed_blob AS blob ON blob.id=manifest.rendered_payload_blob_id
             JOIN native_session_bootstrap_evidence AS bootstrap
               ON bootstrap.id = manifest.bootstrap_evidence_id
             WHERE manifest.agent_run_id = ?1
@@ -7462,29 +7142,12 @@ fn load_existing_manifest(
                     row.get::<_, String>(10)?,
                     row.get::<_, String>(11)?,
                     row.get::<_, String>(12)?,
-                    row.get::<_, String>(13)?,
-                    row.get::<_, String>(14)?,
-                    row.get::<_, i64>(15)?,
-                    row.get::<_, i64>(16)?,
+                    row.get::<_, bool>(13)?,
+                    row.get::<_, Option<i64>>(14)?,
+                    row.get::<_, String>(15)?,
+                    row.get::<_, String>(16)?,
                     row.get::<_, String>(17)?,
-                    row.get::<_, String>(18)?,
-                    row.get::<_, bool>(19)?,
-                    row.get::<_, Option<i64>>(20)?,
-                    row.get::<_, String>(21)?,
-                    row.get::<_, String>(22)?,
-                    row.get::<_, String>(23)?,
-                    row.get::<_, String>(24)?,
-                    row.get::<_, String>(25)?,
-                    row.get::<_, String>(26)?,
-                    row.get::<_, String>(27)?,
-                    row.get::<_, String>(28)?,
-                    row.get::<_, String>(29)?,
-                    row.get::<_, String>(30)?,
-                    row.get::<_, String>(31)?,
-                    row.get::<_, String>(32)?,
-                    row.get::<_, String>(33)?,
-                    row.get::<_, i64>(34)?,
-                    row.get::<_, i64>(35)?,
+
                 ))
             },
         )
@@ -7495,69 +7158,17 @@ fn load_existing_manifest(
     if row.2 != snapshot.camp_message_boundary_sequence {
         anyhow::bail!("Stored ContextManifest no longer matches its frozen AgentRun input");
     }
-    if !context_manifest_is_dispatchable(row.34, row.15, row.16, &snapshot.invocation_kind)
-        || row.35 != run_facts_schema_version(row.34, &snapshot.invocation_kind)
-    {
-        anyhow::bail!("Stored ContextManifest version evidence is inconsistent");
-    }
-    if snapshot.invocation_kind == "batch"
-        && frozen_batch_context_manifest_version(database.connection(), &snapshot.agent_run_id)?
-            != row.34
-    {
-        anyhow::bail!("Stored ContextManifest does not match its frozen RunInput version");
-    }
-    if !valid_agent_projection_audience(&row.31) {
+    if !valid_agent_projection_audience(&row.17) {
         anyhow::bail!("Stored ContextManifest projection audience is invalid");
     }
-    let a2a_guidance_evidence: Value = serde_json::from_str(&row.32)
-        .context("Stored ContextManifest A2A guidance evidence is invalid")?;
-    if canonical_json_digest(&a2a_guidance_evidence)? != row.33 {
-        anyhow::bail!("Stored ContextManifest A2A guidance evidence digest is invalid");
-    }
-    let shared_message_evidence: Value = serde_json::from_str(&row.21)
-        .context("Stored ContextManifest Shared Message evidence is invalid")?;
-    if canonical_json_digest(&shared_message_evidence)? != row.22 {
-        anyhow::bail!("Stored ContextManifest Shared Message evidence digest is invalid");
-    }
-    if sha256_text(&row.23) != row.24 {
-        anyhow::bail!("Stored ContextManifest Run Fact evidence digest is invalid");
-    }
-    let self_active_task_evidence: SelfActiveTaskEvidence = serde_json::from_str(&row.25)
-        .context("Stored ContextManifest Self Active Task evidence is invalid")?;
-    if canonical_json_digest(&serde_json::to_value(&self_active_task_evidence)?)? != row.26 {
-        anyhow::bail!("Stored ContextManifest Self Active Task evidence digest is invalid");
-    }
-    let stored_skill_exposure: SkillExposureSnapshot = serde_json::from_str(&row.27)
-        .context("Stored ContextManifest Skill exposure is invalid")?;
-    if stored_skill_exposure.schema_version != 2
-        || canonical_json_digest(&serde_json::to_value(&stored_skill_exposure)?)? != row.28
-    {
-        anyhow::bail!("Stored ContextManifest Skill exposure digest is invalid");
-    }
-    if prepared_skill_exposure.is_some_and(|prepared| {
-        prepared.snapshot != stored_skill_exposure || prepared.digest != row.28
-    }) {
+    let stored_skill_exposure: SkillExposureSnapshot = serde_json::from_str(&row.15)?;
+    if prepared_skill_exposure.is_some_and(|prepared| prepared.snapshot != stored_skill_exposure) {
         anyhow::bail!("Stored ContextManifest Skill exposure cannot change during recovery");
     }
-    validate_persisted_resolution(
-        &row.29,
-        &row.30,
-        &snapshot.skill_selection_snapshot,
-        &snapshot.skill_selection_snapshot_digest,
-        &row.28,
-    )?;
-    let stored_profile = ContextDeliveryProfile::from_frozen_json(&row.17)
-        .context("Stored ContextManifest delivery profile is invalid")?;
-    if row.16 != stored_profile.profile_version || row.18 != stored_profile.canonical_digest()? {
-        anyhow::bail!("Stored ContextManifest delivery profile evidence is inconsistent");
-    }
+    let _: CurrentInputSkillResolution = serde_json::from_str(&row.16)?;
     if let Some(prepared) = prepared_mcp_projection {
-        let stored: McpExposureSnapshot = serde_json::from_str(&row.6)
-            .context("Stored ContextManifest MCP exposure is invalid")?;
-        if stored != prepared.snapshot
-            || row.7 != prepared.exposure_digest
-            || row.8 != prepared.projection_digest
-        {
+        let stored: McpExposureSnapshot = serde_json::from_str(&row.6)?;
+        if stored != prepared.snapshot {
             anyhow::bail!("Stored ContextManifest MCP projection cannot change during recovery");
         }
     }
@@ -7569,66 +7180,29 @@ fn load_existing_manifest(
         anyhow::bail!("Stored ContextManifest belongs to another Native Binding generation");
     };
     let payload = blob_store.read_text(database, &row.3)?;
-    if sha256_text(&payload) != row.4 {
-        anyhow::bail!("Stored ContextManifest payload digest is invalid");
-    }
-    if matches!(
-        row.15,
-        27 | CONTEXT_FORMATTER_VERSION | 30 | 31 | 32 | PUBLIC_CAMP_BATCH_CONTEXT_FORMATTER_VERSION
-    ) {
-        let dynamic_evidence: Option<(String, String, String)> = database.connection().query_row(
-            "SELECT section_text, section_digest, omitted_json FROM context_additional_skills_evidence WHERE context_manifest_id = ?1",
-            [&row.0],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        ).optional()?;
-        let (section, digest, omitted) = dynamic_evidence
-            .context("new ContextManifest Additional Skills evidence is missing")?;
-        anyhow::ensure!(
-            sha256_text(&section) == digest && payload.matches(&section).count() == 1,
-            "Stored Additional Skills section changed"
-        );
-        let _: Vec<String> = serde_json::from_str(&omitted)?;
-    }
-    validate_a2a_guidance_evidence(&a2a_guidance_evidence, &row.33, &payload)?;
-    let (workspace_json,workspace_digest,workspace_included)=database.connection().query_row("SELECT workspace_fact_json,workspace_fact_digest,workspace_fact_included FROM context_manifest WHERE id=?1",[&row.0],|r|Ok((r.get::<_,Option<String>>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,bool>(2)?)))?;
-    validate_workspace_evidence(
-        &payload,
-        workspace_json.as_deref(),
-        workspace_digest.as_deref(),
-        workspace_included,
-    )?;
-    if row.14 != delivery_mode.as_str() {
+    if row.12 != delivery_mode.as_str() {
         anyhow::bail!("ContextManifest Charter delivery mode cannot change during recovery");
     }
-    let charter = blob_store.read_text(database, &row.10)?;
-    let entrypoint = blob_store.read_text(database, &row.12)?;
-    if sha256_text(&charter) != row.11 || sha256_text(&entrypoint) != row.13 {
-        anyhow::bail!("Stored Native Session Bootstrap digest is invalid");
-    }
+    let charter = blob_store.read_text(database, &row.8)?;
+    let entrypoint = blob_store.read_text(database, &row.10)?;
     let (bootstrap_contract, platform_section, platform_digest): (String, Option<String>, Option<String>) = database.connection().query_row(
         "SELECT bootstrap.contract_version, platform.section_text, platform.section_digest FROM native_session_bootstrap_evidence AS bootstrap LEFT JOIN native_session_platform_skills_evidence AS platform ON platform.bootstrap_evidence_id = bootstrap.id WHERE bootstrap.id = ?1",
-        [&row.9],
+        [&row.7],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
-    if let Some(section) = platform_section.as_deref() {
-        anyhow::ensure!(
-            Some(sha256_text(section)) == platform_digest,
-            "Stored platform Skills digest is invalid"
-        );
-    }
     let bootstrap_digest = bootstrap_evidence_digest_for(
         &bootstrap_contract,
-        &row.11,
+        &row.9,
         platform_digest.as_deref(),
-        &row.13,
+        &row.11,
     )?;
     let bootstrap_required = requires_new_native_session
         || snapshot.native_charter_digest.as_deref() != Some(bootstrap_digest.as_str());
-    let bootstrap_redelivery_revision = if row.19 {
+    let bootstrap_redelivery_revision = if row.13 {
         // Once an input has crossed the prepared cutoff, recovery must
         // reconstruct exactly that decision. A later observation belongs to
         // the next controllable prompt and cannot be pulled into this one.
-        row.20
+        row.14
     } else {
         let native_binding_id = snapshot
             .native_binding_id
@@ -7661,7 +7235,7 @@ fn load_existing_manifest(
     }
     Ok(Some(PreparedContext {
         manifest_id: row.0,
-        bootstrap_evidence_id: row.9,
+        bootstrap_evidence_id: row.7,
         rendered_payload: payload,
         rendered_payload_digest: row.4,
         runtime_payload,
@@ -7698,19 +7272,9 @@ fn load_frozen_delivery_context(
         .context("Materialized Message Delivery has no frozen Context")?;
     let frozen: FrozenDeliveryContext = serde_json::from_value(context.clone())
         .context("Message Delivery frozen Context payload is invalid")?;
-    if sha256_text(&frozen.rendered_payload) != frozen.rendered_payload_digest
-        || sha256_text(&frozen.runtime_payload) != frozen.runtime_payload_digest
-    {
-        anyhow::bail!("Message Delivery frozen Context payload digest is invalid");
-    }
     if !valid_agent_projection_audience(&frozen.message_projection_audience) {
         anyhow::bail!("Message Delivery frozen Context projection audience is invalid");
     }
-    validate_a2a_guidance_evidence(
-        &frozen.a2a_guidance_evidence,
-        &frozen.a2a_guidance_evidence_digest,
-        &frozen.rendered_payload,
-    )?;
     validate_frozen_view_receipt(snapshot, &frozen)?;
     validate_frozen_current_input_source(database, snapshot, &frozen)?;
     Ok(Some(frozen))
@@ -7791,34 +7355,6 @@ fn validate_frozen_view_receipt(
             == Some(frozen.message_projection_audience.as_str()),
         "Frozen Delivery Context projection audience evidence is inconsistent"
     );
-    let version = selection
-        .get("contextManifestVersion")
-        .and_then(Value::as_i64);
-    let profile = selection
-        .get("contextDeliveryProfileVersion")
-        .and_then(Value::as_i64);
-    if !matches!(
-        (version, profile),
-        (Some(28), Some(7)) | (Some(27), Some(7)) | (Some(26), Some(6))
-    ) || selection.get("runFactsSchemaVersion")
-        != Some(&json!(run_facts_schema_version(
-            version.unwrap_or_default(),
-            &snapshot.invocation_kind
-        )))
-    {
-        anyhow::bail!("Frozen Delivery Context uses an obsolete Attachment contract");
-    }
-    if version.is_some_and(|version| version >= 27) {
-        let _ = frozen_additional_skills(frozen)?;
-    } else if selection.contains_key("additionalSkillsSection")
-        || selection.contains_key("additionalSkillsSectionDigest")
-        || selection.contains_key("additionalSkillsOmitted")
-        || frozen
-            .rendered_payload
-            .contains("[ROVAI_ADDITIONAL_SKILLS]")
-    {
-        anyhow::bail!("Legacy frozen Context contains unexpected Additional Skills");
-    }
     if selection
         .get("campAttachmentViewReceipt")
         .is_none_or(Value::is_null)
@@ -7853,34 +7389,10 @@ fn validate_frozen_view_receipt(
     validate_frozen_camp_attachment_view_receipt(&receipt)
 }
 
-fn frozen_additional_skills(frozen: &FrozenDeliveryContext) -> Result<PreparedAdditionalSkills> {
-    let selection = frozen
-        .manifest_selection
-        .as_object()
-        .context("Frozen Delivery Context has no manifest selection")?;
-    let additional_section = selection
-        .get("additionalSkillsSection")
-        .and_then(Value::as_str)
-        .context("Frozen Delivery Context Additional Skills section is missing")?;
-    let additional_digest = selection
-        .get("additionalSkillsSectionDigest")
-        .and_then(Value::as_str)
-        .context("Frozen Delivery Context Additional Skills digest is missing")?;
-    anyhow::ensure!(
-        sha256_text(additional_section) == additional_digest
-            && frozen.rendered_payload.matches(additional_section).count() == 1,
-        "Frozen Additional Skills section is inconsistent"
-    );
-    let additional_omitted: Vec<String> = serde_json::from_value(
-        selection
-            .get("additionalSkillsOmitted")
-            .context("Frozen Additional Skills omissions are missing")?
-            .clone(),
-    )?;
-    Ok(PreparedAdditionalSkills {
-        section: additional_section.to_owned(),
-        omitted: additional_omitted,
-    })
+fn frozen_additional_skill_omissions(frozen: &FrozenDeliveryContext) -> Result<Vec<String>> {
+    Ok(serde_json::from_value(
+        frozen.manifest_selection["additionalSkillsOmitted"].clone(),
+    )?)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7892,8 +7404,6 @@ fn materialize_frozen_delivery_context(
     bootstrap_evidence: &PreparedBootstrapEvidence,
     prepared_skill_exposure: &PreparedSkillExposure,
     mcp_exposure: &McpExposureSnapshot,
-    mcp_exposure_digest: &str,
-    mcp_projection_digest: &str,
     request: &MaterializeContextRequest<'_>,
     expected_binding_generation: i64,
     requires_new_native_session: bool,
@@ -7907,10 +7417,6 @@ fn materialize_frozen_delivery_context(
     {
         anyhow::bail!("Frozen Delivery Context no longer matches the AgentRun boundary");
     }
-    anyhow::ensure!(
-        sha256_text(&frozen.rendered_payload) == frozen.rendered_payload_digest,
-        "Frozen Delivery Context digest changed before materialization"
-    );
     let workspace_fact = PreparedWorkspaceFact {
         value: serde_json::from_value(frozen.manifest_selection["workspaceFact"].clone())?,
         digest: serde_json::from_value(frozen.manifest_selection["workspaceFactDigest"].clone())?,
@@ -7936,7 +7442,11 @@ fn materialize_frozen_delivery_context(
         };
         compose_first_payload(&bootstrap, &frozen.rendered_payload)
     } else {
-        frozen.runtime_payload.clone()
+        frozen
+            .runtime_payload
+            .as_ref()
+            .unwrap_or(&frozen.rendered_payload)
+            .clone()
     };
     if frozen.rendered_payload.len() > max_payload_bytes
         || runtime_payload.len() > max_payload_bytes
@@ -7957,19 +7467,13 @@ fn materialize_frozen_delivery_context(
         adapter_kind,
     )?;
 
-    let payload_digest = sha256_text(&frozen.rendered_payload);
-    if payload_digest != frozen.rendered_payload_digest {
-        anyhow::bail!("Frozen Delivery Context digest changed before materialization");
-    }
     let blob = blob_store.put_bytes(
         database,
         frozen.rendered_payload.as_bytes(),
         "text/plain; charset=utf-8",
         "sensitive",
     )?;
-    if format!("sha256:{}", blob.sha256) != payload_digest {
-        anyhow::bail!("Rendered context Blob digest does not match the frozen payload");
-    }
+    let payload_digest = format!("sha256:{}", blob.sha256);
 
     let selection = frozen
         .manifest_selection
@@ -7977,9 +7481,6 @@ fn materialize_frozen_delivery_context(
         .context("Frozen Delivery Context has no manifest selection")?;
     if selection.get("messageProjectionAudience")
         != Some(&Value::String(frozen.message_projection_audience.clone()))
-        || selection.get("a2aGuidanceEvidence") != Some(&frozen.a2a_guidance_evidence)
-        || selection.get("a2aGuidanceEvidenceDigest")
-            != Some(&Value::String(frozen.a2a_guidance_evidence_digest.clone()))
     {
         anyhow::bail!("Frozen Delivery Context guidance selection is inconsistent");
     }
@@ -8014,9 +7515,6 @@ fn materialize_frozen_delivery_context(
     let profile_version = required("contextDeliveryProfileVersion")?
         .as_i64()
         .context("Frozen Delivery Context profile version is invalid")?;
-    let profile_digest = required("contextDeliveryProfileDigest")?
-        .as_str()
-        .context("Frozen Delivery Context profile digest is invalid")?;
     let collaboration_state_digest = required("collaborationStateDigest")?
         .as_str()
         .context("Frozen Delivery Context collaboration digest is invalid")?;
@@ -8026,31 +7524,6 @@ fn materialize_frozen_delivery_context(
     let collaboration_state_included = required("collaborationStateIncluded")?
         .as_bool()
         .context("Frozen Delivery Context collaboration inclusion evidence is invalid")?;
-    let shared_message_evidence_digest = required("sharedMessageEvidenceDigest")?
-        .as_str()
-        .context("Frozen Delivery Context Shared Message evidence digest is invalid")?;
-    if canonical_json_digest(required("sharedMessageEvidence")?)? != shared_message_evidence_digest
-    {
-        anyhow::bail!("Frozen Delivery Context Shared Message evidence is inconsistent");
-    }
-    let run_fact_digest = required("runFactDigest")?
-        .as_str()
-        .context("Frozen Delivery Context run fact digest is invalid")?;
-    let run_fact_payload_json = required("runFactPayload")?
-        .as_str()
-        .context("Frozen Delivery Context Run Fact payload is not exact JSON text")?
-        .to_string();
-    if sha256_text(&run_fact_payload_json) != run_fact_digest {
-        anyhow::bail!("Frozen Delivery Context Run Fact evidence is inconsistent");
-    }
-    let attachment_digest = required("attachmentDigest")?
-        .as_str()
-        .context("Frozen Delivery Context attachment digest is invalid")?;
-    let self_active_task_evidence: SelfActiveTaskEvidence =
-        serde_json::from_value(required("selfActiveTaskEvidence")?.clone())
-            .context("Frozen Delivery Context Self Active Task evidence is invalid")?;
-    let self_active_task_evidence_digest =
-        canonical_json_digest(&serde_json::to_value(&self_active_task_evidence)?)?;
     let context_manifest_version = required("contextManifestVersion")?
         .as_i64()
         .context("Frozen Delivery Context manifest version is invalid")?;
@@ -8068,16 +7541,6 @@ fn materialize_frozen_delivery_context(
         .then(|| serde_json::to_string(receipt_value))
         .transpose()?;
     let camp_attachment_view_receipt_digest = required("campAttachmentViewReceiptDigest")?.as_str();
-    if !context_manifest_is_dispatchable(
-        context_manifest_version,
-        context_manifest_version,
-        profile_version,
-        &snapshot.invocation_kind,
-    ) || run_facts_schema_version
-        != self::run_facts_schema_version(context_manifest_version, &snapshot.invocation_kind)
-    {
-        anyhow::bail!("Frozen Delivery Context version evidence is inconsistent");
-    }
     if let Some(digest) = camp_attachment_view_receipt_digest {
         if camp_attachment_view_receipt_version != Some(CAMP_ATTACHMENT_VIEW_RECEIPT_VERSION)
             || canonical_json_digest(receipt_value)? != digest
@@ -8089,7 +7552,7 @@ fn materialize_frozen_delivery_context(
     }
 
     let prepared_additional_skills = (context_manifest_version >= 27)
-        .then(|| frozen_additional_skills(frozen))
+        .then(|| frozen_additional_skill_omissions(frozen))
         .transpose()?;
     let manifest_id = Uuid::new_v4().to_string();
     let created_at = chrono::Utc::now().to_rfc3339();
@@ -8164,14 +7627,14 @@ fn materialize_frozen_delivery_context(
             global_public_message_boundary,
             previous_boundary,
             profile_version,
-            json_text("contextDeliveryProfileJson")?,
-            profile_digest,
+            None::<String>,
+            None::<String>,
             optional_json_text("originatingPublicUserMessageRef")?,
             json_text("recentMessageRefs")?,
             json_text("referenceClosureRefs")?,
             json_text("omissionEntries")?,
             json_text("sharedMessageEvidence")?,
-            shared_message_evidence_digest,
+            None::<String>,
             optional_i64("omittedMessageCount")?,
             optional_i64("omittedMessageSequenceStart")?,
             optional_i64("omittedMessageSequenceEnd")?,
@@ -8179,23 +7642,23 @@ fn materialize_frozen_delivery_context(
             collaboration_state_digest,
             i64::from(collaboration_state_included),
             json_text("runFactRefs")?,
-            run_fact_payload_json,
-            run_fact_digest,
+            None::<String>,
+            None::<String>,
             json_text("currentInputSource")?,
             json_text("attachmentRefs")?,
-            attachment_digest,
+            None::<String>,
             serde_json::to_string(&prepared_skill_exposure.snapshot)?,
-            prepared_skill_exposure.digest,
+            None::<String>,
             serde_json::to_string(&current_input_skill_resolution.resolution)?,
-            current_input_skill_resolution.digest,
+            None::<String>,
             serde_json::to_string(mcp_exposure)?,
-            mcp_exposure_digest,
-            mcp_projection_digest,
-            serde_json::to_string(&self_active_task_evidence)?,
-            self_active_task_evidence_digest,
+            None::<String>,
+            None::<String>,
+            None::<String>,
+            None::<String>,
             frozen.message_projection_audience,
-            serde_json::to_string(&frozen.a2a_guidance_evidence)?,
-            frozen.a2a_guidance_evidence_digest,
+            None::<String>,
+            None::<String>,
             context_manifest_version,
             run_facts_schema_version,
             camp_attachment_view_receipt_version,
@@ -8203,7 +7666,7 @@ fn materialize_frozen_delivery_context(
             camp_attachment_view_receipt_digest,
             context_manifest_version,
             blob.id,
-            payload_digest,
+            None::<String>,
             created_at,
             workspace_fact
                 .value
@@ -8216,7 +7679,7 @@ fn materialize_frozen_delivery_context(
         ],
     )?;
     if let Some(prepared_additional_skills) = &prepared_additional_skills {
-        persist_additional_skills_evidence(&transaction, &manifest_id, prepared_additional_skills)?;
+        persist_additional_skill_omissions(&transaction, &manifest_id, prepared_additional_skills)?;
     }
     for camp in &history_camps {
         transaction.execute(
@@ -8246,21 +7709,15 @@ fn materialize_frozen_delivery_context(
             "historyCampCount": history_camps.len(),
             "previousAcceptedPublicBoundarySequence": previous_boundary,
             "contextDeliveryProfileVersion": profile_version,
-            "contextDeliveryProfileDigest": profile_digest,
+
             "bootstrapEvidenceId": bootstrap_evidence.evidence_id,
             "collaborationStateDigest": collaboration_state_digest,
             "collaborationStateIncluded": collaboration_state_included,
-            "sharedMessageEvidenceDigest": shared_message_evidence_digest,
-            "runFactDigest": run_fact_digest,
-            "attachmentDigest": attachment_digest,
-            "skillExposureDigest": prepared_skill_exposure.digest,
-            "currentInputSkillResolutionDigest": current_input_skill_resolution.digest,
-            "mcpExposureDigest": mcp_exposure_digest,
-            "selfActiveTaskEvidenceDigest": self_active_task_evidence_digest,
+
             "messageProjectionAudience": frozen.message_projection_audience,
-            "a2aGuidanceEvidenceDigest": frozen.a2a_guidance_evidence_digest,
+
             "campAttachmentViewReceiptDigest": camp_attachment_view_receipt_digest,
-            "dynamicPayloadDigest": payload_digest,
+
             "frozenByMessageDelivery": true,
         }),
     )?;
@@ -8816,36 +8273,6 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_admission_accepts_current_and_frozen_predecessor_contracts() {
-        assert!(context_manifest_is_dispatchable(28, 28, 7, "single_chat"));
-        assert!(context_manifest_is_dispatchable(33, 33, 10, "batch"));
-        assert!(context_manifest_is_dispatchable(32, 32, 10, "batch"));
-        assert!(context_manifest_is_dispatchable(27, 27, 7, "single_chat"));
-        assert!(context_manifest_is_dispatchable(31, 31, 10, "batch"));
-        assert!(context_manifest_is_dispatchable(30, 30, 10, "batch"));
-        assert!(context_manifest_is_dispatchable(29, 29, 9, "batch"));
-        assert!(context_manifest_is_dispatchable(26, 26, 6, "single_chat"));
-        for (manifest, formatter, profile, invocation) in [
-            (25, 25, 6, "single_chat"),
-            (26, 26, 7, "batch"),
-            (27, 27, 8, "batch"),
-            (28, 28, 8, "batch"),
-            (28, 27, 8, "batch"),
-            (28, 28, 6, "batch"),
-            (29, 29, 8, "batch"),
-            (29, 29, 10, "batch"),
-            (30, 30, 9, "batch"),
-            (31, 31, 9, "batch"),
-            (31, 30, 10, "batch"),
-            (26, 26, 8, "single_chat"),
-        ] {
-            assert!(!context_manifest_is_dispatchable(
-                manifest, formatter, profile, invocation
-            ));
-        }
-    }
-
-    #[test]
     fn batch_public_window_keeps_the_camp_agent_watermark_across_new_sessions() {
         assert_eq!(accepted_public_window_lower_bound("batch", 41, true), 41);
         assert_eq!(accepted_public_window_lower_bound("batch", 41, false), 41);
@@ -9282,7 +8709,6 @@ mod slow_tests {
             source_camp_message_id: Some("message-1".to_string()),
             source_conversation_message_id: None,
             source_content_digest: "sha256:content".to_string(),
-            projected_body_digest: "sha256:body".to_string(),
             mentions_current_user: false,
         };
         let payload = direct.as_payload(
@@ -9365,7 +8791,7 @@ mod slow_tests {
     fn single_chat_contract_bytes_and_dynamic_section_order_are_exact() {
         assert_eq!(
             sha256_text(SINGLE_CHAT_SESSION_CHARTER),
-            "sha256:a01f0a5f4abfb671eb070d4e2f5cf13ddb399e2364acd6d795413206b4ee3a3a"
+            "sha256:bfd8918c49e343563895739baf0ce12d93c4f87dcdc44c442aeadf8180ff4e43"
         );
         assert_eq!(
             sha256_text(SINGLE_CHAT_GUIDANCE),
@@ -9437,7 +8863,7 @@ mod slow_tests {
     }
 
     #[test]
-    fn a2a_guidance_is_edge_specific_exact_and_closed_by_frozen_evidence() {
+    fn a2a_guidance_is_edge_specific_and_omitted_for_other_inputs() {
         let mut connection = rusqlite::Connection::open_in_memory().unwrap();
         connection
             .execute_batch(
@@ -9493,59 +8919,16 @@ mod slow_tests {
         let expected_forward = r#"{"instructions":["This member message delegates work to you.","Complete the requested work. Route back only a substantive result or a blocking question that the sender must act on; otherwise do not send.","Do not send acknowledgement, agreement, thanks, closure, standby, no-new-information, or a repeated conclusion.","A member message does not require a courtesy reply."]}"#;
         let expected_return = r#"{"instructions":["This message is a result from your earlier delegation.","Do not route an acknowledgement or confirmation back to the sender.","If it changes the User-facing conclusion, publish exactly one Thread update with `rovai send --public-only`.","If it adds no new Thread-visible value, end without sending.","Use Agent routing again only for a concrete new action or blocking question."]}"#;
 
-        for (delivery_id, variant, expected_payload) in [
+        for (delivery_id, _variant, expected_payload) in [
             ("forward", "forward", expected_forward),
             ("return", "return", expected_return),
         ] {
             let prepared =
                 prepare_a2a_guidance(&transaction, &snapshot("a2a", Some(delivery_id))).unwrap();
             assert_eq!(prepared.payload_json.as_deref(), Some(expected_payload));
-            assert_eq!(prepared.evidence["schemaVersion"], 3);
-            assert_eq!(prepared.evidence["included"], true);
-            assert_eq!(prepared.evidence["variant"], variant);
-            assert_eq!(
-                prepared.evidence["payloadDigest"],
-                sha256_text(expected_payload)
-            );
             let rendered = format!(
                 "[RUN_FACTS]\n{{}}\n[/RUN_FACTS]\n\n[A2A_GUIDANCE]\n{expected_payload}\n[/A2A_GUIDANCE]\n\n[CURRENT_INPUT]\n{{}}\n[/CURRENT_INPUT]\n\n"
             );
-            validate_a2a_guidance_evidence(
-                &prepared.evidence,
-                &prepared.evidence_digest,
-                &rendered,
-            )
-            .unwrap();
-            // Frozen v1/v2 results keep their original naming and digest.
-            for version in [1, 2] {
-                let legacy_payload = expected_payload.replace("User-facing", "Principal-facing");
-                let legacy_payload = if version == 1 {
-                    legacy_payload.replace("Thread", "Camp")
-                } else {
-                    legacy_payload
-                };
-                let mut legacy = prepared.evidence.clone();
-                legacy["schemaVersion"] = json!(version);
-                legacy["payloadDigest"] = json!(sha256_text(&legacy_payload));
-                let legacy_rendered = rendered.replace(expected_payload, &legacy_payload);
-                validate_a2a_guidance_evidence(
-                    &legacy,
-                    &canonical_json_digest(&legacy).unwrap(),
-                    &legacy_rendered,
-                )
-                .unwrap();
-                if variant == "return" {
-                    legacy["schemaVersion"] = json!(3);
-                    assert!(
-                        validate_a2a_guidance_evidence(
-                            &legacy,
-                            &canonical_json_digest(&legacy).unwrap(),
-                            &legacy_rendered
-                        )
-                        .is_err()
-                    );
-                }
-            }
             assert!(
                 rendered.find("[RUN_FACTS]").unwrap() < rendered.find("[A2A_GUIDANCE]").unwrap()
             );
@@ -9564,36 +8947,7 @@ mod slow_tests {
             let prepared =
                 prepare_a2a_guidance(&transaction, &snapshot(kind, delivery_id)).unwrap();
             assert_eq!(prepared.payload_json, None);
-            assert_eq!(
-                prepared.evidence,
-                json!({"schemaVersion": 3, "included": false})
-            );
-            validate_a2a_guidance_evidence(
-                &prepared.evidence,
-                &prepared.evidence_digest,
-                "[CURRENT_INPUT]\n{}\n[/CURRENT_INPUT]\n\n",
-            )
-            .unwrap();
         }
-
-        let forward =
-            prepare_a2a_guidance(&transaction, &snapshot("a2a", Some("forward"))).unwrap();
-        let mut mismatched = forward.evidence.clone();
-        mismatched["variant"] = json!("return");
-        let mismatched_digest = canonical_json_digest(&mismatched).unwrap();
-        let rendered_forward = format!(
-            "[A2A_GUIDANCE]\n{expected_forward}\n[/A2A_GUIDANCE]\n\n[CURRENT_INPUT]\n{{}}\n[/CURRENT_INPUT]\n\n"
-        );
-        assert!(
-            validate_a2a_guidance_evidence(&mismatched, &mismatched_digest, &rendered_forward,)
-                .is_err()
-        );
-        let mut extended = forward.evidence;
-        extended["edgeKind"] = json!("forward");
-        let extended_digest = canonical_json_digest(&extended).unwrap();
-        assert!(
-            validate_a2a_guidance_evidence(&extended, &extended_digest, &rendered_forward).is_err()
-        );
     }
 
     #[test]
@@ -11422,7 +10776,7 @@ mod slow_tests {
             i64,
             i64,
             i64,
-            String,
+            Option<String>,
             String,
         ) = fixture
             .database
@@ -11447,10 +10801,7 @@ mod slow_tests {
             (manifest_version, formatter_version, facts_version),
             (33, 33, 9)
         );
-        assert_eq!(
-            serde_json::from_str::<Value>(&profile_json).unwrap(),
-            json!({"profileVersion":10,"maxSelfActiveTasks":8})
-        );
+        assert_eq!(profile_json, None);
         assert_eq!(
             serde_json::from_str::<Value>(&shared_evidence).unwrap(),
             json!([])
@@ -11579,7 +10930,7 @@ mod slow_tests {
                 .rendered_payload
                 .contains(&attachment_content_digest)
         );
-        let (evidence_json, evidence_digest): (String, String) = fixture
+        let (evidence_json, evidence_digest): (String, Option<String>) = fixture
             .database
             .connection()
             .query_row(
@@ -11590,7 +10941,7 @@ mod slow_tests {
             .unwrap();
         let evidence: Value = serde_json::from_str(&evidence_json).unwrap();
         assert_eq!(evidence, json!([]));
-        assert_eq!(canonical_json_digest(&evidence).unwrap(), evidence_digest);
+        assert_eq!(evidence_digest, None);
         let stored_body: String = fixture
             .database
             .connection()
@@ -11669,7 +11020,7 @@ mod slow_tests {
     }
 
     #[test]
-    fn self_active_tasks_are_compact_bounded_and_frozen_in_manifest_evidence() {
+    fn self_active_tasks_are_compact_bounded_and_frozen_in_input() {
         let mut fixture = fixture();
         let collaboration = CollaborationService::default();
         for index in 0..10 {
@@ -11732,28 +11083,11 @@ mod slow_tests {
         }));
         assert!(!task_json.contains("description"));
 
-        let evidence: (String, String) = fixture
-            .database
-            .connection()
-            .query_row(
-                r#"
-                SELECT self_active_task_evidence_json,
-                       self_active_task_evidence_digest
-                FROM context_manifest WHERE agent_run_id = ?1
-                "#,
-                [&fixture.run_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        let evidence_value: Value = serde_json::from_str(&evidence.0).unwrap();
-        assert_eq!(evidence_value["included"], true);
-        assert_eq!(
-            evidence_value["selectedTaskRefs"].as_array().unwrap().len(),
-            8
-        );
-        assert_eq!(evidence_value["omittedCount"], 2);
-        assert_eq!(canonical_json_digest(&evidence_value).unwrap(), evidence.1);
-        assert_eq!(evidence_value["projectionDigest"], sha256_text(task_json));
+        let evidence: (Option<String>, Option<String>) = fixture.database.connection().query_row(
+            "SELECT self_active_task_evidence_json,self_active_task_evidence_digest FROM context_manifest WHERE agent_run_id=?1",
+            [&fixture.run_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(evidence, (None, None));
     }
 
     #[test]
@@ -11783,24 +11117,6 @@ mod slow_tests {
             .unwrap()
             .0;
         assert_eq!(empty_task_json, r#"{"tasks":[]}"#);
-        let empty_evidence: Value = empty_fixture
-            .database
-            .connection()
-            .query_row(
-                "SELECT self_active_task_evidence_json FROM context_manifest WHERE agent_run_id = ?1",
-                [&empty_fixture.run_id],
-                |row| row.get::<_, String>(0),
-            )
-            .map(|value| serde_json::from_str(&value).unwrap())
-            .unwrap();
-        assert_eq!(
-            empty_evidence,
-            json!({
-                "included": true,
-                "selectedTaskRefs": [],
-                "projectionDigest": sha256_text(empty_task_json),
-            })
-        );
         empty_fixture.cleanup();
 
         let mut budget_fixture = fixture();
@@ -11866,20 +11182,6 @@ mod slow_tests {
             panic!("Task projection should yield rather than fail required Context");
         };
         assert!(budget_context.rendered_payload.len() <= MIN_CONTEXT_PAYLOAD_BYTES);
-        let budget_evidence: Value = budget_fixture
-            .database
-            .connection()
-            .query_row(
-                "SELECT self_active_task_evidence_json FROM context_manifest WHERE agent_run_id = ?1",
-                [&budget_fixture.run_id],
-                |row| row.get::<_, String>(0),
-            )
-            .map(|value| serde_json::from_str(&value).unwrap())
-            .unwrap();
-        assert_eq!(budget_evidence["included"], false);
-        assert_eq!(budget_evidence["selectedTaskRefs"], json!([]));
-        assert_eq!(budget_evidence["omittedCount"], 8);
-        assert!(budget_evidence.get("projectionDigest").is_none());
         assert!(
             !budget_context
                 .rendered_payload
@@ -12030,7 +11332,7 @@ mod slow_tests {
         let ContextMaterialization::Ready(first_context) = materialized else {
             panic!("Context should materialize");
         };
-        let persisted: (String, String) = fixture
+        let persisted: (String, Option<String>) = fixture
             .database
             .connection()
             .query_row(
@@ -12046,7 +11348,7 @@ mod slow_tests {
             serde_json::from_str::<SkillExposureSnapshot>(&persisted.0).unwrap(),
             exposure.snapshot
         );
-        assert_eq!(persisted.1, exposure.digest);
+        assert_eq!(persisted.1, None);
         let run_input: Value = first_context
             .rendered_payload
             .split_once("[RUN_INPUT]\n")
@@ -12070,7 +11372,7 @@ mod slow_tests {
                 official.name
             )
         );
-        let (resolution_json, resolution_digest): (String, String) = fixture
+        let (resolution_json, resolution_digest): (String, Option<String>) = fixture
             .database
             .connection()
             .query_row(
@@ -12088,10 +11390,7 @@ mod slow_tests {
         assert_eq!(resolution.selection_snapshot_digest, selection_digest);
         assert_eq!(resolution.skill_exposure_digest, exposure.digest);
         assert_eq!(resolution.entries.len(), 1);
-        assert_eq!(
-            canonical_json_digest(&serde_json::to_value(&resolution).unwrap()).unwrap(),
-            resolution_digest
-        );
+        assert_eq!(resolution_digest, None);
         let snapshot = ReadModelService
             .camp_snapshot(&mut fixture.database, &fixture.camp_id)
             .unwrap();
@@ -12205,12 +11504,10 @@ mod slow_tests {
                 max_payload_bytes: DEFAULT_MAX_CONTEXT_PAYLOAD_BYTES,
             },
         );
-        assert!(
-            tampered
-                .unwrap_err()
-                .to_string()
-                .contains("Skill resolution is inconsistent")
-        );
+        let ContextMaterialization::Ready(recovered) = tampered.unwrap() else {
+            panic!("frozen input should recover")
+        };
+        assert_eq!(recovered.rendered_payload, first_context.rendered_payload);
     }
 
     #[test]
@@ -12480,7 +11777,7 @@ mod slow_tests {
     }
 
     #[test]
-    fn context_manifest_persists_only_redacted_frozen_mcp_exposure() {
+    fn context_manifest_recovers_redacted_frozen_mcp_exposure_without_digests() {
         let mut fixture = fixture();
         let config_store = McpConfigStore::new(fixture.directory.join("home/.rovai/mcp.json"));
         let known = ["agent_1".to_string()].into_iter().collect();
@@ -12533,19 +11830,17 @@ mod slow_tests {
                 .unwrap(),
             McpMutationResult::Ok { .. }
         ));
-        let projection = McpProjectionService::new(&fixture.directory)
-            .prepare(
-                &fixture.database,
-                &config_store,
-                &McpProjectionRequest {
-                    agent_run_id: &fixture.run_id,
-                    execution_epoch: fixture.execution_epoch,
-                    agent_id: "agent_1",
-                    adapter_kind: AdapterKind::CodexCli,
-                    reported_runtime_version: None,
-                    execution_root: &fixture.directory,
-                },
-            )
+        let projection_service = McpProjectionService::new(&fixture.directory);
+        let projection_request = McpProjectionRequest {
+            agent_run_id: &fixture.run_id,
+            execution_epoch: fixture.execution_epoch,
+            agent_id: "agent_1",
+            adapter_kind: AdapterKind::CodexCli,
+            reported_runtime_version: None,
+            execution_root: &fixture.directory,
+        };
+        let projection = projection_service
+            .prepare(&fixture.database, &config_store, &projection_request)
             .unwrap();
         let skill_snapshot = SkillExposureSnapshot::default();
         let skill_exposure = PreparedSkillExposure {
@@ -12567,7 +11862,7 @@ mod slow_tests {
             )
             .unwrap();
         assert!(matches!(materialized, ContextMaterialization::Ready(_)));
-        let persisted: (String, String, String) = fixture
+        let persisted: (String, Option<String>, Option<String>) = fixture
             .database
             .connection()
             .query_row(
@@ -12583,9 +11878,53 @@ mod slow_tests {
             serde_json::from_str::<McpExposureSnapshot>(&persisted.0).unwrap(),
             projection.snapshot
         );
-        assert_eq!(persisted.1, projection.exposure_digest);
-        assert_eq!(persisted.2, projection.projection_digest);
+        assert_eq!(persisted.1, None);
+        assert_eq!(persisted.2, None);
         assert!(!persisted.0.contains("must-not-enter-sqlite"));
+
+        // The real Manifest writer leaves both retired digests NULL. The next
+        // prepare must still recover the original private configuration.
+        let repeated = projection_service
+            .prepare(&fixture.database, &config_store, &projection_request)
+            .unwrap();
+        assert_eq!(repeated.snapshot, projection.snapshot);
+        assert_eq!(repeated.servers, projection.servers);
+
+        drop(fixture.database);
+        fixture.database = Database::open(&fixture.directory).unwrap();
+        let reopened_service = McpProjectionService::new(&fixture.directory);
+        let reopened = reopened_service
+            .prepare(&fixture.database, &config_store, &projection_request)
+            .unwrap();
+        assert_eq!(reopened.snapshot, projection.snapshot);
+        assert_eq!(reopened.servers, projection.servers);
+
+        // A new execution epoch copies the same Run's original projection.
+        let redispatched = reopened_service
+            .prepare(
+                &fixture.database,
+                &config_store,
+                &McpProjectionRequest {
+                    execution_epoch: fixture.execution_epoch + 1,
+                    ..projection_request
+                },
+            )
+            .unwrap();
+        assert_eq!(redispatched.snapshot, projection.snapshot);
+        assert_eq!(redispatched.servers, projection.servers);
+        assert_eq!(
+            std::fs::read(&redispatched.canonical_path).unwrap(),
+            std::fs::read(&projection.canonical_path).unwrap()
+        );
+        let diagnostic = ReadModelService
+            .agent_run_diagnostic(&mut fixture.database, &fixture.run_id)
+            .unwrap();
+        assert!(diagnostic.context_manifest.manifest_id.is_some());
+        assert_eq!(diagnostic.context_manifest.rendered_payload_digest, None);
+        assert_eq!(diagnostic.context_manifest.skill_exposure_digest, None);
+        assert_eq!(diagnostic.context_manifest.mcp_exposure_digest, None);
+        assert_eq!(diagnostic.context_manifest.mcp_projection_digest, None);
+        assert_eq!(diagnostic.context_manifest.attachment_digest, None);
         fixture.cleanup();
     }
 
@@ -12887,6 +12226,16 @@ mod slow_tests {
                     |row| row.get(0),
                 )
                 .unwrap();
+            crate::monitoring::MonitoringService::enroll_run(&mut fixture.database, &execution)
+                .unwrap();
+            if !dispatch_first {
+                // A broken optional projection must not block Stop's transaction.
+                fixture
+                    .database
+                    .connection()
+                    .execute_batch("DROP TABLE runtime_usage_run_summary")
+                    .unwrap();
+            }
             let result = ExecutionRuntimeService::default()
                 .request_agent_run_cancellation(
                     &mut fixture.database,
@@ -12908,6 +12257,28 @@ mod slow_tests {
                 .unwrap();
             assert_eq!(result.result.status, CommandResultStatus::Applied);
             assert_eq!(result.result.payload["status"], "cancelled");
+            if dispatch_first {
+                let settled: bool = fixture.database.connection().query_row(
+                    "SELECT finalized_at IS NOT NULL FROM runtime_usage_run_summary WHERE agent_run_id=?1",
+                    [&fixture.run_id], |row| row.get(0),
+                ).unwrap();
+                assert!(!settled, "statistics are not in the Stop transaction");
+                assert_eq!(
+                    crate::monitoring::MonitoringService::finalize_settled_runs(
+                        &mut fixture.database
+                    )
+                    .unwrap(),
+                    1
+                );
+                assert_eq!(
+                    crate::monitoring::MonitoringService::finalize_settled_runs(
+                        &mut fixture.database
+                    )
+                    .unwrap(),
+                    0
+                );
+            }
+
             assert_eq!(
                 ContextService
                     .runtime_input_delivery_status(&fixture.database, &delivery.id)
@@ -14825,14 +14196,17 @@ mod slow_tests {
             )
             .map(|value| serde_json::from_str(&value).unwrap())
             .unwrap();
-        assert_eq!(
-            run_input_evidence["messages"][0]["projectedBodyDigest"],
-            sha256_text(projected_body.as_str())
+        assert!(
+            run_input_evidence["messages"][0]
+                .get("projectedBodyDigest")
+                .is_none()
         );
-        assert_eq!(
-            run_input_evidence["projectedInputDigest"],
-            canonical_json_digest(&run_input).unwrap()
+        assert!(
+            run_input_evidence["messages"][0]
+                .get("projectedInputDigest")
+                .is_none()
         );
+        assert!(run_input_evidence.get("projectedInputDigest").is_none());
         assert_eq!(
             context.rendered_payload_digest,
             sha256_text(&context.rendered_payload)
@@ -14942,7 +14316,6 @@ mod slow_tests {
             rendered.payload_json,
             "{\"attachmentOutputRoot\":\"/tmp/attachments/rvcamp_01h47kvsy5fk1shh6w1g60eecf\",\"taskContext\":{\"taskId\":\"task-1\",\"referenceMode\":\"frozen\",\"laterChangesRetargetRun\":false}}"
         );
-        assert_eq!(rendered.digest, sha256_text(&rendered.payload_json));
     }
 
     #[test]

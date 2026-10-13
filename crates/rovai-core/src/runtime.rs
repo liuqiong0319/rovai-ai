@@ -8250,9 +8250,10 @@ mod tests {
             } else {
                 assert_eq!(result.result.code, "agent_run.failed");
                 let binding: Option<String> = database.connection().query_row("SELECT native_session_id FROM conversation WHERE id = (SELECT conversation_id FROM agent_run WHERE id = ?1)", [&agent_run_id], |row| row.get(0)).unwrap();
-                assert!(
-                    binding.is_none(),
-                    "unknown outcome must rotate the old native binding"
+                assert_eq!(
+                    binding.as_deref(),
+                    Some("old-native"),
+                    "unknown outcome keeps the same CLI Session available for an explicit continuation"
                 );
                 let state = database
                     .connection()

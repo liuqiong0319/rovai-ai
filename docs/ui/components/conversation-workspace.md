@@ -2,7 +2,7 @@
 document_type: ui-component-contract
 authority: renderer-camp-workspace
 status: accepted
-last_updated: 2026-10-09
+last_updated: 2026-10-12
 ---
 
 # Camp 会话工作区
@@ -135,7 +135,7 @@ Escape 收起预览。定位只滚动公共时间线并聚焦目标消息，保�
 较新页读取失败仍在执行记录内保留原位重试。
 
 冷启动恢复与应用内切换的呈现边界不同。Main Window Session 一旦给出恢复目标，Renderer 必须挂载对应一级页面框架；
-不足 400ms 不显示加载提示，超时后由共享的不透明整窗品牌画布遮住框架，直到真实目标内容可用再淡出。Camp shell 不得
+共享的不透明整窗品牌画布从 Renderer 首帧起遮住框架，直到真实目标内容可用再淡出。Camp shell 不得
 用标题区、骨架或结构占位伪装 meaningful content，也不得在 `camps.enter` 成功前提交权威 Camp。成功 enter 的 Active Camp 保持 Active；meaningful
 未激活的 Pending Camp 外壳保持 Pending。若该 Camp 已有有效 Desktop-local Composer snapshot，则在 Camp
 权威进入后恢复；普通一键 Pending 的客户端 presence 允许其进入侧栏，但不会激活 Camp，

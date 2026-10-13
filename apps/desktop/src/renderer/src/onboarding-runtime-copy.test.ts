@@ -260,8 +260,7 @@ async function harness() {
         return structuredClone(recorded.result) as T
       }
       const result: StoredCommandResult = {
-        commandId: params.commandId, commandType: method, requestDigest: 'test', requestDigestVersion: 1,
-        status: 'applied', code: 'applied', payload: {}, resultEntity: null, recordedAt: '2026-10-05T00:00:00Z'
+        commandId: params.commandId, commandType: method, status: 'applied', code: 'applied', payload: {}, resultEntity: null, recordedAt: '2026-10-05T00:00:00Z'
       }
       if (method === 'threads.create') {
         result.payload = { threadId }

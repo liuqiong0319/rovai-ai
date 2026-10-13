@@ -244,7 +244,7 @@ where
                             let native_message = message["error"]["message"]
                                 .as_str()
                                 .unwrap_or_default();
-                            Err(anyhow::anyhow!(if message["error"]["code"] == -32601 {
+                            let diagnostic = if message["error"]["code"] == -32601 {
                                 "Official ZCode method not found; bundled protocol is incompatible"
                             } else if native_message.contains("Provider Registry")
                                 && native_message.contains("Model")
@@ -252,7 +252,10 @@ where
                                 "ZCode Provider Registry has no usable model; configure a personal BYOK provider in official ZCode"
                             } else {
                                 "Official ZCode rejected the protocol request"
-                            }))
+                            };
+                            Err(anyhow::Error::new(crate::acp::AcpRpcError::from_response(
+                                &json!({"code":message["error"]["code"],"message":diagnostic})
+                            )))
                         } else {
                             Ok(message.get("result").cloned().unwrap_or(Value::Null))
                         };
@@ -538,7 +541,19 @@ impl Bridge {
             let response = match result {
                 Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
                 Err(error) => {
-                    json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":format!("Official ZCode request failed: {error}")}})
+                    // Only dispatch's exact native resume rejection can escape as
+                    // a recoverability code. A later subscribe/model failure cannot.
+                    let code = if error.downcast_ref::<crate::runtime::NativeSessionResumeFailure>()
+                        == Some(&crate::runtime::NativeSessionResumeFailure::Incompatible)
+                    {
+                        error
+                            .downcast_ref::<crate::acp::AcpRpcError>()
+                            .and_then(|e| e.code)
+                            .unwrap_or(-32000)
+                    } else {
+                        -32000
+                    };
+                    json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":format!("Official ZCode request failed: {error}")}})
                 }
             };
             write_frame(&self.core, &response).await?;
@@ -614,7 +629,16 @@ impl Bridge {
                     if self.config.protocol() == NativeProtocol::Legacy {
                         resume["runtimeModel"] = runtime_model;
                     }
-                    self.call("session/resume", resume).await?
+                    self.call("session/resume", resume).await.map_err(|error| {
+                        if error
+                            .downcast_ref::<crate::acp::AcpRpcError>()
+                            .is_some_and(|e| matches!(e.code, Some(-32004 | -32601)))
+                        {
+                            error.context(crate::runtime::NativeSessionResumeFailure::Incompatible)
+                        } else {
+                            error
+                        }
+                    })?
                 };
                 let session_id = snapshot
                     .pointer("/session/sessionId")
@@ -1575,6 +1599,116 @@ mod tests {
             }
         }
         peer.abort();
+    }
+
+    // Owns native-to-ACP error provenance. The model-selection happy path and
+    // Core fallback fixtures cannot detect a facade laundering unrelated errors
+    // into restore rejection. No real process, credentials or native history.
+    #[cfg(feature = "extended-tests")]
+    #[tokio::test]
+    async fn only_the_native_resume_rejection_authorizes_session_replacement() {
+        for (failed_method, native_code, expected_code) in [
+            ("session/resume", -32004, -32004),
+            ("session/resume", -32601, -32601),
+            ("session/resume", -32602, -32000),
+            ("session/resume", -32603, -32000),
+            ("workspace/readPresentation", -32004, -32000),
+            ("workspace/readPresentation", -32601, -32000),
+            ("session/subscribe", -32004, -32000),
+            ("session/subscribe", -32601, -32000),
+            ("session/setMode", -32004, -32000),
+            ("session/setModel", -32601, -32000),
+        ] {
+            let config = NativeConfig {
+                value: json!({}),
+                digest: "resume-errors-fixture".into(),
+                app_config: false,
+                protocol: NativeProtocol::ProviderRegistry,
+                default_selection: Some(json!({"providerId":"fixture","modelId":"model"})),
+            };
+            let (native, adapter) = tokio::io::duplex(64 * 1024);
+            let (native_read, native_write) = tokio::io::split(native);
+            let (adapter_read, adapter_write) = tokio::io::split(adapter);
+            let peer = tokio::spawn(async move {
+                let mut reader = BufReader::new(native_read);
+                let writer: Mutex<Writer> = Mutex::new(Box::new(native_write));
+                let mut frame = Vec::new();
+                while let Some(request) = read_frame(&mut reader, &mut frame).await.unwrap() {
+                    let method = request["method"].as_str().unwrap();
+                    let response = if method == failed_method {
+                        json!({"id":request["id"],"error":{"code":native_code,
+                            "message":"incompatible method not found PRIVATE_NATIVE_ERROR"}})
+                    } else {
+                        let result = match method {
+                            "workspace/readPresentation" => {
+                                json!({"workspace":request["params"]["workspace"],"mode":"build","slashCommands":[]})
+                            }
+                            "session/resume" => {
+                                assert_eq!(request["params"]["sessionId"], "s1");
+                                json!({"session":{"sessionId":"s1"},"settings":{"model":{
+                                    "current":{"providerId":"fixture","modelId":"model"}}}})
+                            }
+                            "session/subscribe" => json!({"eventSeq":0}),
+                            "session/setMode" => json!({}),
+                            other => panic!(
+                                "unexpected native request, including any business input: {other}"
+                            ),
+                        };
+                        json!({"id":request["id"],"result":result})
+                    };
+                    write_frame(&writer, &response).await.unwrap();
+                }
+            });
+            let stream = start(
+                adapter_write,
+                adapter_read,
+                config,
+                PathBuf::from("/fixture"),
+                "build".into(),
+            );
+            let (read, write) = tokio::io::split(stream);
+            let mut reader = BufReader::new(read);
+            let writer: Mutex<Writer> = Mutex::new(Box::new(write));
+            let mut frame = Vec::new();
+            let mut rejected = false;
+            for (id, method, params) in [
+                (1, "initialize", json!({})),
+                (
+                    2,
+                    "session/resume",
+                    json!({"cwd":"/fixture","sessionId":"s1"}),
+                ),
+                (
+                    3,
+                    "session/set_model",
+                    json!({"sessionId":"s1","modelId":"fixture/model"}),
+                ),
+            ] {
+                write_frame(&writer, &json!({"id":id,"method":method,"params":params}))
+                    .await
+                    .unwrap();
+                let response = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    read_frame(&mut reader, &mut frame),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+                assert_eq!(response["id"], id);
+                assert!(!response.to_string().contains("PRIVATE_NATIVE_ERROR"));
+                if response.get("error").is_some() {
+                    assert_eq!(
+                        response["error"]["code"], expected_code,
+                        "{failed_method}: {response}"
+                    );
+                    rejected = true;
+                    break;
+                }
+            }
+            assert!(rejected, "{failed_method}");
+            peer.abort();
+        }
     }
 
     // Owns the artifact filesystem boundary, which existing ACP output tests

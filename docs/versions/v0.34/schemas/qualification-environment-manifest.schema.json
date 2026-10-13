@@ -75,7 +75,7 @@
         "core": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["version", "executableDigest", "readModelSchema", "builtinToolContractVersion", "builtinToolIpcProtocolVersion", "builtinToolCatalogDigest"],
+          "required": ["version", "executableDigest", "readModelSchema", "builtinToolContractVersion", "builtinToolIpcProtocolVersion"],
           "properties": {
             "version": { "type": "string", "minLength": 1, "maxLength": 80 },
             "executableDigest": { "$ref": "artifact-envelope.schema.json#/$defs/digest" },

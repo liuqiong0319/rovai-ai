@@ -19,7 +19,7 @@ use rovai_core::{
         AdapterRuntimeProjection, AdapterRuntimeResolutionInput, AgentRuntimeAdapter,
         AgentRuntimeAdapterRegistry, McpProjectionCapability, SkillDiscoveryCapability,
     },
-    builtin_tool_transport::{BUILTIN_TOOL_CONTRACT_VERSION, builtin_tool_catalog_digest},
+    builtin_tool_transport::BUILTIN_TOOL_CONTRACT_VERSION,
     command::canonical_json_digest,
     managed_process::{
         ManagedChildStderr, ManagedChildStdin, ManagedChildStdout, ManagedProcess,
@@ -1704,7 +1704,6 @@ pub(crate) fn runtime_compatibility_digest(
         "hostConfigDigest": frozen_runtime.host_config_digest,
         "executionRoot": cwd,
         "builtinToolContractVersion": BUILTIN_TOOL_CONTRACT_VERSION,
-        "builtinToolCatalogDigest": builtin_tool_catalog_digest()?,
         "attachmentOutputRoot": attachment_authorization.output_root,
     }))
 }
@@ -2440,7 +2439,6 @@ mod tests {
             "hostConfigDigest": frozen.host_config_digest,
             "executionRoot": root.canonicalize().unwrap(),
             "builtinToolContractVersion": BUILTIN_TOOL_CONTRACT_VERSION,
-            "builtinToolCatalogDigest": builtin_tool_catalog_digest().unwrap(),
             "attachmentOutputRoot": attachment_authorization.output_root,
         }))
         .unwrap();

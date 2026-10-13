@@ -38,6 +38,12 @@ describe('composerInvitationTargets', () => {
       .toEqual({ inviteAgentIds: [], unavailableAgentIds: ['outside'] })
   })
 
+  it('away 队外资料仍不能因展示保留姓名而获得邀请资格', () => {
+    expect(composerInvitationTargets(['outside'], members, profiles.map(profile =>
+      profile.agentId === 'outside' ? { ...profile, presence: 'away' as const } : profile
+    ), true)).toEqual({ inviteAgentIds: [], unavailableAgentIds: ['outside'] })
+  })
+
   it('recognizes a successful invitation on retry without inviting twice', () => {
     const afterInvite = [...members, {
       agentId: 'outside', membershipStatus: 'active' as const, profilePresence: 'present' as const

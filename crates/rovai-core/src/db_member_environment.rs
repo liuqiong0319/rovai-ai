@@ -216,7 +216,7 @@ mod tests {
         connection.execute_batch(SESSION_SQL).unwrap();
         connection
             .execute_batch(
-                "DELETE FROM schema_migration WHERE version IN (193,194);
+                "DELETE FROM schema_migration WHERE version>=193;
             UPDATE rovai_data_contract SET projection_schema_version=142 WHERE singleton=1;
             INSERT INTO runtime_environment_plan VALUES('broken','broken',x'00');
             INSERT INTO conversation_runtime_environment VALUES('with-broken-snapshot','codex-cli','broken',1);",

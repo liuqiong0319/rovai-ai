@@ -158,10 +158,7 @@ impl NativeJsonlUsageReader {
         let root = fs::canonicalize(home).ok()?;
         let workspace = workspace.to_str()?.to_string();
         let path = match dialect {
-            Dialect::CodeBuddy => root
-                .join("projects")
-                .join(codebuddy_workspace_key(&workspace))
-                .join(format!("{session_id}.jsonl")),
+            Dialect::CodeBuddy => codebuddy_session_path(&root, &workspace, session_id),
             Dialect::Kimi => root
                 .join("sessions")
                 .join(kimi_workspace_key(&workspace))
@@ -674,6 +671,12 @@ fn safe_identity(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
         && value != "."
         && value != ".."
+}
+
+pub(crate) fn codebuddy_session_path(root: &Path, workspace: &str, session_id: &str) -> PathBuf {
+    root.join("projects")
+        .join(codebuddy_workspace_key(workspace))
+        .join(format!("{session_id}.jsonl"))
 }
 
 fn codebuddy_workspace_key(workspace: &str) -> String {

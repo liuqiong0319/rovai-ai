@@ -80,7 +80,6 @@ export function deriveObservedPairedExecution({
       ordinaryToolAvailabilityDigest: digestJson({
         builtinToolContractVersion: environmentPayload.core.builtinToolContractVersion,
         builtinToolIpcProtocolVersion: environmentPayload.core.builtinToolIpcProtocolVersion,
-        builtinToolCatalogDigest: environmentPayload.core.builtinToolCatalogDigest,
         leadCapabilityDigest: lead.capabilityDigest
       }),
       isolationProfileDigest: stripPairedDigest(casePayload.isolationProfile.digest)

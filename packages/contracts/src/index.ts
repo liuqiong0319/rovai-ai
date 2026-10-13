@@ -770,8 +770,6 @@ export interface StartPreflightResult {
 export interface StoredCommandResult {
   commandId: string
   commandType: string
-  requestDigest: string
-  requestDigestVersion: number
   status: 'applied' | 'accepted' | 'rejected'
   code: string
   payload: Record<string, unknown>
@@ -2265,7 +2263,7 @@ export interface ContextManifestView {
     maxPublicReferenceChainMessages: number
     maxSelfActiveTasks: number
   }
-  contextDeliveryProfileDigest: string
+  contextDeliveryProfileDigest: string | null
   originatingPublicUserMessageRef: unknown | null
   recentMessageCount: number
   omittedMessageCount: number | null
@@ -2275,30 +2273,30 @@ export interface ContextManifestView {
   collaborationStateDigest: string
   collaborationStateIncluded: boolean
   sharedMessageEvidence: unknown[]
-  sharedMessageEvidenceDigest: string
+  sharedMessageEvidenceDigest: string | null
   runFactRefs: RunFactRefView[]
   runFactPayload: unknown
-  runFactDigest: string
+  runFactDigest: string | null
   workspaceFact?: { workingDirectory: string; branch?: string | null } | null
   workspaceFactDigest?: string | null
   workspaceFactIncluded?: boolean
   currentInputSource: unknown
   attachmentRefs: ThreadAttachmentRefView[]
-  attachmentDigest: string
+  attachmentDigest: string | null
   skillExposure: SkillExposureSnapshot
-  skillExposureDigest: string
+  skillExposureDigest: string | null
   currentInputSkillResolution: CurrentInputSkillResolution
-  currentInputSkillResolutionDigest: string
+  currentInputSkillResolutionDigest: string | null
   messageProjectionAudience: 'agent_v1' | 'agent_v2'
   a2aGuidanceEvidence: unknown
-  a2aGuidanceEvidenceDigest: string
+  a2aGuidanceEvidenceDigest: string | null
   mcpExposure: McpExposureSnapshot
-  mcpExposureDigest: string
-  mcpProjectionDigest: string
+  mcpExposureDigest: string | null
+  mcpProjectionDigest: string | null
   selfActiveTaskEvidence: unknown
-  selfActiveTaskEvidenceDigest: string
+  selfActiveTaskEvidenceDigest: string | null
   formatterVersion: 22 | 23 | 24 | 25
-  renderedPayloadDigest: string
+  renderedPayloadDigest: string | null
   delivery: RuntimeInputDeliveryView | null
   createdAt: string
 }

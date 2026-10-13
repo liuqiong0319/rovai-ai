@@ -61,6 +61,9 @@ pub struct OpenSingleChatCommand {
 impl sealed::Sealed for OpenSingleChatCommand {}
 impl DomainCommand for OpenSingleChatCommand {
     const TYPE: &'static str = "single_chat.open";
+    fn draft_client(&self) -> Option<&DraftClient> {
+        Some(&self.draft_client)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +86,9 @@ pub struct SendSingleChatMessageCommand {
 impl sealed::Sealed for SendSingleChatMessageCommand {}
 impl DomainCommand for SendSingleChatMessageCommand {
     const TYPE: &'static str = "single_chat.send";
+    fn draft_client(&self) -> Option<&DraftClient> {
+        Some(&self.draft_client)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -282,6 +288,9 @@ pub enum SingleChatPendingInputEditAction {
 impl sealed::Sealed for EditSingleChatPendingInputCommand {}
 impl DomainCommand for EditSingleChatPendingInputCommand {
     const TYPE: &'static str = "single_chat.pending_input.edit";
+    fn draft_client(&self) -> Option<&DraftClient> {
+        Some(&self.draft_client)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

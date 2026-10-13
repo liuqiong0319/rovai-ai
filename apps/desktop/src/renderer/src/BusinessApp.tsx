@@ -285,7 +285,6 @@ export function requestAuthoritativeThreadOpenProjection(
 
 type LoadState = 'loading' | 'ready' | 'error'
 export type StartupStatus = 'loading' | 'waiting' | 'resolved'
-export const STARTUP_FEEDBACK_DELAY_MS = 400
 export const SHUTDOWN_FEEDBACK_DELAY_MS = 400
 export type View = 'compose' | 'camp' | 'members' | 'automations' | 'missions' | 'memory' | 'settings'
 type ActivateThreadOptions = {
@@ -371,10 +370,9 @@ export function startupGateShouldBeVisible(
 }
 
 export function startupFeedbackShouldBeVisible(
-  status: StartupStatus,
-  delayElapsed: boolean
+  status: StartupStatus
 ): boolean {
-  return status === 'waiting' || (status === 'loading' && delayElapsed)
+  return status !== 'resolved'
 }
 
 export function campViewIsVisibleForReadAcknowledgement(
@@ -809,10 +807,10 @@ export function StartupWorkspace({
               onExportDiagnostics={() => window.rovai.exportDiagnostics()} />)}
       </main>
     </NavigationShell>
-    <StartupLoadingCanvas
-      visible={feedbackVisible && error === null}
+    {error === null && <StartupLoadingCanvas
+      visible={feedbackVisible}
       route={target?.kind ?? 'location'}
-    />
+    />}
     </>
   )
 }
@@ -1012,15 +1010,13 @@ export function BusinessApp({
   sidebarFooter,
   remoteConnection,
   initialStartupSnapshot,
-  startupStartedAtMs,
-  startupFeedbackDelayElapsed
+  startupStartedAtMs
 }: {
   environment: BusinessEnvironment
   sidebarFooter?: React.ReactNode
   remoteConnection?: React.ReactNode
   initialStartupSnapshot?: DesktopStartupSnapshot
   startupStartedAtMs?: number
-  startupFeedbackDelayElapsed?: boolean
 }): React.JSX.Element {
   const { client, preferences: uiPreferences, desktop } = environment
   const userAnchorNavigationFor = useThreadUserAnchorCache(client)
@@ -4128,10 +4124,7 @@ export function BusinessApp({
     settings: 'settings-content'
   }
   const startupGateVisible = Boolean(desktop) && startupGateShouldBeVisible(startupSnapshot)
-  const startupFeedbackVisible = startupFeedbackShouldBeVisible(
-    startupStatus,
-    startupFeedbackDelayElapsed ?? false
-  )
+  const startupFeedbackVisible = startupFeedbackShouldBeVisible(startupStatus)
   const startupRoutePending = !startupGateVisible && startupStatus !== 'resolved'
     ? startupRouteTarget
     : null
@@ -4185,7 +4178,7 @@ export function BusinessApp({
       <>
         <StartupWorkspace
           snapshot={startupSnapshot}
-          feedbackVisible={startupFeedbackDelayElapsed ?? false}
+          feedbackVisible={!shuttingDown}
           error={onboardingError || startupError}
           onRetry={retryStartup}
         />
@@ -4660,7 +4653,7 @@ export function BusinessApp({
         onDownload={appUpdates.download}
       />}
     </NavigationShell>
-    <StartupLoadingCanvas visible={startupLoadingVisible} route={startupLoadingRoute} />
+    {startupStatus !== 'waiting' && <StartupLoadingCanvas visible={startupLoadingVisible} route={startupLoadingRoute} />}
     </MissionInteractionProvider>
     </FilePreviewProvider>
     </MobileLayoutProvider>

@@ -1,7 +1,7 @@
 ---
 document_type: development-guide
 authority: desktop-ui-acceptance-infrastructure
-last_updated: 2026-10-03
+last_updated: 2026-10-12
 ---
 
 # 桌面 UI 验收与隔离数据
@@ -393,35 +393,40 @@ pnpm accept:structured-mentions-ui
 明确选择与结构化 Skill 草稿持久化后即结束；`accept:composer-skill-context` 使用不调用模型的最小本地
 Runtime，继续证明 Picker → 发送 → send-time snapshot → Manifest resolution → exact
 `CURRENT_INPUT.skills`；`accept:structured-mentions-ui` 追加原有 Mention、
-发送、人物信息卡、原生选区与复制回归。两者都使用三位带角色的队员和无模型安全 Runtime
-fixture，并共同证明：
+发送、人物信息卡、原生选区与复制回归。两项 UI 门禁都使用三位带角色的队员和无模型安全 Runtime
+fixture。夹具固定本次 Host 的 Runtime 启动路径，并在退出后核对 Run 实际入口；历史安装快照不替代启动配置。
+静态准入按 `installed_unverified` 且无 blocker 检查，不伪造本次协议验证成功。Thread 使用当前
+`threads.*` API，本机草稿从隔离 Renderer 的 localStorage 读取，不再调用已退役的 Core Draft API。
+
+两项 UI 门禁共同证明：
 
 - `/` 在空 Composer、正文中的空白（含换行与全角空格）或中文标点后打开真实 Skill 下拉；
-  URL、路径、普通词内斜杠和跨原子 token 的内容不触发。候选按当前 Lead 的 Runtime 生效组过滤，
+  URL、路径、普通词内斜杠和跨原子 token 的内容不触发。候选读取当前 Thread 全队的工具箱与原生 Skill 来源，
   菜单位于输入框上方且使用 Porcelain/Steel 层级；日夜主题和窄窗口中不越界，键盘活动项保持可见；
 - Enter 或 Tab 明确选择后，仅将当前 `/query` 替换为原子
-  `skill_mention { skillId, nameAtSend }`，保留前后正文和其他 token，并复用已有空白或补一个普通尾随空格；
-  恢复 Composer 焦点并按同一身份持久化，Skill 的正文片段精确投影为 `/<skill-name>`，且不会自动发送；
+  Composer V2 `skill` Atom，保留前后正文和其他 token，并复用已有空白或补一个普通尾随空格；
+  恢复 Composer 焦点并按 `skillId + nameAtSend` 持久化，可见文本为 `/<skill-name>`，且不会自动发送；
 - 手写、粘贴和旧 Draft 中看似 `/<skill-name>` 的内容始终保持 Text，不按当前 Skill 反解析或升级；
-- Draft 中 Skill 后来 disabled、deleted、renamed 或对当前 Lead unassigned 时，token 保留冻结 Marker 并
-  显示不可用状态；正文仍可发送，是否提供 `SKILL.md` 文件链接以发送时和 Run start-time 的 Core
-  判定为准；
+- Draft 中 Skill 来源后来不在当前候选中时，保留冻结身份并提示来源状态；正文仍可发送，是否提供
+  `SKILL.md` 文件链接以 [Skills Rebuild](../contracts/skills-rebuild-v2.md) 的来源解析为准；
 - Composer Mention 是默认无底色的蓝色、不可拆分原子行内文字，耐久 Draft 与发送后的
   Structured Content 保持同一稳定身份；
 - 从队员或所有队员候选中选中 Mention 后自动补一个普通空格，光标位于该空格之后；
   替换范围后已有空白时不重复插入，模型单测覆盖复用与光标位置；
-- 一条消息在同一 CampTurn 边界为三位唯一收件人创建各自的 AgentRun；
+- 一条消息为三位唯一收件人分别创建 batch AgentRun；按 `inputMessageIds` 与 `anchorMessageId`
+  核对同一条已受理消息，不要求独立领取的 Run 具有同一时间戳或 CampTurn；
 - Composer 和已发送 Member Mention 具有同一飞书式紧凑样式：`display: inline`、透明背景、
   无边框、`0 1px` 内边距和 3px 圆角；仅 Hover、Focus 或打开态显示轻量蓝色反馈；
-- 两处当前队员 Mention 都具有 `role="button"`、`aria-haspopup="dialog"` 和精确可访问名称；
-  单击、Enter、Space 打开锚定的非模态人物信息卡，且不出现全局 `.app-toast`；
+- Composer Atom 保持不可编辑的行内 span；已发送当前队员 Mention 具有 `role="button"`、
+  `aria-haspopup="dialog"` 和精确可访问名称。Composer 点击及已发送 Mention 的单击、Enter、Space
+  打开锚定的非模态人物信息卡，且不出现全局 `.app-toast`；
 - 人物信息卡具有 `role="dialog"`、`aria-modal="false"`，并采用 392px/128px/302px 的
   布局 2 侧边照结构；展示名称、角色、Presence、运行时、专业职责、工作准则和性格底色；
 - 激活前后 `.camp-workspace` 保持存在且不出现 `.members-view`；点击外部或 `Esc` 关闭，
   键盘关闭后焦点返回原 Mention；
 - 跨过 Mention 执行真实鼠标拖选可完整包含其可见文本，且不会误触发人物信息卡；普通消息
   文本也继续支持原生拖选和系统 `Command+C`；
-- 整条消息复制入口仍只在 Hover/Focus 时出现，固定在消息内容列右上角，复制结果使用当前可见正文；
+- 用户消息复制入口仍只在 Hover/Focus 时出现，位于消息正文右下方，复制结果使用当前可见正文；
 - 测试前的系统剪贴板按 flavor 完整恢复，隔离 `userData` 不污染日常 App。
 
 专项脚本成功时输出 JSON 证据并生成 `composer-skill-picker.png`；完整脚本还会生成

@@ -110,7 +110,6 @@ test('paired factors are derived from admitted and normalized authorities instea
         core: {
           builtinToolContractVersion: 1,
           builtinToolIpcProtocolVersion: 1,
-          builtinToolCatalogDigest: `sha256:${'e'.repeat(64)}`
         },
         runtimes: [{
           memberId: 'agent_1',

@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
-import { createHash } from 'node:crypto'
 import { once } from 'node:events'
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:net'
@@ -28,14 +27,9 @@ test('Send files preserve the IPC request, fail before dispatch and never wait o
       if (!frame.endsWith('\n')) return
       const request = JSON.parse(frame)
       requests.push(request)
-      const preimage = {
-        contractVersion: 1, domain: 'rovai.builtin-tool-receipt.v1', ok: false,
-        operation: request.operation, requestId: request.request_id, resultOrError: rejection
-      }
-      const receipt = `sha256:${createHash('sha256').update(JSON.stringify(preimage)).digest('hex')}`
       connection.end(`${JSON.stringify({ kind: 'envelope', envelope: {
-        contractVersion: 1, ok: false, operation: request.operation,
-        requestId: request.request_id, receipt, error: rejection
+        contractVersion: 2, ok: false, operation: request.operation,
+        requestId: request.request_id, error: rejection
       } })}\n`)
     })
   })
@@ -45,7 +39,7 @@ test('Send files preserve the IPC request, fail before dispatch and never wait o
   const version = Number((await readFile(join(repository, 'crates/rovai-core/src/builtin_tool_transport.rs'), 'utf8'))
     .match(/BUILTIN_TOOL_CONTRACT_VERSION: u32 = (\d+);/u)[1])
   await writeFile(contextPath, JSON.stringify({
-    contractVersion: version, ipcProtocolVersion: 2,
+    contractVersion: version, ipcProtocolVersion: 3,
     coreEndpoint: process.platform === 'win32'
       ? { transport: 'windows_named_pipe', name: socket } : { transport: 'unix_socket', path: socket },
     processId: 'fixture', processToken: 'fixture',

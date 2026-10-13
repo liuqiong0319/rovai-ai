@@ -11,7 +11,7 @@ last_updated: 2026-10-12
 人类用户的主称呼、双别名、结构化搜索与冻结投影边界见 [User Naming v1](../contracts/user-naming-v1.md)。
 
 本文件说明 Rovai built-in operations 的长期组件结构。当前字段与版本以
-[Built-in Tool Transport v37](../contracts/builtin-tool-transport-v37.md)、
+[Built-in Tool Transport v38](../contracts/builtin-tool-transport-v38.md)、
 [Built-in Tool Agent Output Projection v1](../contracts/builtin-tool-agent-output-projection-v1.md)、
 [Camp History v11](../contracts/camp-history-v11.md)、
 [Durable Task v5](../contracts/durable-task-v5.md) 和
@@ -68,7 +68,7 @@ Agent Runtime
     │ fixed business command + process-scoped CLI context
     ▼
 bundled `rovai` CLI
-    │ authenticated local IPC v2
+    │ authenticated local IPC v3
     │ Unix Socket | Windows Named Pipe
     ▼
 Core BuiltinToolRouter
@@ -94,8 +94,8 @@ Domain canonical result
 ```
 
 CLI 是运输与投影客户端，不拥有领域逻辑、授权、receipt 或 Replay 真源。Router 验证输入、解析
-active lease、调用既有领域服务，并生成完整 Envelope、receipt、Replay 和 Core Activity。Projection
-不能参与 receipt、Replay 或授权决策。Rovai-owned 层不按统一字节阈值裁剪成功结果：完整交付才成功，
+active lease、调用既有领域服务，并生成完整 Envelope、结果 Replay 和 Core Activity。Projection
+不能参与 结果 Replay 或授权决策。Rovai-owned 层不按统一字节阈值裁剪成功结果：完整交付才成功，
 无法完成 framing、serialization 或 transport 时明确失败。
 
 每次 Agent 业务 operation 都必须匹配 current Run、lease、Native Binding 与 Run 冻结的 exact active Camp
@@ -108,12 +108,12 @@ membership version；这一统一 Router fence 覆盖整个 catalog，而不是�
 | --- | --- | --- |
 | Built-in Tool Catalog | canonical names、输入/结果 schema、`agentOutputSchema`、projection identity、错误合同、CLI mapping、digest | Agent-facing discovery API |
 | `rovai` CLI | 输入来源解析、canonical Schema 校验、IPC、一次完整 Envelope validation、显式 projection、stdout/exit/stderr 安全边界、有限运输重试 | 领域 handler、授权者、receipt 生成者、通用字段删除器 |
-| BuiltinToolRouter | current lease 解析、operation 分发、完整 Envelope、receipt、Replay、Activity | 第二套 Message/Delivery 服务 |
+| BuiltinToolRouter | current lease 解析、operation 分发、完整 Envelope、结果 Replay、Activity | 第二套 Message/Delivery 服务 |
 | Domain Services / Gateway | 可见范围、版本、状态、幂等副作用和业务不变量 | CLI 或 MCP 适配层 |
 | Runtime Fleet | process ownership、exclusive Run lease、reuse、fence、quiescence | Camp 选择或业务 catalog |
 | Runtime Adapter | 启动/恢复 Runtime、注入 CLI 环境、Bootstrap、外部 MCP Projection | built-in schema、alias、Agent discovery |
 | Bootstrap / Charter | 固定命令、使用原则、帮助入口和安全恢复原则 | 完整 schema、Envelope、catalog digest、凭据、Camp ID |
-| Evidence / Qualification / host debug | 完整 Envelope、receipt、request identity 和诊断证据 | Agent 日常 stdout |
+| Evidence / Qualification / host debug | 完整 Envelope、request identity 和诊断证据 | Agent 日常 stdout |
 
 Local IPC 的外部 seam 只有 `LocalIpcEndpoint` 与异步 byte stream。macOS Adapter 使用 Unix Socket；Windows
 Adapter 使用在创建时带 protected DACL、拒绝 remote client 的 Named Pipe。Raw `SECURITY_ATTRIBUTES`、listener
@@ -122,7 +122,7 @@ Adapter 使用在创建时带 protected DACL、拒绝 remote client 的 Named Pi
 
 ## Catalog 与 Agent command
 
-Core 只维护一份 catalog。它服务 IPC 校验、合同测试、Qualification、Evidence/receipt 验证和
+Core 只维护一份 catalog。它服务 IPC 校验、合同测试、Qualification、Evidence 和普通结果校验和
 开发诊断；catalog 中的 `agentOutputSchema`、Envelope schema、error contract 和 projection
 identity 不构成 Agent discovery 协议。
 
@@ -206,11 +206,11 @@ Send `body` exact help 只说明正文 payload；Bootstrap、Send summary/schema
 Domain Service 保留 line-leading 连续有效 mention 的兼容 parser，未知/歧义 alias 只结束 cluster 并保持 Text；
 CLI、Runtime Adapter、Bootstrap 与 Skill 都不重写正文或教学该 grammar。`--public-only` 在任何 alias/member lookup 前绕过正文寻址，并与显式
 `to/taskId` 原子冲突；`agentAddressingMode` 表达 caller intent，`effectiveRecipients/deliveryIds` 表达实际结果。
-该 schema 继续进入当前 catalog digest。
-当前 Contract/CLI 为 36、Agent Output 为 9、capability 为 `builtin_cli.transport.v36`，IPC 仍为 2。
+目录静态复用，说明和 schema 不再计算目录摘要；真正不兼容的接口改动使用原协议版本。
+当前 Contract/CLI 为 38、Agent Output 为 10、capability 为 `builtin_cli.transport.v38`，IPC 为 3，Envelope 为 2，不生成或校验结果摘要 receipt。
 [Thread Runs v1](../contracts/thread-runs-v1.md) 复用公开读取范围，用一个事务组合实际 Run 和按队员聚合的等待消息；不进入调度写路径。
 Camp History 当前使用 v11。Charter revision 为 22；Binding compatibility 保持 16 及原冻结 context tuple，
-Antigravity 继续使用既有固定工具兼容身份。当前目录变化不轮换旧 Session；恢复和压缩补发复用原 Bootstrap。
+Antigravity 使用当前工具协议版本，不含目录指纹。当前目录变化不轮换旧 Session；恢复和压缩补发复用原 Bootstrap。
 新 Binding 使用 Bootstrap v5/Formatter 5，新公开批次 Formatter/Manifest 33、非批次 28 保持。
 Skill 正文与 reference 通过现有受管同步更新原路径；旧、新 Session 后续读取均可使用新版。
 
@@ -684,7 +684,7 @@ Activity。命令文本、时间、cwd 或输出相似度不能建立关联。Sh
 系统不声称能够证明模型主观意图。
 
 - CLI 从 direct flags、JSON stdin/heredoc 或 `--input-file` 构造一个对象。Send 文件按
-  [Transport v37](../contracts/builtin-tool-transport-v37.md)分流，只有正文文件可与除 `--body` 外的发送参数组合；
+  [Transport v38](../contracts/builtin-tool-transport-v38.md)分流，只有正文文件可与除 `--body` 外的发送参数组合；
   完整请求文件和其他 operation 保持来源互斥。所有来源共用
   catalog canonical input Schema validator，只有通过后才加载 lease/context 并发送 IPC。`camp.read`
   直接发送 `messageId | thread | before | limit` 的合法组合，不补写模式或方向，也不接受旧字段。

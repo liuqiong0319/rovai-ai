@@ -468,8 +468,6 @@ function commandResult(
   return {
     commandId: `${commandType}-id`,
     commandType,
-    requestDigest: 'digest',
-    requestDigestVersion: 1,
     status: 'applied',
     code: `${commandType}.applied`,
     payload,

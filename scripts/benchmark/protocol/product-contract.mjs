@@ -13,7 +13,6 @@ const SOURCES = Object.freeze({
   contextContract: 'crates/rovai-core/src/context_contract.rs',
   contextDelivery: 'crates/rovai-core/src/context_delivery.rs',
   builtinTransport: 'crates/rovai-core/src/builtin_tool_transport.rs',
-  builtinCatalog: 'crates/rovai-core/src/team_tool_catalog.rs',
   taskContract: 'crates/rovai-core/src/collaboration.rs',
   acceptedAck: 'crates/rovai-core/src/context.rs'
 })
@@ -28,7 +27,6 @@ export async function collectProductContractFingerprint({
   const cargoVersion = capture(source.cargo.contents, /\[workspace\.package\][\s\S]*?\nversion\s*=\s*"([^"]+)"/u, 'workspace Cargo version')
   const gitCommit = await runGit(repositoryRoot, ['rev-parse', 'HEAD'])
   const gitStatus = await runGit(repositoryRoot, ['status', '--porcelain=v1'])
-  const health = coreHealth ? sanitizeCoreHealth(coreHealth) : null
   const coreDigest = coreExecutable ? await digestExecutable(coreExecutable) : null
   const deliveryProfileSymbol = capture(source.contextDelivery.contents,
     /pub fn current_public_camp_batch_context_delivery_profile\(\)[^{]*\{\s*(PUBLIC_CAMP_BATCH_CONTEXT_DELIVERY_PROFILE_V\d+)\.validate\(\)/u,
@@ -76,11 +74,6 @@ export async function collectProductContractFingerprint({
       Number.parseInt(capture(source.builtinTransport.contents, /BUILTIN_TOOL_CONTRACT_VERSION:\s*u32\s*=\s*(\d+)/u, 'Built-in Transport version'), 10),
       constantAuthority(source.builtinTransport, 'BUILTIN_TOOL_CONTRACT_VERSION')
     ),
-    builtInCatalogDigest: health?.builtinToolCatalogDigest
-      ? available(health.builtinToolCatalogDigest, { kind: 'core_health_check' })
-      : unavailable('product.builtin_catalog_requires_core_health', {
-          sourceCompatibilityDigest: digestSources([source.builtinTransport, source.builtinCatalog])
-        }),
     acceptedInputAckContract: available({
       semanticClass: 'accepted_input_only',
       sourceDigest: source.acceptedAck.digest
@@ -103,10 +96,6 @@ export function sanitizeCoreHealth(payload) {
     builtinToolContractVersion: Number.isInteger(core.builtinToolContractVersion)
       ? core.builtinToolContractVersion
       : null,
-    builtinToolCatalogDigest: typeof core.builtinToolCatalogDigest === 'string'
-      && /^(?:sha256:)?[a-f0-9]{64}$/u.test(core.builtinToolCatalogDigest)
-      ? core.builtinToolCatalogDigest.replace(/^sha256:/u, '')
-      : null
   }
 }
 

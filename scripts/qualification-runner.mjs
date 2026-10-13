@@ -1226,7 +1226,6 @@ async function collectEnvironmentManifest({
       readModelSchema: health.core.readModelSchema,
       builtinToolContractVersion: health.core.builtinToolContractVersion,
       builtinToolIpcProtocolVersion: health.core.builtinToolIpcProtocolVersion,
-      builtinToolCatalogDigest: health.core.builtinToolCatalogDigest,
       builtinToolEvidenceProjectionVersion: health.core.builtinToolEvidenceProjectionVersion
     },
     host: { platform: platform(), type: osType(), release: release(), architecture: arch(), timezone: Intl.DateTimeFormat().resolvedOptions().timeZone },

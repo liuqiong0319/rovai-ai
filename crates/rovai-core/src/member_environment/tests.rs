@@ -328,12 +328,13 @@ async fn parallel_child_processes_inherit_their_cli_environment_without_changing
 #[test]
 fn legacy_archive_is_inert_read_only_and_acknowledgment_survives_path_edits() {
     let (database, root) = database();
+    crate::db::downgrade_run_bootstrap_for_test(database.connection());
     database.connection().execute("INSERT INTO runtime_startup_setting(runtime_kind,revision,configuration_json,updated_at) VALUES('claude-code-cli',1,?1,datetime('now'))",
         [json!({"programPath":null,"environment":[{"name":"ANTHROPIC_API_KEY","value":"fixture-old-key"},{"name":"HTTP_PROXY","value":"http://legacy.example"}]}).to_string()]).unwrap();
     // Exercise the actual upgrade: schema, archive, old source and receipt are atomic.
     database.connection().execute_batch("DROP TABLE IF EXISTS conversation_runtime_environment; DROP TABLE member_runtime_environment;
         DROP TABLE IF EXISTS runtime_environment_plan; DROP TABLE runtime_environment_legacy;
-        DELETE FROM schema_migration WHERE version IN (191,192,193,194);
+        DELETE FROM schema_migration WHERE version>=191;
         UPDATE rovai_data_contract SET projection_schema_version=140 WHERE singleton=1;
         CREATE TRIGGER fail_member_environment_receipt BEFORE INSERT ON schema_migration WHEN NEW.version=191
         BEGIN SELECT RAISE(ABORT,'fixture environment receipt failure'); END;").unwrap();

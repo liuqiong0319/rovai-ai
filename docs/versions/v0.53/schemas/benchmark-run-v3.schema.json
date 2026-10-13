@@ -72,7 +72,7 @@
         "fingerprintDigest", "releaseBuildIdentity", "gitCommit", "coreExecutableDigest",
         "dataContractVersion", "dataContractSchemaVersion", "campSnapshotSchemaVersion",
         "contextManifestVersion", "contextFormatterVersion", "contextDeliveryProfileVersion",
-        "durableTaskContract", "builtInTransportVersion", "builtInCatalogDigest", "acceptedInputAckContract"
+        "durableTaskContract", "builtInTransportVersion", "acceptedInputAckContract"
       ],
       "properties": {
         "fingerprintDigest": { "$ref": "#/$defs/digest" },

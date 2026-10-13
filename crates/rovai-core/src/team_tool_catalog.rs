@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
@@ -36,7 +38,7 @@ pub fn validate_builtin_tool_input(canonical_name: &str, input: &Value) -> Resul
     let canonical_name = crate::thread_compat::canonical_operation(canonical_name);
     let input = &crate::thread_compat::normalize_builtin_input(canonical_name, input.clone())?;
     let definition = builtin_tool_definitions()
-        .into_iter()
+        .iter()
         .find(|definition| definition["name"].as_str() == Some(canonical_name))
         .ok_or_else(|| anyhow::anyhow!("unknown built-in operation: {canonical_name}"))?;
     validate_schema(input, &definition["inputSchema"])
@@ -955,7 +957,12 @@ fn mission_list_success_schema() -> Value {
     })
 }
 
-pub fn builtin_tool_definitions() -> Vec<Value> {
+pub fn builtin_tool_definitions() -> &'static [Value] {
+    static DEFINITIONS: OnceLock<Vec<Value>> = OnceLock::new();
+    DEFINITIONS.get_or_init(build_builtin_tool_definitions)
+}
+
+fn build_builtin_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "mission.list",

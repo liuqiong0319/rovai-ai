@@ -2,7 +2,7 @@
 document_type: ui-component-contract
 authority: renderer-composer-atoms-and-structured-mentions
 status: accepted
-last_updated: 2026-10-10
+last_updated: 2026-10-12
 ---
 
 # 结构化 Mention 与 Composer Atom
@@ -152,6 +152,12 @@ replace。失败保留现有正文并恢复交互。
 `addressedAgentId`，在可见正文前派生一个 Member Mention。它复用本节的行内色彩、人物卡和不可用降级，
 但使用 `data-quote-exclude` 与用户原文边界隔离：不是 Structured Content，不改变复制、引用定位、搜索、
 `camp.read` 或 Agent 路由。显式 Member Mention 仍只来自权威 Structured Content，不得从正文或显示前缀反推身份。
+
+发送受理后，本机临时展示的结构化 Member Mention 若尚无名册行，可以按同一 `agentId` 的现有、未移除队员资料
+保留姓名；资料为 `present` 或 `away` 都不抹去该身份的姓名。静态提示“正在同步队员名册”，不提前开放人物卡、
+不补造成员行或改变发送资格。该展示补充只从仍待
+投影的已受理消息派生，名册到达后收敛回成员状态；明确离队或资料已移除的名册行仍按不可用显示。
+正文、复制、历史回复预览和消息导航摘要共用这份临时名称解析，不从普通文本猜测身份。
 
 Current User Mention 从 Desktop 当前个人资料解析名称；保存后历史结构化 `@你` 立即显示为新名称。
 普通文本、代码和外部引用中的同名字面字符不替换。作者栏、复制投影和历史回复预览的当前资料规则见

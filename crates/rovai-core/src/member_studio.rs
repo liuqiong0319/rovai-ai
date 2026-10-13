@@ -537,28 +537,49 @@ pub fn create_member(
             |row| Ok((row.get::<_, String>(0)?,)),
         )
         .optional()?;
-    let Some((stored_digest,)) = pre else {
+    // A consumed capability for the same creation key is an idempotent replay;
+    // the command gateway returns the original result.
+    let replay = pre.is_none()
+        && database.connection().query_row(
+            r#"
+            SELECT EXISTS(SELECT 1 FROM member_create_capability
+            WHERE preview_id=?1 AND authorized_run_id=?2
+              AND scope_kind='camp' AND (scope_id IS ?3)
+              AND status='consumed' AND creation_key=?4)
+            "#,
+            params![
+                input.preview_id,
+                authenticated_run.agent_run_id.to_string(),
+                authenticated_run.camp_id,
+                input.draft.creation_key,
+            ],
+            |row| row.get::<_, bool>(0),
+        )?;
+    if let Some((stored_digest,)) = pre {
+        if stored_digest != digest {
+            return Err(MemberOperationError {
+                code: "member.card_mismatch",
+                message: "Member card changed after confirmation; run member.create.preview again",
+                details: None,
+            }
+            .into());
+        }
+    } else if !replay {
         return Err(MemberOperationError {
             code: "member.confirmation_required",
             message: "No confirmed capability is claimable for this preview by this run; run member.create.preview, then confirm, then retry",
             details: None,
         }
         .into());
-    };
-    if stored_digest != digest {
-        return Err(MemberOperationError {
-            code: "member.card_mismatch",
-            message: "Member card changed after confirmation; run member.create.preview again",
-            details: None,
-        }
-        .into());
     }
 
-    // Import (publish) the avatar only after the capability verifies.
+    // Import (publish) the avatar only after the capability verifies; a replay
+    // reuses the original result and must not publish another asset.
     let avatar_ref = input
         .draft
         .avatar_file
         .as_deref()
+        .filter(|_| !replay)
         .map(Path::new)
         .map(|path| import_managed_member_avatar(data_dir, creation_id, path))
         .transpose()

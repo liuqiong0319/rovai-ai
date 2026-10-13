@@ -83,6 +83,9 @@ pub struct BindUpload {
 impl sealed::Sealed for BindUpload {}
 impl DomainCommand for BindUpload {
     const TYPE: &'static str = "camp.source_attachment.upload.bind";
+    fn draft_client(&self) -> Option<&DraftClient> {
+        Some(&self.client)
+    }
 }
 
 fn envelope(client: &DraftClient, intent: UploadIntent) -> Result<CommandEnvelope<BindUpload>> {

@@ -4,6 +4,7 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 import type {
+  AgentProfile,
   ThreadMessageView,
   ThreadSnapshot,
   StructuredThreadMessageContent
@@ -41,13 +42,23 @@ const members: ThreadSnapshot['members'] = [{
   version: 1
 }]
 
+const reviewerProfile: AgentProfile = {
+  agentId: 'agent_reviewer', displayName: '沐瓦', avatarRef: null, accent: null, teamRole: '评审',
+  professionalResponsibilities: '', personalityTraits: [], workingPrinciples: '', growthTopic: '',
+  defaultCapabilities: [], presence: 'present', runtimeConfiguration: null,
+  runtimeReadiness: { status: 'ready', blockers: [] }, memberOrder: 1, version: 1,
+  createdAt: '2026-10-12T00:00:00Z', updatedAt: '2026-10-12T00:00:00Z', removedAt: null
+}
+
 function renderMessage(
   content: StructuredThreadMessageContent,
   body = 'NON_AUTHORITATIVE_BODY_CACHE',
   authorType: 'agent' | 'user' | 'external_principal' = 'agent',
   campMembers = members,
   profile: CurrentUserProfile = DEFAULT_CURRENT_USER_PROFILE,
-  messageOverrides: Partial<ThreadMessageView> = {}
+  messageOverrides: Partial<ThreadMessageView> = {},
+  agents: AgentProfile[] = [],
+  awaitingProjection = false
 ): string {
   const message: ThreadMessageView = {
     quotes: [],
@@ -89,7 +100,7 @@ function renderMessage(
     members: campMembers,
     membershipReconciliations: [],
     tasks: [],
-    messages: [message],
+    messages: awaitingProjection ? [] : [message],
     messageDeliveries: [],
     turns: [],
     agentRuns: [],
@@ -106,7 +117,8 @@ function renderMessage(
   }, createElement(ThreadWorkspace, {
     snapshot,
     projectName: null,
-    agents: [],
+    agents,
+    optimisticMessages: awaitingProjection ? [message] : [],
     busy: false,
     onSend: async () => undefined,
     onChangeLead: async () => undefined,
@@ -117,6 +129,59 @@ function renderMessage(
     inspectorVisible: false
   })))
 }
+
+describe('受理先于名册投影时的 Member Mention', () => {
+  const content: StructuredThreadMessageContent = [
+    { kind: 'member_mention', agentId: 'agent_reviewer' },
+    { kind: 'text', text: ' 请检查' }
+  ]
+  const renderPending = (campMembers = [members[0]], agents = [reviewerProfile], pending = true) =>
+    renderMessage(content, 'NON_AUTHORITATIVE_BODY_CACHE', 'user', campMembers,
+      DEFAULT_CURRENT_USER_PROFILE, { addressMode: 'explicit', addressedAgentIds: ['agent_reviewer'] }, agents, pending)
+
+  it.each(['present', 'away'] as const)('%s 资料保留已知姓名，但不伪造成员资格或可操作人物卡', (presence) => {
+    const source = JSON.stringify(content)
+    const markup = renderPending([members[0]], [{ ...reviewerProfile, presence }])
+    expect(markup).toContain('class="message-mention-token" data-agent-id="agent_reviewer"')
+    expect(markup).toContain('title="正在同步队员名册"')
+    expect(markup).toContain('aria-label="队员 沐瓦 的名册正在同步"')
+    expect(markup).toContain('@沐瓦</span>')
+    const token = markup.match(/<span class="message-mention-token"[^>]*>/)?.[0]
+    expect(token).not.toContain('role=')
+    expect(token).not.toContain('tabindex=')
+    expect(JSON.stringify(content)).toBe(source)
+  })
+
+  it.each(['left', 'removed'] as const)('明确 %s 的名册行仍压过现有资料', (state) => {
+    const campMembers = [members[0], {
+      ...members[1],
+      ...(state === 'left' ? { membershipStatus: 'left' as const } : { profilePresence: 'removed' as const })
+    }]
+    const markup = renderPending(campMembers)
+    expect(markup).toContain('class="message-mention-token is-unavailable" data-agent-id="agent_reviewer"')
+    expect(markup).toContain('@沐瓦</span>')
+    expect(markup).not.toContain('title="正在同步队员名册"')
+  })
+
+  it.each(['missing', 'removed', 'different-id', 'no-receipt'] as const)('不为 %s 引用补造待投影状态', (state) => {
+    const agents = state === 'missing' ? [] : [{
+      ...reviewerProfile,
+      ...(state === 'removed' ? { presence: 'removed' as const } : {}),
+      ...(state === 'different-id' ? { agentId: 'same-name-other-id' } : {})
+    }]
+    const markup = renderPending([members[0]], agents, state !== 'no-receipt')
+    expect(markup).toContain('class="message-mention-token is-unavailable" data-agent-id="agent_reviewer"')
+    expect(markup).toContain('@不可用队员</span>')
+    expect(markup).not.toContain('title="正在同步队员名册"')
+  })
+
+  it('名册到达后恢复当前成员交互并使用名册名称', () => {
+    const markup = renderPending([members[0], { ...members[1], displayName: '新名字' }])
+    expect(markup).toContain('class="message-mention-token is-interactive" data-agent-id="agent_reviewer"')
+    expect(markup).toContain('@新名字</span>')
+    expect(markup).not.toContain('title="正在同步队员名册"')
+  })
+})
 
 describe('Default recipient timeline Mention rendering', () => {
   it('shows the frozen default recipient before authored user text without changing the source', () => {

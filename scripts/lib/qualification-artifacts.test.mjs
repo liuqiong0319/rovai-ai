@@ -323,7 +323,6 @@ function environmentFixture(result) {
       readModelSchema: 18,
       builtinToolContractVersion: 1,
       builtinToolIpcProtocolVersion: 1,
-      builtinToolCatalogDigest: '9'.repeat(64)
     },
     host: {
       type: 'Darwin',

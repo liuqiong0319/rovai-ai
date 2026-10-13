@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import type { AgentProfile, ThreadSnapshot, ThreadComposerDraftView } from '@contracts'
+import type { AgentProfile, ThreadSnapshot, ThreadComposerDraftView, ThreadMessageView } from '@contracts'
+import { optimisticThreadMessage } from '../../../apps/desktop/src/renderer/src/BusinessApp'
 import { ThreadWorkspace, type ThreadLeaveGuard } from '../../../apps/desktop/src/renderer/src/ThreadWorkspace'
 import { ThreadClientProvider, type ThreadClient } from '../../../apps/desktop/src/renderer/src/camp-client'
 import { loadLocalThreadComposerDraft } from '../../../apps/desktop/src/renderer/src/camp-composer-local-store'
@@ -29,10 +30,15 @@ const initial: ThreadSnapshot = { schemaVersion: 35, throughGlobalSequence: 1,
   executionEvidence: [], agentRunFileChanges: [], agentRunImages: [], contextManifests: [], approvals: [], actions: [], timeline: [] }
 const calls: string[] = []
 const submissions: ThreadComposerDraftView[] = []
+const clipboardWrites: Array<{ text: string; html: string | null }> = []
+Object.assign(window, { rovai: { clipboard: { write: async (data: { text: string; html: string | null }) => { clipboardWrites.push(data) } } } })
 let rejectSend = true
 let coreActivated = false
 let acceptedSends = 0
 let prepareLeave: ThreadLeaveGuard | null = null
+let visibleSnapshot = initial
+let visibleProfiles = [agent, outside]
+let setProfiles: React.Dispatch<React.SetStateAction<AgentProfile[]>>
 let setFixture: React.Dispatch<React.SetStateAction<ThreadSnapshot>>
 let setVisible: React.Dispatch<React.SetStateAction<boolean>>
 const client = {
@@ -50,10 +56,12 @@ const client = {
 } as unknown as ThreadClient
 function Fixture() {
   const [snapshot, setSnapshot] = useState(initial)
+  const [profiles, updateProfiles] = useState([agent, outside])
+  const [acceptedMessages, setAcceptedMessages] = useState<ThreadMessageView[]>([])
   const [visible, show] = useState(true)
-  setFixture = setSnapshot; setVisible = show
+  visibleSnapshot = snapshot; visibleProfiles = profiles; setProfiles = updateProfiles; setFixture = setSnapshot; setVisible = show
   return <ThreadClientProvider client={client}><main className="content task-content" style={{ height: '100vh', width: '100vw' }}>
-    {visible && <ThreadWorkspace snapshot={snapshot} agents={[agent, outside]} busy={false} stopping={false}
+    {visible && <ThreadWorkspace snapshot={snapshot} optimisticMessages={acceptedMessages} agents={profiles} busy={false} stopping={false}
       worldMapEnabled={false} onChangeLead={async () => {}} onTasksChanged={async () => {}} onResolveApproval={() => {}}
       onThreadLeaveGuardChange={(_id, guard) => { prepareLeave = guard }}
       onPendingThreadLeave={async () => { calls.push('discard-pending') }}
@@ -67,6 +75,8 @@ function Fixture() {
         if (rejectSend) throw new Error('Fixture rejects this send')
         coreActivated = true
         acceptedSends += 1
+        const message = optimisticThreadMessage(snapshot, `send-${acceptedSends}`, draft, now)
+        setAcceptedMessages(current => [...current, { ...message, id: `published-${acceptedSends}`, sequence: acceptedSends }])
         return { threadMessageId: 'published-' + acceptedSends, publishedMessageSequence: acceptedSends, deliveryIds: ['delivery'], agentRunIds: [], addressedAgentIds: ['outside'] }
       }} />}
     </main></ThreadClientProvider>
@@ -76,13 +86,15 @@ window.addEventListener('error', e => errors.push(String(e.error?.stack ?? e.mes
 window.addEventListener('unhandledrejection', e => errors.push(String(e.reason)))
 createRoot(document.getElementById('root')!).render(<Fixture />)
 Object.assign(window, { invitationTest: {
-  state: () => ({ calls, submissions, errors, text: document.getElementById('camp-message')?.textContent,
+  state: () => ({ calls, submissions, errors, clipboardWrites, memberIds: visibleSnapshot.members.map(member => member.agentId), outsidePresence: visibleProfiles.find(profile => profile.agentId === 'outside')?.presence, text: document.getElementById('camp-message')?.textContent,
     atoms: document.querySelectorAll('[data-composer-atom="member"]').length,
+    publishedMentions: [...document.querySelectorAll<HTMLElement>('.message-bubble [data-agent-id="outside"]')].map(token => ({ label: token.textContent, unavailable: token.classList.contains('is-unavailable'), interactive: token.classList.contains('is-interactive') })),
     invite: !!document.querySelector('[aria-label="发送时邀请 爱丽丝"]'),
     continuation: !!document.querySelector('[aria-label="继续发给 爱丽丝"]'),
     draft: loadLocalThreadComposerDraft(threadId),
     button: document.querySelector<HTMLButtonElement>('form.composer:has(#camp-message) button[type="submit"]')?.disabled,
     stored: Object.values(localStorage).join(' ') }),
+  presence: (presence: AgentProfile['presence']) => setProfiles(current => current.map(profile => profile.agentId === 'outside' ? { ...profile, presence } : profile)),
   accept: () => { rejectSend = false },
   projectActivation: () => setFixture(current => ({ ...current, thread: { ...current.thread, activationState: 'active' }, members: [member(agent), member(outside)] })),
   hide: () => setVisible(false), show: () => setVisible(true),

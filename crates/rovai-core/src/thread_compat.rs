@@ -105,18 +105,6 @@ pub(crate) fn alias(input: &mut Value, old: &str, new: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn stored_command_payload(mut payload: Value) -> Result<Value> {
-    for (new, old) in [
-        ("threadId", "campId"),
-        ("threadTurnId", "campTurnId"),
-        ("replyToThreadMessageId", "replyToCampMessageId"),
-        ("visibleThreadTurnIds", "visibleCampTurnIds"),
-    ] {
-        alias(&mut payload, new, old)?;
-    }
-    Ok(payload)
-}
-
 /// Project a domain command's owned result fields after its stored identity is checked.
 /// Nested content, quotes and evidence are deliberately opaque.
 pub(crate) fn project_command_result(command_type: &str, payload: &mut Value) -> Result<()> {

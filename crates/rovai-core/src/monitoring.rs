@@ -34,6 +34,7 @@ pub(crate) const ASYNC_SETTLEMENT_TRIGGER: &str = "CREATE TRIGGER runtime_usage_
           AND agent_run_id = NEW.id;
     END";
 
+#[cfg(test)]
 pub(crate) fn async_settlement_schema_matches(
     connection: &rusqlite::Connection,
 ) -> rusqlite::Result<bool> {
@@ -953,6 +954,19 @@ impl MonitoringService {
         let changed = finalize_run_in_transaction(&transaction, &collection_epoch, agent_run_id)?;
         transaction.commit()?;
         Ok(changed)
+    }
+
+    /// Derived summaries settle in the existing Usage worker. Their schema or
+    /// persistence failures cannot roll back an AgentRun status transition.
+    pub fn finalize_settled_runs(database: &mut Database) -> Result<usize> {
+        Ok(database.connection_mut().execute(
+            "UPDATE runtime_usage_run_summary
+             SET finalized_at = COALESCE((SELECT ended_at FROM agent_run WHERE id=agent_run_id), datetime('now'))
+             WHERE finalized_at IS NULL AND EXISTS (
+                 SELECT 1 FROM agent_run WHERE id=agent_run_id
+                 AND status IN ('succeeded','failed','cancelled')
+             )", [],
+        )?)
     }
 
     pub fn purge_expired(database: &mut Database) -> Result<usize> {

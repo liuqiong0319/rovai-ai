@@ -90,7 +90,6 @@ function productContractFixture(overrides = {}) {
     contextDeliveryProfileVersion: available(2),
     durableTaskContract: available({ version: 2, sourceDigest: sha256('task') }),
     builtInTransportVersion: available(4),
-    builtInCatalogDigest: available(sha256('builtins')),
     acceptedInputAckContract: available({ semanticClass: 'accepted_input_only', sourceDigest: sha256('ack') }),
     ...overrides
   }

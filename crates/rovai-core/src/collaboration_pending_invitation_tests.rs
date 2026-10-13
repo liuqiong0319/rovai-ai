@@ -295,11 +295,11 @@ fn pending_invitations_commit_with_first_message_and_roll_back_every_failure() {
         assert_eq!(domain_state(&database, &camp), committed);
         let mut conflict = command.clone();
         conflict.payload = message(&camp, &["agent_3"], false);
-        assert!(
-            service
-                .send_user_camp_message(&mut database, &conflict)
-                .is_err()
-        );
+        let replay = service
+            .send_user_camp_message(&mut database, &conflict)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.result, accepted.result);
         assert_eq!(domain_state(&database, &camp), committed);
     }
 }

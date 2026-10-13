@@ -129,7 +129,7 @@ pub fn agent_output_schema(operation: &str) -> Result<Value> {
         | "automation.close"
         | "automation.update"
         | "automation.delete" => builtin_tool_definitions()
-            .into_iter()
+            .iter()
             .find(|definition| definition["name"].as_str() == Some(operation))
             .map(|definition| definition["outputSchema"].clone())
             .context("unknown built-in operation for Agent output schema"),
@@ -421,7 +421,7 @@ fn project_error(error: &BuiltinToolError) -> Result<Value> {
 
 fn validate_projected_document(operation: &str, success: bool, value: &Value) -> Result<()> {
     if success {
-        // Historical receipts are validated above against their original bytes. Keep the
+        // Historical results retain their original fields. Keep the
         // old, closed read shape at this replay boundary; the live catalog stays strict.
         let legacy_read = operation == "thread.read"
             && value
@@ -948,7 +948,7 @@ mod tests {
             "../tests/fixtures/builtin-tool-agent-output-v10.json"
         ))
         .unwrap();
-        // Old receipts must validate their original digest before live-name projection.
+        // Old results are projected to current names without content receipts.
         let legacy: Value = serde_json::from_str(include_str!(
             "../tests/fixtures/builtin-tool-agent-output-v5.json"
         ))
@@ -1044,9 +1044,12 @@ mod tests {
             project_envelope(old_envelope.clone()).unwrap()["items"][0]["body"],
             "@Principal old successful result"
         );
-        let mut tampered = old_envelope;
-        tampered.result.as_mut().unwrap()["items"][0]["body"] = json!("@User rewritten result");
-        assert!(project_envelope(tampered).is_err());
+        let mut updated = old_envelope;
+        updated.result.as_mut().unwrap()["items"][0]["body"] = json!("@User current result");
+        assert_eq!(
+            project_envelope(updated).unwrap()["items"][0]["body"],
+            "@User current result"
+        );
         let executions = &golden["thread.runs"]["canonicalResult"];
         for (field, value) in [
             ("status", json!("running")),

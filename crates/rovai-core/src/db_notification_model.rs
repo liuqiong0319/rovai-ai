@@ -359,8 +359,11 @@ mod tests {
             .unwrap();
         assert!(matches!(
             classify_database_contract(&reopened.connection).unwrap(),
-            DatabaseContractClassification::Unknown(_)
+            DatabaseContractClassification::Current(_)
         ));
+        // Optional projection damage is diagnosed by its module; it no longer
+        // rejects an otherwise usable current business database.
+        assert!(!schema_matches(&reopened.connection).unwrap());
         drop(reopened);
         std::fs::remove_dir_all(directory).unwrap();
     }
