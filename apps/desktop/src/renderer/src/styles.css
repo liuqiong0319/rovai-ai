@@ -688,13 +688,13 @@ html[lang="en"] .settings-app-update-badge svg { display: none; }
 .sidebar-action-menu-icon { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.65; }
 .sidebar-action-menu-icon.filled path:first-child { fill: currentColor; }
 .sidebar-action-menu-separator { height: 1px; margin: 4px 6px; background: var(--line); }
-.camp-pagination-actions { display: flex; min-width: 0; gap: 2px; margin: 2px 4px; }
+.camp-pagination-actions { display: flex; min-width: 0; gap: 0; margin: 2px 0; }
 .show-more-camps,
-.collapse-camps { min-width: 0; min-height: 28px; padding: 4px 8px; border: 0; border-radius: 5px; color: var(--muted); background: transparent; text-align: left; cursor: pointer; font-size: 11px; }
-.show-more-camps { flex: 1 1 auto; }
-.collapse-camps { flex: 0 0 auto; }
-.show-more-camps:hover,
-.collapse-camps:hover { color: var(--ink); background: var(--surface-hover); }
+.collapse-camps { display: inline-flex; flex: 0 0 auto; min-width: 0; min-height: 28px; align-items: center; padding: 4px 8px; border: 0; border-radius: 6px; color: color-mix(in srgb, var(--muted) 40%, var(--faint)); background: transparent; text-align: left; cursor: pointer; font-size: 11px; line-height: 1.35; white-space: nowrap; }
+.show-more-camps:is(:hover, :focus-visible):not(:disabled),
+.collapse-camps:is(:hover, :focus-visible):not(:disabled) { color: var(--muted); background: var(--surface-muted); }
+.show-more-camps:active:not(:disabled),
+.collapse-camps:active:not(:disabled) { background: var(--surface-selected); }
 
 @media (hover: none), (pointer: coarse) {
   .sidebar-menu-trigger,

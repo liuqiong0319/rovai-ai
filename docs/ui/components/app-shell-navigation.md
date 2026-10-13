@@ -2,7 +2,7 @@
 document_type: ui-component-contract
 authority: renderer-app-shell-navigation
 status: accepted
-last_updated: 2026-10-12
+last_updated: 2026-10-13
 ---
 
 # App Shell 与统一侧栏
@@ -224,6 +224,11 @@ Main Window Session 必须等待本机偏好读取后冻结恢复目标，不能
 只有明确 `blocked` / `crashed` 才使用 [Bootstrap Shell](bootstrap-shell.md)；本机偏好读取失败立即切换到独立恢复面。
 
 ## 导航投影新鲜度
+
+列表底部的“查看更多 / 收起”（`View more / Collapse`）使用同一行靠左的纯文字操作，不带方向图标。
+“查看更多”的文字与会话标题共用左侧基线；两个按钮按内容宽度紧邻排列，不把“收起”推到侧栏右侧。
+保留 11px 字号、28px 最小高度和 8px 水平内边距，默认文字使用 `--muted` 与 `--faint` 的浅色混合，
+日夜主题与 200px 窄侧栏下均保持可读与同排；键盘聚焦使用同层级的文字与底色反馈。
 
 每组先展示 5 条未置顶会话，“查看更多”每次请求最新完整前缀并增加 10 条未置顶会话。
 单独置顶的会话只出现在置顶区，不占原分组的展示名额；过滤后补足窗口，未置顶会话已经全部展示时隐藏
