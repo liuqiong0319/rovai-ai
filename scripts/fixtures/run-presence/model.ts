@@ -19,8 +19,8 @@ export const scenarios: Record<string, { name: string; steps: string[]; descript
     descriptions: ['等待期间不预占会话。', '执行内容显示在最新消息下面。', '同一 Run 的回复和占位衔接，不重复头像。', '另一位队员插话后，本 Run 的占位仍留在自己回复下方。', '本 Run 再次回复后，收起重复头像，继续向下展示。', '执行结束，占位收起。'] },
   same_member: { name: '同一队员不同 Run', steps: ['处理中', '首次回复', '另一 Run 回复', '本 Run 再回复', '执行结束'],
     descriptions: ['本次执行正在进行。', '本 Run 已回复，后续占位无需头像。', '另一 Run 的回复插入，本 Run 的占位保持原位。', '本 Run 再次回复，重新衔接为无头像的占位。', '不留下完成行。'] },
-  followup: { name: '运行中追加两条输入', steps: ['正在处理', '追加输入', '继续追加', '领取新输入', '全部结束'],
-    descriptions: ['前一次执行仍在进行。', '新输入排队，已有占位保持原位。', '继续追加也不重复占位。', '下一次执行实际开始后才出现占位。', '两次执行分别结束，占位收起。'] },
+  followup: { name: '运行中追加两条输入', steps: ['正在处理', '追加输入', '继续追加', '领取新输入', '新一轮回复', '全部结束'],
+    descriptions: ['前一次执行仍在进行。', '新输入排队，已有占位保持原位。', '继续追加也不重复占位。', '新执行接在上一轮回复与产物之后，后来插话不移动它。', '本轮公开回复后才移动执行行。', '两次执行分别结束，占位收起。'] },
   failed: { name: '执行异常', steps: ['已发送', '处理中', '执行中断'],
     descriptions: ['先确认本次输入已经被接受。', '处理中的状态不承诺完成时间。', '中断后可查看原因，也可以直接重试本次请求。'] },
   silent: { name: '结束但没有公开回复', steps: ['已发送', '处理中', '执行结束'],
@@ -52,7 +52,7 @@ function delivery(id: string, messageId: string, agentId: string, targetAgentRun
 }
 function makeRun(id: string, agent = 0, status = 'running', inputs = ['request-main'], seconds = 48): any {
   return { ...structuredClone(runTemplate), id, agentId: aid(agent), status, inputMessageIds: inputs,
-    anchorMessageId: inputs.at(-1), inputSummary: '按现在的界面做一版队员占位，保留群聊的消息顺序。',
+    anchorMessageId: inputs.at(-1), publicTailSequenceAtStart: 3, inputSummary: '按现在的界面做一版队员占位，保留群聊的消息顺序。',
     purpose: '核对队员占位方案', threadTurnId: null, invocationKind: 'batch',
     a2aRootAgentRunId: id, runtimeModel: { modelId: null },
     createdAt: at(31), startedAt: at(34), updatedAt: at(seconds), endedAt: ['succeeded', 'failed', 'cancelled'].includes(status) ? at(seconds) : null,
@@ -149,10 +149,20 @@ function snapshot() {
     if (s >= 3) {
       value.agentRuns[0].status = 'succeeded'; value.agentRuns[0].endedAt = at(55)
       addReply('reply-alice', 6, '第一版已核对。接着处理你刚追加的两个问题。')
-      value.agentRuns.push(makeRun('run-alice-next', 0, s >= 4 ? 'succeeded' : 'running', ['followup-1', 'followup-2'], 70))
+      value.agentRuns.push({ ...makeRun('run-alice-next', 0, s >= 5 ? 'succeeded' : 'running', ['followup-1', 'followup-2'], 90),
+        publicTailSequenceAtStart: 6, createdAt: at(73), startedAt: at(74) })
       value.agentRuns.at(-1).inputSummary = '检查追加输入和没有公开回复的结束状态。'
+      value.memberCreations = [{ creationId: 'joined-reviewer', sourceAgentRunId: 'run-alice', agentId: aid(2),
+        displayName: profiles[2].displayName, avatarRef: null, teamRole: profiles[2].teamRole,
+        professionalResponsibilities: profiles[2].professionalResponsibilities, personalityTraits: ['细致', '冷静'],
+        creatorAgentId: aid(0), creatorDisplayName: profiles[0].displayName, createdAt: at(54) }]
+      value.agentRunFileChanges = [{ schemaVersion: 3, agentRunId: 'run-alice', executionEpoch: 1,
+        files: [{ evidenceFileId: 'presence-order-file', path: 'conversation-run-presence.ts', changeKind: 'modify',
+          presentationKind: 'full_net_diff', operationCount: 1, additions: 8, deletions: 3 }],
+        fileCount: 1, operationCount: 1, additions: 8, deletions: 3, completedAt: at(55) }]
+      addReply('followup-peer', 7, '我会继续核对回复和附属卡片是否完整。', 2, 'review-after-start')
     }
-    if (s >= 4) addReply('reply-followup', 7, '追加的两条输入等待时不占位，实际开始后才显示下一次执行。结束后占位直接收起。', 0, 'run-alice-next')
+    if (s >= 4) addReply('reply-followup', 8, '追加的两条输入等待时不占位，实际开始后才显示下一次执行。结束后占位直接收起。', 0, 'run-alice-next')
   }
   value.messages.push(...extraMessages)
   value.agentRuns.push(...extraRuns)
@@ -218,6 +228,7 @@ function localSend(body: string, recipients = [aid(0)], draft?: any) {
       const runId = `local-run-${number}-${agentId}`
       const r = makeRun(runId, profiles.findIndex(p => p.agentId === agentId), 'running', [id], 112 + number * 5)
       r.inputSummary = body; r.startedAt = at(102 + number * 5)
+      r.publicTailSequenceAtStart = Math.max(0, ...state.snapshot.messages.map((m: any) => m.sequence))
       extraRuns.push(r)
       extraDeliveries = extraDeliveries.map(d => d.messageId === id && d.recipientAgentId === agentId ? { ...d, status: 'running', targetAgentRunId: runId } : d)
     }
@@ -253,10 +264,11 @@ export const model = {
   },
   get: () => state, subscribe: (fn: () => void) => { listeners.add(fn); return () => listeners.delete(fn) },
   note: (note: string) => update({ note }),
-  showStartupStatus(waitReason: 'runtime_initializing' | null) {
+  showStartupStatus(waitReason: 'runtime_initializing' | null, preserveEvidence = false) {
     update({ streamPaused: true, snapshot: { ...state.snapshot,
       agentRuns: state.snapshot.agentRuns.map((run: any) => run.id === 'run-alice' ? { ...run, waitReason } : run),
-      executionEvidence: state.snapshot.executionEvidence.filter((item: any) => item.agentRunId !== 'run-alice')
+      executionEvidence: preserveEvidence ? state.snapshot.executionEvidence
+        : state.snapshot.executionEvidence.filter((item: any) => item.agentRunId !== 'run-alice')
     } })
   },
   showNarration(text: string) {
@@ -391,7 +403,8 @@ function scheduleRetry(source: any, runId: string, deliveryId: string) {
     const agentIndex = profiles.findIndex(p => p.agentId === source.agentId)
     const run = makeRun(runId, agentIndex, 'running', [...source.inputMessageIds])
     const now = new Date().toISOString()
-    Object.assign(run, { inputSummary: source.inputSummary, anchorMessageId: source.anchorMessageId, createdAt: now, startedAt: now, updatedAt: now })
+    Object.assign(run, { inputSummary: source.inputSummary, anchorMessageId: source.anchorMessageId,
+      publicTailSequenceAtStart: Math.max(0, ...state.snapshot.messages.map((m: any) => m.sequence)), createdAt: now, startedAt: now, updatedAt: now })
     extraRuns.push(run)
     extraDeliveries = extraDeliveries.map(d => d.id === deliveryId ? { ...d, status: 'running', targetAgentRunId: runId } : d)
     retries.set(source.id, { status: 'started', runId, deliveryId }); refresh()

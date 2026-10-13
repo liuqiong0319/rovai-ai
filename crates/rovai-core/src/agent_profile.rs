@@ -956,17 +956,6 @@ impl DomainCommand for RemoveMemberCommand {
     const TYPE: &'static str = "agent_profile.remove";
 }
 
-/// Claim key used to atomically consume a confirmed capability inside the
-/// profile-create transaction (frozen spec §4.2: preview_id + authorized run +
-/// scope + issued + TTL).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemberCapabilityClaim {
-    pub preview_id: String,
-    pub authorized_run_id: String,
-    pub scope_kind: &'static str,
-    pub scope_id: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemberRemovalPreview {
@@ -1232,12 +1221,6 @@ impl AgentProfileService {
             .optional()?;
         raw.map(|profile| self.materialize_profile(database, profile))
             .transpose()
-    }
-
-    /// Reports whether a member with this display name already exists.
-    pub fn display_name_exists(&self, database: &mut Database, display_name: &str) -> Result<bool> {
-        let transaction = database.connection_mut().transaction()?;
-        profile_display_name_exists(&transaction, display_name, None)
     }
 
     pub fn reorder_profiles(
@@ -2606,126 +2589,6 @@ impl AgentProfileService {
                     },
                 )?;
             }
-            Ok(CommandHandlerResult::applied(
-                "agent_profile.created",
-                json!({ "agentId": id, "version": 1 }),
-                Some(EntityReference {
-                    entity_type: "agent_profile".to_string(),
-                    entity_id: id,
-                }),
-            ))
-        })
-    }
-
-    /// Creates a member only after atomically consuming a confirmed
-    /// member-create capability inside the SAME gateway transaction that
-    /// inserts the profile (frozen spec §4.2). The claim matches previewId +
-    /// authorized run + scope + issued + TTL; a concurrent or foreign claim
-    /// yields 0 rows and the profile is never written.
-    pub fn create_confirmed_profile(
-        &self,
-        database: &mut Database,
-        envelope: &CommandEnvelope<CreateAgentProfileCommand>,
-        claim: &MemberCapabilityClaim,
-        source: &crate::team_tool::AuthenticatedTeamToolRun,
-    ) -> Result<CommandExecution> {
-        let identity = normalize_member_identity(
-            &envelope.payload.display_name,
-            &envelope.payload.team_role,
-            &envelope.payload.professional_responsibilities,
-            &envelope.payload.personality_traits,
-            &envelope.payload.working_principles,
-            &envelope.payload.growth_topic,
-        )?;
-        crate::member_avatar::validate_new_member_avatar_ref(
-            envelope.payload.avatar_ref.as_deref(),
-        )?;
-        self.gateway.execute(database, envelope, |transaction| {
-            let now = chrono::Utc::now().to_rfc3339();
-            let consumed = transaction.execute(
-                r#"
-                UPDATE member_create_capability
-                SET status='consumed', consumed_at=?5
-                WHERE preview_id=?1 AND authorized_run_id=?2
-                  AND scope_kind=?3 AND (scope_id IS ?4)
-                  AND status='issued' AND expires_at>?5
-                "#,
-                params![
-                    claim.preview_id,
-                    claim.authorized_run_id,
-                    claim.scope_kind,
-                    claim.scope_id,
-                    now,
-                ],
-            )?;
-            if consumed != 1 {
-                return Ok(CommandHandlerResult::rejected(
-                    "member.confirmation_required",
-                    json!({ "previewId": claim.preview_id }),
-                ));
-            }
-            if profile_display_name_exists(transaction, &identity.display_name, None)? {
-                return Ok(CommandHandlerResult::rejected(
-                    "agent_profile.display_name_conflict",
-                    json!({ "displayName": identity.display_name }),
-                ));
-            }
-            let id = allocate_agent_id(transaction)?;
-            let profile_uuid = Uuid::new_v4().to_string();
-            transaction.execute(
-                r#"
-                INSERT INTO agent_profile(
-                    uuid, id, slug, handle, display_name, avatar_ref,
-                    team_role, professional_responsibilities, personality_traits_json,
-                    working_principles, growth_topic,
-                    default_capabilities_json, accent,
-                    runtime_enabled, visual_state_json, profile_status, member_order, version,
-                    created_at, updated_at, archived_at
-                ) VALUES (
-                    ?9, ?1, ?1, NULL, ?2, ?10,
-                    ?3, ?4, ?5,
-                    ?6, ?7,
-                    '[]', '',
-                    0, '{}', 'present',
-                    (SELECT COALESCE(MAX(member_order), -1) + 1 FROM agent_profile), 1,
-                    ?8, ?8, NULL
-                )
-                "#,
-                params![
-                    id,
-                    identity.display_name,
-                    identity.team_role,
-                    identity.professional_responsibilities,
-                    serde_json::to_string(&identity.personality_traits)?,
-                    identity.working_principles,
-                    identity.growth_topic,
-                    now,
-                    profile_uuid,
-                    envelope.payload.avatar_ref,
-                ],
-            )?;
-            let creator_display_name = transaction.query_row(
-                "SELECT display_name FROM agent_profile WHERE id=?1",
-                [&source.agent_id],
-                |row| row.get(0),
-            )?;
-            crate::member_studio::record_member_creation(
-                transaction,
-                source,
-                &crate::member_studio::MemberCreationView {
-                    creation_id: envelope.command_id.clone(),
-                    source_agent_run_id: Some(source.agent_run_id.clone()),
-                    agent_id: id.clone(),
-                    display_name: identity.display_name.clone(),
-                    avatar_ref: envelope.payload.avatar_ref.clone(),
-                    team_role: identity.team_role.clone(),
-                    professional_responsibilities: identity.professional_responsibilities.clone(),
-                    personality_traits: identity.personality_traits.clone(),
-                    creator_agent_id: source.agent_id.clone(),
-                    creator_display_name,
-                    created_at: now.clone(),
-                },
-            )?;
             Ok(CommandHandlerResult::applied(
                 "agent_profile.created",
                 json!({ "agentId": id, "version": 1 }),

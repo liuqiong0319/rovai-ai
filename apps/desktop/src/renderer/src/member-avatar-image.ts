@@ -19,7 +19,7 @@ export type NormalizedMemberAvatarSource =
       width: number
       height: number
       frameCount: number
-      loopCount: number
+      loopCount: number | null
     }
 
 export type NormalizedMemberAvatarAsset =

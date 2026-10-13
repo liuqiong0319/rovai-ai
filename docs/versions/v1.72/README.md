@@ -11,6 +11,13 @@ last_updated: 2026-10-13
 
 # Rovai-ai v1.72：Lark 独立渠道
 
+## 会话切换读取回归修复（2026-10-13）
+
+按 User 要求移除公开及单聊执行过程中的原生会话重建提示、对应 View 字段和事件历史查询，
+恢复 Camp Open 不读取 `event_log` 的边界。原生恢复和审计事件保持，不新增数据库迁移。
+当前合同见 [Runtime Launch v62](../../contracts/runtime-launch-and-verification-v62.md)，
+验证见[实施记录](implementation-plan.md#会话切换读取回归修复2026-10-13)。
+
 ## 原生恢复真实 CLI 复测（2026-10-12）
 
 15 类 Runtime 的隔离实测发现 CodeBuddy 空历史假恢复及四类结构化恢复拒绝未接入降级。
@@ -49,15 +56,18 @@ Memory 入口改用完整 CLI 和按需读取教学。Charter revision 22 保持
 
 ## 会话内队员占位（2026-10-11）
 
-按 User 确认的 v12，在公开会话按每次 Run 的输入／自身公开回复锚点投影正在执行的队员：
+按 User 确认的 v12，在公开会话按每次 Run 的启动公开消息边界／自身公开回复锚点投影正在执行的队员：
 原文按已有换行在单行内推进，运行中复用 RunCard 高亮；保留命令图标、Run 身份衔接、确认停止及中断重试。停止按钮默认中性色，悬浮变红。
 复用现有 Evidence、精确 Run Stop 和独立续做命令；Core 从持久化续做 Delivery 派生受理事实，
 切群／刷新后旧失败入口保持收起。单行预览首次读取失败可随更新／重连恢复，慢请求保留更新并补拉；
 旧恢复记录与实时事件按版本合并，不覆盖新正文。排队不占位，不创建公开消息，不改变模型上下文或数据库结构。
 2026-10-13 增补：共享高亮统一为 4.8 秒；执行行右键直达外观“减少动态效果”，
 初始化与已受理的空内容按真实状态分别显示连接／处理文案。
-当前边界见 [Run Process Detail Surface v51](../../contracts/run-process-detail-surface-v51.md)，验证与交付见
-[实施记录](implementation-plan.md#会话内队员占位)。
+同日修正：输入受理回执晚到时，共享执行行优先展示当前 Run、当前执行轮次的实际活动；
+旧轮次记录仍不能掩盖新一轮连接。公开回复后、慢读取及远程恢复沿用相同规则。
+同日修正：新执行初始位置使用已冻结的启动公开消息边界；任何执行行都不拆开回复与附属产物组。
+当前边界见 [Run Process Detail Surface v53](../../contracts/run-process-detail-surface-v53.md)，验证与交付见
+[实施记录](implementation-plan.md#会话内队员占位)及[启动状态修正](implementation-plan.md#执行行误回到启动状态2026-10-13)。
 
 ## Windows Web 凭据可用性（2026-10-11）
 
@@ -588,7 +598,7 @@ Runtime Smoke 为证据，不从合同 accepted 状态推断所有 Provider 都�
 
 按 User 确认的范围，将左侧锚点改为完整用户消息目录，保留正文分页和现有外观。Core 只读取首条有效直接 reply 队员回复，
 预览按需读取；锚点定位窗口独立且有界，分页入口与自动加载跟随正常连续区间。合同见
-[Camp Open Projection v26](../../contracts/camp-open-projection-v26.md)，实现与验证见
+[Camp Open Projection v27](../../contracts/camp-open-projection-v27.md)，实现与验证见
 [用户锚点验收](thread-user-anchors-verification.md)。这是局部读取正确性修复，不增加持久副本、全局缓存框架或时间线重构。
 
 本轮以 `4563d23d` 为修正基线，修复缓存清窗和重同步可信状态，正文先显示再请求目录，格式化移出数据库锁，
@@ -632,3 +642,10 @@ User 于 2026-10-09 确认[完整方案及补充边界 r1](model-context-change-
 新建降级，绑定成功前保留旧目标，输入接收/取消/执行代次保护不变。当前边界见
 [Runtime Launch v60](../../contracts/runtime-launch-and-verification-v60.md)，实施与验收见
 [实施记录](implementation-plan.md#同类-cli-优先恢复原生会话2026-10-12)。
+
+
+## 移除会话队员重置入口（2026-10-13）
+
+按 User 要求移除会话队员列表中 Desktop“…”菜单与 Mobile 按钮的“重置队员会话”，
+同时清理专用确认弹窗、前端状态与不再适用的弹窗验收。其他队员操作和后端会话恢复保持。
+边界见 [Runtime Launch v61](../../contracts/runtime-launch-and-verification-v61.md)。

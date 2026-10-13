@@ -8,6 +8,29 @@ last_updated: 2026-10-13
 
 # v1.72 实施与验收
 
+## 会话切换读取回归修复（2026-10-13）
+
+基线 `50d50d3a46ec409420a9c1382ab5101ba16892bd`，分支 `codex/remove-session-rebuild-notice`。
+User 要求删除原生会话重建提示和对应事件历史判断，并授权 PR 合入及日常 App 安装。
+删除公开/单聊 Renderer 提示与翻译、两类 Run View 字段及各自 SQL 子查询。
+恢复和 continuity 审计仍由原 Runtime 路径拥有；不新增迁移或模型上下文变更。
+字段边界见 [Runtime Launch v62](../../contracts/runtime-launch-and-verification-v62.md)。
+
+复用 `read_model::camp_open_slow_tests` 的完整首屏事件访问禁止及规模 owner；
+在既有 `single_chat::tests::successful_final_is_private_and_a_cancelled_run_cannot_append_late_output`
+增加公聊/单聊投影的 SQLite authorizer 禁止事件读取断言，不新建独立测试或放宽原性能边界。
+
+- 5 项 CampOpen 慢测与上述单聊 owner 通过。无关事件从 5 万增至 500 万、无关 Evidence 从
+  1,000 增至 100,000 时，首屏 SQL VM 步数保持 3,085。
+- 同机两个真实会话的生产 ReadModel 只读测量，11 次采样的后 10 次中位数从 985/1,105 ms
+  降至 21/22 ms；这是 Debug Read Side 测量，不含 Electron 渲染、IPC 或共享数据库锁等待。
+- 类型检查与完整 `pnpm test` 通过：242 个 Vitest 文件、2,656 项用例；后续 Node 340 项通过、
+  2 项平台跳过。文档带 base 的 CI 门禁通过。
+  主目录的 Git 忽略原型存在既有坏链接，因此完整前端及文档门禁在同基线加本次 patch 的干净
+  临时检出运行，共用已锁定的 Node 依赖；未改动本机原型或跳过测试。
+- User 后续明确要求只跑专项：正在运行的 Rust workspace 全量已停止，不计为通过；后续只做
+  与会话打开相关的定向验收及构建/安装校验。
+
 ## 项目目录 JSON 保存（2026-10-12）
 
 基线主线 `bab6034df3459269a4a15628dc436d660716f1ac`，分支 `rovai/json-project-navigation`，复用原隔离
@@ -1993,3 +2016,57 @@ User 确认 4.8 秒、执行行右键入口及连接／处理两阶段文案，�
 右键／Shift+F10／长按松手、设置聚焦与保存、减少动态效果、强制颜色和既有锚点／重试回归。
 外观保存使用隔离内存适配器，未启动日常 App、Core 或真实 Runtime；BusinessApp 的设置跳转
 复用既有离开保护与草稿 owner，浏览器夹具只验证组件路径，不替代完整 App 的导航验收。
+
+## 执行行与回复产物顺序（2026-10-13）
+
+User 确认修正执行行拆开回复与 Files Changed／入队卡片，以及连续输入后新执行回插到上一轮回复之前。
+基线 `997856a8317531b6daaeb3c0d27a20644f4aaaaa`，分支 `rovai/run-presence-order`，独立 worktree 实施。
+
+- Snapshot / Open 的 Run View 直接投影已持久化的启动公开消息边界，输入锚点与模型上下文不变，
+  没有迁移、新查询或新持久副本。精确读取合同见 [Camp Open Projection v27](../../contracts/camp-open-projection-v27.md)。
+- 执行行初始使用冻结边界，自己的公开回复后才推进；插入时越过锚点所属 Run 的整个连续输出组，
+  同一队员不同 Run 仍显示各自身份。边界见 [Run Process Detail Surface v53](../../contracts/run-process-detail-surface-v53.md)。
+- 单元覆盖排队输入、后来插话、时钟回拨、分页与重入、旧字段兼容、连续回复和跨 Run 卡片组。
+  生产组件浏览器夹具新增明确 DOM 顺序断言，不用同一个投影函数充当预期结果。
+- Rust 扩展既有分页 owner 为 `camp_open_run_titles_and_start_boundaries_survive_message_paging`，
+  保留摘要全部 case，增加冻结序号与旧 null 在 Open / Snapshot 中的投影断言；没有新增独立 Rust fixture。
+  该 owner 属于 `slow-tests`，必须显式开启；仅 `extended-tests` 不执行它。
+
+本机验证：`pnpm typecheck`、`pnpm test`、`cargo check --workspace`、Rust 格式检查通过。
+定向执行上述分页 owner，以及 `camp_open_preserves_business_state_without_reading_event_history`，
+验证有界分页读取、wire 字段与零事件历史访问。生产组件浏览器验收通过 38 个阶段、6 组主题尺寸、
+28 项交互记录，包含新初始位置、完整附属卡片、resync 及仅在自身公开回复后移动。
+浏览器使用独立临时 Chrome profile 与合成投影，Rust 使用隔离数据库；没有调用真实 Runtime。
+
+## 执行行误回到启动状态（2026-10-13）
+
+User 报告远程执行行在公开回复后再次显示连接／处理文案，随后确认 dsh 与 Trae CLI 也有同样现象。
+基线 `50d50d3a46ec409420a9c1382ab5101ba16892bd`，分支 `fix/run-presence-startup`。
+截图对应的只读运行记录显示：GitHub Copilot 已产生工具活动，输入受理却到 prompt 结束才确认。
+共享预览把 `runtime_initializing` 无条件置于实际活动之前，导致同一 Run 被错误呈现为仍在连接。
+
+- 按 [Run Process Detail Surface v52](../../contracts/run-process-detail-surface-v52.md)，在共享预览内部
+  保留原始 Evidence 的 Run / executionEpoch 归属，再投影实际活动；不新增 Adapter 名称分支。
+- 初始化期间只允许当前 Run、当前轮次的公开正文和工具替换连接反馈；旧／缺失／未来轮次、
+  其他 Run、空白正文与原生阶段元数据仍不能覆盖。失败、停止和等待优先级不变。
+- ACP 的 response-only ACK、交付水位及恢复隔离不变；没有 Rust、数据库或模型上下文变更。
+
+测试准入：扩展既有 `conversation-run-presence.test.ts` 的启动反馈 owner 与
+`scripts/lib/run-presence.test.mjs` 的生产组件夹具，没有新增独立测试 owner。
+修复前失败输入是 `runtime_initializing` 与同轮次正文／工具同时存在；单元覆盖选择与轮次隔离，
+浏览器覆盖实际共享组件。完整远程探针补足纯组件无法证明的 HTTP/SSE 读取、公开消息移动与重连。
+
+本机自动验收结果：
+
+- `pnpm exec vitest run apps/desktop/src/renderer/src/conversation-run-presence.test.ts apps/desktop/src/renderer/src/execution-events.test.ts`：2 文件、11 项通过。
+- `pnpm typecheck`、`pnpm build:web` 通过；构建保留既有大 chunk 提示。
+- `pnpm docs:test`（10 项）、`pnpm docs:check` 及相对上述基线的 `pnpm docs:check:ci` 通过。
+- `pnpm test:run-presence-ui`：37 个阶段、6 组主题尺寸、27 项交互记录通过，含回执前后的当前工具、
+  锚点与消息顺序、原文增量、停止／重试、慢读取和恢复。
+- 同一隔离 Host / Chrome 远程探针分别加载已安装旧 Web 和候选 Web：旧版在正文、公开回复、
+  工具和断线恢复后持续显示连接，复现通过；候选版显示当前活动，晚到 ACK 不产生状态回退，
+  完成后执行行移除。包含 700 ms 延迟读取、390 px 窄窗口及主动切断 SSE 后恢复；两组无浏览器错误。
+
+远程探针使用独立临时 data-dir、Skill Library、MCP 配置、Runtime 文件根与 Chrome profile，
+只在合成数据库中注入执行记录，没有调用真实 Runtime；dsh / Trae 的真实模型运行不是本轮验收项。
+未写入日常数据库，未安装或重启日常 App。修改只交付任务分支，待后续发布后生效。

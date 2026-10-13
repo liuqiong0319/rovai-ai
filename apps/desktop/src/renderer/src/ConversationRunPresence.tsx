@@ -13,7 +13,7 @@ import { RunningText } from './RunningText'
 import { runPresencePreview, type ConversationRunPresenceSlot } from './conversation-run-presence'
 import { identityColorToken } from './theme'
 import { uiAttribute, useInterfaceLanguage } from './interface-language'
-import { buildLiveExecutionProgress, type LiveRuntimeEvent } from './ui-model'
+import type { LiveRuntimeEvent } from './ui-model'
 import { groupExecutionEventsByRunId } from './execution-events'
 import { useExecutionWindow } from './useExecutionWindow'
 import { useNavigationPressMenu } from './useNavigationPressMenu'
@@ -141,13 +141,13 @@ function RunPresenceOpen({ threadId, run, name, description, windowedEvidence, e
   const menuId = useId()
   const menu = useNavigationPressMenu(Boolean(onOpenMotionSettings))
   const tail = useExecutionWindow(windowedEvidence && run.status === 'running', threadId, run, events, null, true)
-  const progress = useMemo(() => {
+  const mergedEvents = useMemo(() => {
     // Reconcile evidence by identity/revision before projecting a line. A late
     // restored page must not replace newer live text or a newly started command.
     const merged = groupExecutionEventsByRunId([{ id: run.id }], tail.evidence, windowedEvidence ? events?.slice(-48) ?? [] : events ?? [])
-    return buildLiveExecutionProgress(merged.get(run.id) ?? [], run.id, { includePublicResults: false })
+    return merged.get(run.id) ?? []
   }, [tail.evidence, events, run.id, windowedEvidence])
-  const preview = runPresencePreview(run, progress)
+  const preview = useMemo(() => runPresencePreview(run, mergedEvents), [run, mergedEvents])
   const running = run.status === 'running' && !run.cancelRequestedAt && !stopping
   const button = <button ref={trigger} {...menu.rowProps} className={`run-presence-open is-${preview.kind}`} type="button" data-preview-kind={preview.kind}
     title={uiAttribute('查看执行过程')} aria-label={`${name}，${preview.text}，${description}`}

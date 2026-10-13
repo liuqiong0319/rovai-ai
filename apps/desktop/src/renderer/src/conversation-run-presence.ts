@@ -1,5 +1,5 @@
 import type { AgentRunView, ThreadMessageView } from '@contracts'
-import { agentRunPresentation, type ActivityIconKind, type LiveExecutionProgress } from './ui-model'
+import { agentRunPresentation, buildLiveExecutionProgress, type ActivityIconKind, type LiveRuntimeEvent } from './ui-model'
 import { uiAttribute } from './interface-language'
 import type { ThreadConversationTimelineItem } from './ThreadWorkspace'
 
@@ -61,22 +61,29 @@ export function conversationRunPresenceTimeline(
       && message.sourceAgentRunId === run.id && !message.id.startsWith('optimistic:'))
       .reduce<ThreadMessageView | null>((last, message) => !last || message.sequence > last.sequence ? message : last, null)
     const inputAnchor = messages.find(message => message.id === run.anchorMessageId)
-    // Current batch Runs have an immutable claimed-input anchor. Older/direct
-    // Runs without one recover from their start boundary, never the latest tail.
-    const startAnchor = inputAnchor ?? (run.anchorMessageId ? null : messages.filter(message => !message.id.startsWith('optimistic:')
+    const startSequence = run.publicTailSequenceAtStart
+    // The last claimed input may precede another Run's reply. Pin to Core's
+    // frozen public tail at claim time, independent of paging or wall clocks.
+    // Legacy projections retain their input/time fallback, never today's tail.
+    const startAnchor = startSequence != null
+      ? messages.filter(message => !message.id.startsWith('optimistic:') && message.sequence <= startSequence)
+        .reduce<ThreadMessageView | null>((last, message) => !last || message.sequence > last.sequence ? message : last, null)
+      : inputAnchor ?? (run.anchorMessageId ? null : messages.filter(message => !message.id.startsWith('optimistic:')
       && message.createdAt <= (run.startedAt ?? run.createdAt))
       .reduce<ThreadMessageView | null>((last, message) => !last || message.sequence > last.sequence ? message : last, null))
     const anchor = ownMessage ?? startAnchor
     let index = anchor ? timeline.findIndex(item => item.kind === 'camp_message' && item.id === anchor.id) : -1
-    // Keep a published message and its attached artifacts together. A failed
-    // silent Run may instead have a standalone artifact group.
+    // A failed silent Run may instead have a standalone artifact group.
     if (!ownMessage && run.status === 'failed') {
       const artifactIndex = timeline.findLastIndex(item => item.kind !== 'camp_message' && outputRunId(item) === run.id)
       if (artifactIndex >= 0) index = artifactIndex
     }
-    if (ownMessage || run.status === 'failed') {
+    // Every message's output group is atomic, including an earlier Run's reply
+    // used as the start anchor. Continuation identity is still checked below.
+    const anchorRunId = outputRunId(timeline[index])
+    if (anchorRunId) {
       while (index + 1 < timeline.length && timeline[index + 1].kind !== 'camp_message'
-        && outputRunId(timeline[index + 1]) === run.id) index += 1
+        && outputRunId(timeline[index + 1]) === anchorRunId) index += 1
     }
     groups.set(index, [...(groups.get(index) ?? []), { run, continuation: false }])
   }
@@ -105,7 +112,7 @@ function currentNarrationLine(text: string): string {
   return text.replace(/\r\n?/g, '\n').split('\n').findLast(line => line.trim())?.trim() ?? ''
 }
 
-export function runPresencePreview(run: AgentRunView, progress?: LiveExecutionProgress): RunPresencePreview {
+export function runPresencePreview(run: AgentRunView, events: readonly LiveRuntimeEvent[] = []): RunPresencePreview {
   if (run.status === 'failed') {
     const disconnected = run.failure?.code === 'runtime_network_interrupted'
       || run.failure?.code === 'runtime_disconnected'
@@ -113,15 +120,20 @@ export function runPresencePreview(run: AgentRunView, progress?: LiveExecutionPr
   }
   if (run.cancelRequestedAt) return { kind: 'status', text: uiAttribute('正在停止…') }
   if (run.status === 'waiting') return { kind: 'status', text: uiAttribute(agentRunPresentation(run).label) }
-  if (run.status === 'running' && run.waitReason === 'runtime_initializing') {
-    return { kind: 'status', text: uiAttribute('正在连接智能体…') }
-  }
-  const latest = progress?.items.findLast(item => item.kind === 'tool' || item.kind === 'narration' && item.body.trim())
+  const initializing = run.status === 'running' && run.waitReason === 'runtime_initializing'
+  // ACP can acknowledge the input only at prompt completion. Current-epoch
+  // activity already describes what is happening, without changing that ACK.
+  // Older or unscoped evidence must not hide a genuine reconnection.
+  const progress = buildLiveExecutionProgress(events.filter(event =>
+    event.agentRunId === run.id && (!initializing || event.executionEpoch === run.executionEpoch)
+  ), run.id, { includePublicResults: false })
+  const latest = progress.items.findLast(item => item.kind === 'tool' || item.kind === 'narration' && item.body.trim())
   if (latest?.kind === 'tool') return {
     kind: 'command',
     text: singleLine(latest.step.publicCommand || latest.step.currentInstruction || latest.step.title),
     iconKind: latest.step.publicCommand && latest.step.iconKind === 'unknown' ? 'terminal' : latest.step.iconKind
   }
   if (latest?.kind === 'narration') return { kind: 'narration', text: currentNarrationLine(latest.body) }
-  return { kind: 'status', text: progress?.runtimeThinkingTitle || uiAttribute('正在处理你的请求…') }
+  if (initializing) return { kind: 'status', text: uiAttribute('正在连接智能体…') }
+  return { kind: 'status', text: progress.runtimeThinkingTitle || uiAttribute('正在处理你的请求…') }
 }

@@ -369,9 +369,9 @@ pub struct AgentRunView {
     pub camp_turn_id: Option<String>,
     pub input_message_ids: Vec<String>,
     pub anchor_message_id: Option<String>,
+    pub public_tail_sequence_at_start: Option<i64>,
     pub input_summary: Option<String>,
     pub has_accepted_continuation: bool,
-    pub native_session_replaced: bool,
     pub conversation_id: String,
     pub agent_id: String,
     pub task_id: Option<String>,
@@ -3136,10 +3136,7 @@ fn load_agent_runs(
                       THEN camp_turn.trigger_id END
                ),
                continued.source_agent_run_id IS NOT NULL,
-               EXISTS(SELECT 1 FROM event_log e WHERE e.entity_type='agent_run'
-                 AND e.entity_id=agent_run.id AND e.execution_epoch=agent_run.execution_epoch
-                 AND e.event_type='agent_run.native_session_continuity_lost'
-                 AND json_extract(e.payload_json, '$.continuation')='native_session_replaced')
+               agent_run.current_public_tail_sequence
         FROM agent_run
         LEFT JOIN camp_turn ON camp_turn.id = agent_run.camp_turn_id
         JOIN camp ON camp.id = COALESCE(agent_run.camp_id, camp_turn.camp_id)
@@ -3215,7 +3212,7 @@ fn load_agent_runs(
                 row.get::<_, Option<String>>(39)?,
                 row.get::<_, Option<String>>(40)?,
                 row.get::<_, bool>(41)?,
-                row.get::<_, bool>(42)?,
+                row.get::<_, Option<i64>>(42)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3269,7 +3266,7 @@ fn load_agent_runs(
                 anchor_message_id,
                 summary_message_id,
                 has_accepted_continuation,
-                native_session_replaced,
+                public_tail_sequence_at_start,
             )| {
                 Ok(AgentRunView {
                     id,
@@ -3277,10 +3274,10 @@ fn load_agent_runs(
                     input_message_ids: serde_json::from_str(&input_message_ids_json)
                         .context("AgentRun input Message IDs are invalid")?,
                     anchor_message_id,
+                    public_tail_sequence_at_start,
                     input_summary: summary_message_id
                         .and_then(|id| summaries.get(&id).cloned().flatten()),
                     has_accepted_continuation,
-                    native_session_replaced,
                     conversation_id,
                     agent_id,
                     task_id,

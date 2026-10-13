@@ -1,25 +1,26 @@
-# Rovai AI v0.4.8
+# Rovai AI v0.4.9
 
 <!-- lang:zh-CN -->
 
-本次更新适配 OpenCode V1/V2，增加 Pi 思考强度设置，改善 @队员的查看与编辑，并修复会话列表和 Windows 远程连接问题。
+本次新增队员独立环境变量配置、手动模型 ID，以及会话内执行查看与控制；另有会话恢复、消息显示、项目目录保存和启动加载方面的修复。
 
-### 更新内容
+### 新功能
 
-- 【功能】**兼容 OpenCode V1 和 V2。** 根据所选程序的版本使用对应的权限配置、压缩事件和用量采集方式，继续支持会话恢复、Skills 和 MCP。
-- 【修复】**修复 OpenCode 压缩后的上下文衔接。** V1 恢复原生插件加载，压缩后重新提供队员身份与协作规则；Windows 补齐压缩事件监听。
-- 【修复】**改善 OpenCode 的启动兼容性。** 减少 V1 原生依赖锁造成的冷启动失败，并避开 macOS 上 V2 可选加速库的异常路径查找。
-- 【功能】**Pi 支持设置思考强度。** 队员配置、配置摘要和执行记录均显示所选档位；恢复同一模型的会话时，不再因重复选模重置原有设置。
-- 【修复】**Pi 的模型列表不再依赖健康检查先通过。** 首次安装或检查结果失效时仍可读取目录；刷新失败保留已有列表，刷新和切换模型不会清掉已填写的思考强度。
-- 【交互】**@队员时可以直接查看智能体和模型。** 会话输入框与使命描述使用相同的候选列表，点击智能体图标查看详情；查看不会触发提及或邀请，关闭后可继续编辑。
-- 【修复】**修复连续 @队员时光标卡住的问题。** 选中提及后，方向键、输入法、删除、粘贴和换行可以正常使用。
-- 【修复】**置顶会话不再占用列表的显示名额。** 项目和快速对话列表会补足未置顶的会话，置顶或取消置顶后及时更新；没有更多会话时不再显示“查看更多”。
-- 【调整】**Kimi Code 改为读取原生配置。** 模型、接口和凭据使用 Kimi CLI 的配置，已有文件与会话记录保留。
-- 【调整】**关闭 Rovai 内 Claude Code 和 Codex 的原生自动记忆。** 避免在 Rovai 记忆之外自动读取或生成另一套长期记忆。项目规则、已有历史和会话恢复保留，不修改用户的原生 CLI 配置。
-- 【功能】**命令行支持从文件读取消息正文。** `rovai send --input-file` 可直接发送多行正文，减少复杂内容的转义；原有完整 JSON 请求仍可使用。
-- 【修复】**修复执行进程异常退出后的状态与清理。** 已接收消息的执行中断后正确显示失败，不再误显示为主动停止；改善 macOS 残留工具进程的回收和重启后的清理。
-- 【修复】**修复 Windows 远程连接的凭据权限问题。** 备份恢复后的正常继承权限不再阻止查看 Token、开启服务或登录；凭据读取、保存失败时显示具体原因，并保留原有凭据。
-- 【文档】**补充智能体配置与接入指南。** 官网新增配置说明，开发者文档补充原生 CLI、ACP 接入方式和当前限制。
+- 【功能】**队员可单独配置环境变量。** 每位队员使用自己的运行配置，敏感值默认隐藏。修改在新进程启动时生效，不影响正在运行的任务。原智能体级环境变量配置停用，旧值保留，可在“诊断与修复”中查看并手动复制到对应队员。官网补充了多 Provider 配置指南。
+- 【功能】**模型选择支持手动填写 ID。** 在搜索框输入模型 ID 后，可直接选择并保存，即使该模型不在原生列表中。实际是否可用，由智能体执行时判断。
+- 【功能】**会话中可直接查看和控制执行。** 显示队员当前正文或命令，可查看执行详情、停止执行，或在执行失败后重试。执行行固定在对应消息位置，不会随其他队员的消息移动，并区分连接与处理阶段。
+
+### 其他更新
+
+- 【修复】**升级或修改配置后，优先恢复原会话。** 使用原会话 ID 尝试恢复同类智能体，不再仅凭旧配置摘要放弃恢复。同时修复 Pi 公屏与单聊的恢复路径互相覆盖。
+- 【修复】**修复原生历史丢失后的续接问题。** CodeBuddy 不再将空历史误认为恢复成功；Copilot、Qwen Code、Qoder、ZCode 在确认原会话无法恢复时，可新建会话继续执行。替换进程使用新的工具上下文和临时目录，不再引用已清理的旧路径。
+- 【性能】**执行结束不再等待正文和用量统计收尾。** 后续保存失败不会把已成功的操作显示为失败。退出时补充已接收正文的保存处理，渠道最终卡片在正文定稿后生成。
+- 【修复】**修复中文 Markdown 显示和引用定位。** 中文标点紧邻正文时，加粗和删除线正常显示，不再露出原始标记；选文引用的定位也同步修正。
+- 【修复】**修复邀请受理后队员姓名短暂显示异常的问题。** 消息先于成员列表更新时，保留队员姓名并显示同步状态，不再短暂显示“不可用队员”。回复预览和导航摘要同步修正。
+- 【修复】**空项目目录在切换和重启后仍会保留。** 已添加的目录即使没有会话，或删除了其中全部会话，也不会丢失登记。原有别名和排序保持不变。
+- 【交互】**启动时直接显示加载页。** 不再先显示空侧栏框架，再切换到加载页。所需数据就绪后进入工作区，读取失败时显示恢复界面。
+- 【调整】**精简 Charter 和记忆入口提示。** 删去重复的命令清单和说明，减少内部术语，移除 Codex 专用最终答复提示。协作义务和权限边界保留。
+- 【性能】**减少重复的上下文存储和校验。** 去除重复副本和校验信息，减少数据库打开、内置工具执行时的额外处理。实际输入、历史记录及结果查询保留。
 
 ### 升级提醒
 
@@ -31,28 +32,29 @@ Desktop 与 Server 同版发布，使用同一份源码构建。
 
 Windows x64 仍为未签名预览版，安装时可能出现“未知发布者”提示。请仅从本次官方 GitHub Release 下载安装包。
 
-[完整变更](https://github.com/murray17/rovai-ai/compare/v0.4.7...v0.4.8)
+[完整变更](https://github.com/murray17/rovai-ai/compare/v0.4.8...v0.4.9)
 
 <!-- lang:en -->
 
-This release supports OpenCode V1 and V2, adds Pi thinking-level settings, improves teammate mentions, and fixes conversation lists and Windows remote connections.
+This release adds per-teammate environment variables, manual model IDs, and execution previews and controls in conversations. It also fixes native session recovery, message rendering, project folder persistence, and startup presentation.
 
-### What's changed
+### New features
 
-- [Feature] **Support OpenCode V1 and V2.** Permissions, compaction events, and usage collection follow the selected executable's version, with continued support for session recovery, Skills, and MCP.
-- [Fix] **Restore collaboration context after OpenCode compaction.** V1 loads native plugins again and redelivers teammate identity and collaboration rules after compaction. Compaction observation is also installed on Windows.
-- [Fix] **Improve OpenCode startup compatibility.** Reduce V1 cold-start failures caused by native dependency locks and avoid an incorrect optional acceleration-library lookup on macOS V2.
-- [Feature] **Set Pi thinking levels.** The selected level appears in teammate configuration, configuration summaries, and execution history. Restoring a session with the same model no longer resets its existing level by selecting the model again.
-- [Fix] **Read Pi model lists without a successful health check first.** Catalogs remain available on first installation or when health evidence expires. Failed refreshes retain the previous list, and refreshing or switching models preserves the entered thinking level.
-- [Interaction] **Inspect a teammate's agent and model while @mentioning them.** Conversation composers and mission descriptions share the same suggestions. Click an agent icon to view details without creating a mention or invitation, then close it to continue editing.
-- [Fix] **Fix the caret getting stuck between consecutive teammate mentions.** Arrow keys, IME input, deletion, paste, and line breaks work after selecting a mention.
-- [Fix] **Pinned conversations no longer consume visible list slots.** Project and quick-chat lists fill their windows with unpinned conversations and update after pin changes. “View more” disappears when no additional conversations remain.
-- [Change] **Kimi Code reads native configuration.** Models, endpoints, and credentials use the Kimi CLI configuration. Existing files and conversation records are retained.
-- [Change] **Disable native automatic memory for Claude Code and Codex launched by Rovai.** This avoids automatically reading or generating a separate long-term memory alongside Rovai Memory. Project rules, history, and session recovery remain available, and users' native CLI configuration is unchanged.
-- [Feature] **Read message bodies from files on the command line.** `rovai send --input-file` accepts multiline text directly, reducing escaping for complex content. Existing complete JSON requests remain supported.
-- [Fix] **Fix execution status and cleanup after a native process exits unexpectedly.** Interrupted executions with accepted input correctly show failure instead of a user-initiated stop. Cleanup of remaining tool processes on macOS and after restart is improved.
-- [Fix] **Fix Windows credential permissions for remote connections.** Normal inherited permissions after restoring a backup no longer block viewing the Token, starting the service, or logging in. Credential read and save failures show specific reasons while preserving existing credentials.
-- [Documentation] **Add agent setup and integration guides.** The website provides configuration instructions, and contributor documentation covers native CLI and ACP integration paths and current limitations.
+- [Feature] **Configure environment variables for each teammate.** Each teammate has its own configuration, with sensitive values hidden by default. Changes apply when a new process starts, without interrupting running tasks. The former agent-level environment configuration is no longer used; its values remain available in Diagnostics & Repair for manual copying to the appropriate teammate. The website includes a guide to configuring multiple providers.
+- [Feature] **Enter model IDs manually.** Type a model ID in the search field, select it, and save it even when it is absent from the native model list. The agent validates availability during execution.
+- [Feature] **View and control execution directly in conversations.** See a teammate's current text or command, open execution details, stop execution, or retry after a failure. Each execution row stays with its corresponding message rather than moving with other teammates' messages, and distinguishes connection from processing.
+
+### Other updates
+
+- [Fix] **Try the original session first after upgrades or configuration changes.** Resume the original session ID with the same agent type instead of rejecting recovery solely because of old configuration digests. Pi's public and private conversation recovery paths no longer overwrite each other.
+- [Fix] **Handle missing native history correctly.** CodeBuddy no longer mistakes empty history for successful recovery. Copilot, Qwen Code, Qoder, and ZCode can start a new session when the original session is confirmed to be unavailable. Replacement processes receive fresh tool contexts and temporary directories instead of referring to cleaned-up paths.
+- [Performance] **Finish executions without waiting for text and usage finalization.** Later save failures no longer turn a successfully committed operation into a reported failure. Shutdown provides an additional opportunity to save received text, and final channel cards wait for text finalization.
+- [Fix] **Fix Chinese Markdown rendering and quote navigation.** Bold and strikethrough render correctly beside Chinese punctuation instead of exposing raw markers. Selected-text quote navigation is updated accordingly.
+- [Fix] **Keep teammate names visible after an invitation is accepted.** When a message arrives before the updated roster, retain the teammate's name and show synchronization status rather than briefly displaying an unavailable teammate. Reply previews and navigation summaries follow the same behavior.
+- [Fix] **Keep empty project folders across navigation and restarts.** Registered folders remain even when they contain no conversations or all their conversations are deleted. Existing aliases and ordering are preserved.
+- [Interaction] **Show the loading screen from the first startup frame.** The app no longer briefly shows an empty sidebar shell before switching to loading. It enters the workspace when the required data is ready and shows recovery controls if reading fails.
+- [Change] **Shorten Charter and Memory entry instructions.** Remove repeated command lists and explanations, reduce internal terminology, and remove Codex-specific final-answer guidance. Collaboration obligations and permission boundaries remain.
+- [Performance] **Reduce duplicate context storage and validation.** Remove redundant copies and validation metadata, reducing extra work when opening the database and executing built-in tools. Actual input, history, and result lookup remain available.
 
 ### Upgrading
 
@@ -64,4 +66,4 @@ Desktop and Server share this release and are built from the same source commit.
 
 Windows x64 remains an unsigned preview. SmartScreen may show “Unknown publisher” during installation; download installers only from this official GitHub Release.
 
-[Full changelog](https://github.com/murray17/rovai-ai/compare/v0.4.7...v0.4.8)
+[Full changelog](https://github.com/murray17/rovai-ai/compare/v0.4.8...v0.4.9)

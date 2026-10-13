@@ -93,7 +93,8 @@ Architecture 解释组件如何组成，Version 概览记录交付范围；它�
 | [Runtime Images v3（历史）](runtime-images-v3.md) | v2 来源/保存/读取不变；同 Run 的已发送同摘要图片优先展示；统一图片几何与附件原序规则由 v4 替代 |
 | [Runtime Images v2（历史）](runtime-images-v2.md) | 本地结构化图片、ACP 增量累积、混合存储与 Camp-scoped 读取；允许显式附件重复展示的规则由 v3 替代 |
 | [Member Creation Flow v1（当前）](member-creation-flow-v1.md) | AI 优先入口、可用协助者、原子静态入队回执与配置链接 |
-| [Camp Open Projection v26（当前）](camp-open-projection-v26.md) | 全会话用户目录、Core 权威按需回复预览、独立定位窗口与定向刷新；正文保持分页 |
+| [Camp Open Projection v27（当前）](camp-open-projection-v27.md) | Run 投影冻结的启动公开消息边界，初始执行行不回插到已领取输入；读取与分页边界不变 |
+| [Camp Open Projection v26（历史）](camp-open-projection-v26.md) | 全会话用户目录、Core 权威按需回复预览、独立定位窗口与定向刷新；正文保持分页 |
 | [Camp Open Projection v25（历史）](camp-open-projection-v25.md) | 增加按 Thread 索引读取的静态创建回执与消息 source Run 模型展示；继承 v24 读取边界 |
 | [Camp Open Projection v24（历史）](camp-open-projection-v24.md) | Run 自带有界触发消息摘要，标题不依赖会话分页；继承 v23 读取与 Evidence 边界 |
 | [Camp Open Projection v23（历史）](camp-open-projection-v23.md) | 有界 Run View 增加独立 Evidence change watermark；原始行数不再充当刷新 revision |
@@ -112,7 +113,9 @@ Architecture 解释组件如何组成，Version 概览记录交付范围；它�
 | [Camp Open Projection v10（历史）](camp-open-projection-v10.md) | main Snapshot 34/Open 6；Open 不读取 event_log，移除 timeline/coverage.timeline，保留 high-water 与业务卡片 |
 | [Camp Open Projection v10（渠道分支历史）](camp-open-projection-channel-v10.md) | v9 保留；Camp/Navigation 增加可选 channelSource，原始 title 不变；合并时保留原文以区分同号合同 |
 | [Camp Open Projection v9（历史）](camp-open-projection-v9.md) | v8 保留；Snapshot 34/Open 5 增加可选 member.fast，仅查询安全缓存 |
-| [Runtime Launch and Verification v60（当前）](runtime-launch-and-verification-v60.md) | 同类 CLI 优先原 ID 恢复、Adapter 证据限定一次降级、历史上下文不阻断新输入 |
+| [Runtime Launch and Verification v62（当前）](runtime-launch-and-verification-v62.md) | 移除原生会话重建提示、展示字段及公聊/单聊事件历史查询；恢复行为保持 |
+| [Runtime Launch and Verification v61（历史）](runtime-launch-and-verification-v61.md) | 移除 Desktop / Mobile 会话队员列表中的重置入口及其弹窗；启动与恢复保持 |
+| [Runtime Launch and Verification v60（历史）](runtime-launch-and-verification-v60.md) | 同类 CLI 优先原 ID 恢复、Adapter 证据限定一次降级、历史上下文不阻断新输入 |
 | [Runtime Launch and Verification v59（历史）](runtime-launch-and-verification-v59.md) | 启动时读取队员环境、Warm 保持、快照退役与单任务失败隔离 |
 | [Runtime Launch and Verification v58（历史）](runtime-launch-and-verification-v58.md) | 配置透传、队员会话创建时固定、显式重置及 Camp/队员/会话进程归属 |
 | [Runtime Launch and Verification v57（历史）](runtime-launch-and-verification-v57.md) | 队员私有 JSON 环境、冻结计划和兼容复用；Agents 旧环境停用与人工迁移 |
@@ -568,7 +571,9 @@ Architecture 解释组件如何组成，Version 概览记录交付范围；它�
 | [ContextManifest Evidence v9 (historical)](context-manifest-evidence-v9.md) | bounded public omission evidence；不作为 Formatter v13 恢复入口 |
 | [Context Delivery Profile v2 (historical)](context-delivery-profile-v2.md) | 公共引用链与历史 budget 的旧当前合同；不选择 self-active Task |
 | [Context Delivery Profile v1 (historical)](context-delivery-profile-v1.md) | AgentRun 公共消息窗口、Unicode scalar 正文截断、历史字符预算与遗漏提示 |
-| [Run Process Detail Surface v51（当前）](run-process-detail-surface-v51.md) | 共享 4.8 秒高亮、执行行动态效果设置入口与真实连接／处理反馈 |
+| [Run Process Detail Surface v53（当前）](run-process-detail-surface-v53.md) | 执行行固定启动时公开消息边界；任何 Run 均不能拆开回复与附属卡片 |
+| [Run Process Detail Surface v52（历史）](run-process-detail-surface-v52.md) | 当前轮次活动优先于晚到的输入受理回执，保留新轮次连接反馈；Desktop / Web 共用 |
+| [Run Process Detail Surface v51（历史）](run-process-detail-surface-v51.md) | 共享 4.8 秒高亮、执行行动态效果设置入口与真实连接／处理反馈 |
 | [Run Process Detail Surface v50（历史）](run-process-detail-surface-v50.md) | 每 Run 的发送前固定锚点与成功发送跟随、单行内按原文换行推进及 RunCard 高亮 |
 | [Run Process Detail Surface v49（历史）](run-process-detail-surface-v49.md) | 单行预览首次读取失败的事件驱动恢复、在途更新补拉及新旧 Evidence 合并；不改变 v48 展示与授权规则 |
 | [Run Process Detail Surface v48](run-process-detail-surface-v48.md) | 停止区短竖线分隔、默认中性色停止按钮；按持久化续做 Delivery 恢复已受理重试的收起状态 |

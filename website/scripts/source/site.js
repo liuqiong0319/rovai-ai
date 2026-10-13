@@ -177,7 +177,6 @@
     });
     update();
   }else{addEventListener('hashchange',updateLocaleLink);}
-  document.addEventListener('click', async event => { const button=event.target.closest('.prompt-copy'); if(!button)return; const value=button.previousElementSibling.textContent; try { await navigator.clipboard.writeText(value); button.textContent=choose('Copied','已复制'); } catch { const range=document.createRange(); range.selectNodeContents(button.previousElementSibling); const selection=getSelection(); selection.removeAllRanges(); selection.addRange(range); button.textContent=choose('Selected — copy with keyboard','已选中，请用键盘复制'); } });
   const box=document.querySelector('.lightbox');
   if(box){document.querySelectorAll('[data-image]').forEach(button=>button.addEventListener('click',()=>{const img=new Image();img.src=button.dataset.image;img.alt=button.querySelector('img').alt;box.querySelector('.lightbox-media').replaceChildren(img);box.showModal();document.body.classList.add('modal-open');}));box.querySelector('button').addEventListener('click',()=>box.close());box.addEventListener('click',event=>{if(event.target===box)box.close();});box.addEventListener('close',()=>document.body.classList.remove('modal-open'));}
 })();

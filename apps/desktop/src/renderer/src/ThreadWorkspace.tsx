@@ -1,6 +1,5 @@
 import { groupExecutionEventsByRunId } from './execution-events'
 export { groupExecutionEventsByRunId } from './execution-events'
-import { MemberSessionReset } from './MemberSessionReset'
 import { ContinueAgentRunButton } from './ContinueAgentRunButton'
 import { ConversationRunPresence } from './ConversationRunPresence'
 import { conversationRunPresenceTimeline } from './conversation-run-presence'
@@ -8314,7 +8313,6 @@ function ThreadMembersPanel({
   onRemoveMember?(preview: ThreadMemberRemovalPreview): Promise<ThreadMemberRemoveOutcome>
   onNotify(message: string): void
 }): JSX.Element {
-  const [sessionResetMember, setSessionResetMember] = useState<{ agentId: string; displayName: string } | null>(null)
   const mobile = useMobileLayout()
   const members = campInspectorMembers(snapshot.members)
   const presentCount = members.filter(campMemberIsLeadEligible).length
@@ -8499,7 +8497,6 @@ function ThreadMembersPanel({
 
   return (
     <section aria-label={uiAttribute("当前会话队员")}>
-      {sessionResetMember && <MemberSessionReset key={sessionResetMember.agentId} campId={snapshot.thread.id} member={sessionResetMember} onClose={() => setSessionResetMember(null)} onNotify={onNotify}/>}
       <div className="camp-members-summary">
         <div className="camp-members-summary-line">
           <div>
@@ -8581,7 +8578,6 @@ function ThreadMembersPanel({
                 <strong>{presenceLabel}</strong>
                 {runtimeTone === 'attention' && profile && <small className="runtime-attention">{runtimeReadinessLabel(profile.runtimeReadiness.status)}</small>}
               </span>
-              {mobile && <button type="button" className="quiet-button" disabled={busy} onClick={() => setSessionResetMember(member)}>{uiAttribute('重置队员会话')}</button>}
               {!mobile && <DropdownMenu.Root>
                 <DropdownMenu.Trigger asChild>
                   <button
@@ -8622,9 +8618,6 @@ function ThreadMembersPanel({
                       <strong><UiText zh={"模型信息"} /></strong>
                       {!runtimeConfiguration && <small><UiText zh={"请先配置智能体"} /></small>}
                     </DropdownMenu.Item>
-                    <DropdownMenu.Separator className="camp-member-menu-separator" />
-                    <DropdownMenu.Item className="camp-member-menu-item" disabled={busy}
-                      onSelect={() => setSessionResetMember(member)}><strong><UiText zh={"重置队员会话"}/></strong></DropdownMenu.Item>
                     <DropdownMenu.Separator className="camp-member-menu-separator" />
                     <DropdownMenu.Item
                       className="camp-member-menu-item is-danger"
@@ -10657,7 +10650,6 @@ function RunExecutionContent({
       {cancelling && nonTerminal && (
         <div className="process-action cancelling" role="status"><UiText zh={"正在提交停止请求，完成后即可继续发送。"} /></div>
       )}
-      {run.nativeSessionReplaced && <p className="process-copy" role="status"><UiText zh="原生会话未能恢复，已新建会话继续。Camp 中的消息保留。" /></p>}
       {publicFailure && <RuntimeFailureNotice failure={publicFailure} presentation="agent-run" />}
     </div>
     </ExecutionContentContext.Provider>

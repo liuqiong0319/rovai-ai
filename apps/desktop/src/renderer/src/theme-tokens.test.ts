@@ -470,7 +470,8 @@ describe('Porcelain Day + Steel Night theme tokens', () => {
     expect(css).toMatch(/\.message-surface\s*\{[^}]*position: relative[^}]*display: flex/)
     expect(css).toMatch(/\.safe-markdown code\s*\{[^}]*padding:\s*0 2px[^}]*border-radius:\s*3px[^}]*background:\s*var\(--inline-code-canvas\)/)
     expect(css).not.toMatch(/\.safe-markdown code\s*\{[^}]*\bborder\s*:/)
-    expect(css).toMatch(/\.safe-markdown pre\s*\{[^}]*background:\s*var\(--code-block-canvas\)/)
+    expect(css).toMatch(/\.safe-markdown\s*\{[^}]*--markdown-code-canvas:\s*var\(--code-block-canvas\)/)
+    expect(css).toMatch(/\.safe-markdown pre\s*\{[^}]*background:\s*var\(--markdown-code-canvas\)/)
     expect(css).toMatch(/\.safe-markdown pre code\s*\{[^}]*padding:\s*0[^}]*background:\s*transparent/)
     expect(css).toContain('.conversation-bubble:hover .message-actions')
     expect(css).toMatch(/\.message-actions\s*\{[^}]*align-self: flex-end[^}]*gap: 0[^}]*margin-top: 3px/)
@@ -511,7 +512,7 @@ describe('Porcelain Day + Steel Night theme tokens', () => {
       /@media\s*\(min-width:\s*1800px\)\s*\{\s*:root\s*\{[^}]*--conversation-composer-width:\s*1440px/
     )
     expect(css).toMatch(
-      /\.conversation-bubble\.agent \.safe-markdown > :where\(pre, table\)\s*\{[^}]*width:\s*min\(var\(--conversation-artifact-width\), 100%\)/
+      /\.conversation-bubble\.agent \.safe-markdown > :where\(pre, \.markdown-code-frame, table\)\s*\{[^}]*width:\s*min\(var\(--conversation-artifact-width\), 100%\)/
     )
     expect(css).toMatch(
       /@media\s*\(min-width:\s*1800px\)[\s\S]*?\.timeline-event-card:not\(\.task-event-card\)\s*\{[^}]*width:\s*min\(var\(--conversation-artifact-width\), 100%\)/
@@ -523,7 +524,10 @@ describe('Porcelain Day + Steel Night theme tokens', () => {
 
   it('shares Mist Gray Markdown code layers across Thread reading surfaces', () => {
     expect(css).toMatch(/\.conversation-bubble :is\(\.final-copy, \.message-bubble\) \.safe-markdown code,\s*\.execution-drawer \.safe-markdown code,\s*\.file-preview-markdown \.safe-markdown code\s*\{[^}]*padding:\s*1px 4px[^}]*border-radius:\s*6px[^}]*background:\s*var\(--conversation-inline-code-canvas\)[^}]*box-decoration-break:\s*clone/)
-    expect(css).toMatch(/\.conversation-bubble :is\(\.final-copy, \.message-bubble\) \.safe-markdown pre,\s*\.execution-drawer \.safe-markdown pre,\s*\.file-preview-markdown \.safe-markdown pre\s*\{[^}]*padding:\s*11px 12px[^}]*border-color:\s*var\(--conversation-code-line\)[^}]*border-radius:\s*8px[^}]*background:\s*var\(--conversation-code-block-canvas\)/)
+    expect(css).toMatch(/\.conversation-bubble :is\(\.final-copy, \.message-bubble\) \.safe-markdown pre,\s*\.execution-drawer \.safe-markdown pre,\s*\.file-preview-markdown \.safe-markdown pre\s*\{[^}]*padding:\s*11px 12px/)
+    expect(css).toMatch(/\.conversation-bubble :is\(\.final-copy, \.message-bubble\) \.safe-markdown,\s*\.execution-drawer \.safe-markdown,\s*\.file-preview-markdown \.safe-markdown\s*\{[^}]*--markdown-code-line:\s*var\(--conversation-code-line\)[^}]*--markdown-code-canvas:\s*var\(--conversation-code-block-canvas\)[^}]*--markdown-code-radius:\s*8px/)
+    expect(css).toMatch(/\.markdown-code-frame\s*\{[^}]*border:\s*1px solid var\(--markdown-code-line\)[^}]*border-radius:\s*var\(--markdown-code-radius\)[^}]*background:\s*var\(--markdown-code-canvas\)/)
+    expect(css).toMatch(/\.safe-markdown \.markdown-code-frame > pre\s*\{[^}]*border:\s*0[^}]*background:\s*transparent/)
     expect(css).toMatch(/\.conversation-bubble :is\(\.final-copy, \.message-bubble\) \.safe-markdown pre code,\s*\.execution-drawer \.safe-markdown pre code,\s*\.file-preview-markdown \.safe-markdown pre code\s*\{[^}]*padding:\s*0[^}]*border-radius:\s*0[^}]*background:\s*transparent/)
     expect(css).toMatch(/\.file-preview-metadata\s*\{[^}]*border:\s*1px solid var\(--conversation-code-line\)[^}]*border-radius:\s*8px[^}]*color:\s*var\(--evidence-ink\)[^}]*background:\s*var\(--conversation-code-block-canvas\)/)
     expect(css).toMatch(/@container file-preview-pane \(max-width:\s*330px\)[\s\S]*?\.file-preview-metadata-row\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\)/)

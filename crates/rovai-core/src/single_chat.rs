@@ -167,7 +167,6 @@ pub struct SingleChatMessageView {
 #[serde(rename_all = "camelCase")]
 pub struct SingleChatRunView {
     pub id: String,
-    pub native_session_replaced: bool,
     #[serde(rename = "threadTurnId", alias = "campTurnId")]
     pub camp_turn_id: String,
     pub trigger_conversation_message_id: String,
@@ -1634,11 +1633,7 @@ impl SingleChatService {
                        (SELECT COUNT(*) FROM agent_run_execution_evidence AS evidence
                         WHERE evidence.agent_run_id = agent_run.id),
                        agent_run.execution_evidence_change_sequence,
-                       agent_run.camp_turn_id,
-                       EXISTS(SELECT 1 FROM event_log e WHERE e.entity_type='agent_run'
-                         AND e.entity_id=agent_run.id AND e.execution_epoch=agent_run.execution_epoch
-                         AND e.event_type='agent_run.native_session_continuity_lost'
-                 AND json_extract(e.payload_json, '$.continuation')='native_session_replaced')
+                       agent_run.camp_turn_id
                 FROM agent_run
                 WHERE agent_run.conversation_id = ?1
                   AND agent_run.invocation_kind = 'single_chat'
@@ -1649,7 +1644,6 @@ impl SingleChatService {
                 .query_map([conversation_id], |row| {
                     Ok(SingleChatRunView {
                         id: row.get(0)?,
-                        native_session_replaced: row.get(14)?,
                         camp_turn_id: row.get(13)?,
                         trigger_conversation_message_id: row.get(1)?,
                         status: row.get(2)?,
@@ -3247,6 +3241,18 @@ mod tests {
         "#,
             )
             .unwrap();
+        // Opening either read surface must not replay audit history for Run presentation.
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        database
+            .connection()
+            .authorizer(Some(|context: AuthContext<'_>| match context.action {
+                AuthAction::Read {
+                    table_name: "event_log",
+                    ..
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }))
+            .unwrap();
         let private_pending = service
             .snapshot(&database, &conversation_id)
             .unwrap()
@@ -3258,6 +3264,10 @@ mod tests {
             .unwrap();
         assert!(public.approvals.is_empty());
         assert_eq!(public.coverage.approvals.total_count, 0);
+        database
+            .connection()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .unwrap();
         let pending_changes = crate::notification::NotificationEpisodeService::default()
             .changes_since(&mut database, "local_user", 0, 100)
             .unwrap();

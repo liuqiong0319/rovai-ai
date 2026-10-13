@@ -1,7 +1,7 @@
 ---
 document_type: development-guide
 authority: test-policy-and-command-routing
-last_updated: 2026-10-12
+last_updated: 2026-10-13
 ---
 
 # 测试与 Smoke Test
@@ -427,6 +427,28 @@ workspace 不同、同名图片内容不同、失效 epoch／缺失 workspace �
 `cargo test -p rovai-core --features extended-tests --lib builtin_tool_runtime::tests::`，
 同样先核对清单；默认 workspace 回归仍执行 `pnpm test:rust:pr`。
 
+### GIF 队员头像
+
+复用 `member_avatar::tests` 的 import/read、recrop、结构解析与资源限制 owner，增加 PNG 上传尾部
+与受管严格校验、GIF 长宽图及缩放取整后贴边取景的保存/读取/再次裁剪、PNG 渠道封面及超限拒绝。
+新增最低成本纯 codec owner `gif_crop_preserves_transparency_disposal_and_loop_semantics`：修复前透明
+部分帧会留下残影、无循环扩展会变为无限循环；现有持久化 owner 只检查整帧颜色，不拥有部分帧
+disposal 的逐像素状态转换，因此不用完整数据库或重复文件夹具验证此矩阵。最小命令为
+`cargo test -p rovai-core --lib member_avatar::`。三阶段创建合同退出本 PR，相应专用 helper 随之移除；
+创建路径复用 `confirmed_user_input_can_create_one_idempotent_member_but_agent_input_cannot`，在现有
+PNG 成员创建/幂等矩阵中增加 Run 相对路径 GIF；认证与 Migration owner 不变。该 owner 需
+`--features extended-tests`，不能用默认构建的同名过滤结果宣称已经执行。
+
+Desktop/Web 的原始文件检查共用 `packages/contracts/src/member-avatar-image.ts`，原
+`member-avatar-assets.test.ts` owner 覆盖标准循环扩展、逐位置截断、越界帧、元数据和浏览器 MIME
+不可靠输入；UI 的静态图片与提交失败恢复继续由现有 avatar image/submit owner 负责。
+
+`cargo build -p rovai-core --bin rovai-core` 后运行 `pnpm test:member-avatar-flow`：真实编辑器与
+Web 序列化适配调用独立 Core，覆盖动画预览、调整取景不重建 Blob URL、超宽图规范化后
+保存/重开/重新裁剪、页面刷新与渠道静态 PNG 首帧。夹具通过 Chromium 指定测试文件，不启动真实 Runtime；
+userData、Skill Library 和 MCP 路径均为本次临时目录，成功后清理。可通过
+`ROVAI_CORE_BINARY` 指定已构建 Core，`ROVAI_KEEP_MEMBER_AVATAR_FIXTURE=1` 保留验收数据。
+
 ## Thread 执行查询
 
 `thread_runs::tests` 拥有新的输入/游标封闭边界与 Unicode 预览语义；现有 owner 没有执行游标或该截断约定，
@@ -814,6 +836,12 @@ required 模式，防止未来迁移到 macOS runner 时把环境阻断当成通
 夹具创建临时绝对 `userData`，不启动 Core/SQLite/Runtime，也不读取日常数据；它是生产组件组合测试，不冒充真实数据库
 迁移端到端验收。默认删除本次夹具，`ROVAI_KEEP_STARTUP_PRESENTATION_FIXTURE=1` 可保留 Day/Night、最小窗口与
 200%/reduced-motion 截图。手动 Full check 的 Linux job 通过 `xvfb-run -a pnpm test:startup-presentation` 执行。
+
+Markdown 代码块复制运行 `pnpm test:markdown-code-copy`。先执行根目录 `pnpm install --frozen-lockfile` 和
+`npm ci --prefix website`；使用本机 Chrome（可由 `ROVAI_TEST_CHROME` 指定）。夹具直接挂载生产会话、文件
+预览与代码组件，并构建真实 VitePress 页面，在独立临时浏览器 profile 中验证剪贴板、键盘、失败恢复、
+引用/查找排除、代码更新与页面导航时的异步竞争，以及双主题和窄屏。没有 Chrome 时明确 skip，不能视为通过。
+可设置 `ROVAI_CODE_COPY_OUTPUT=/absolute/path` 保留截图与结果；此入口不启动 Electron、Core 或 Runtime。
 
 文件预览分栏交互运行 `pnpm test:file-preview-layout`。它在真实 Electron 中挂载生产 `FilePreviewProvider`、
 标题栏、分栏组件、文件 Tab 与 Viewer，以原生鼠标/键盘输入验证拖动提交、回弹、关闭与取消、焦点回退、

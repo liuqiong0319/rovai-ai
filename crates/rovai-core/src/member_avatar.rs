@@ -279,6 +279,7 @@ fn import_gif_selected(
         ));
     }
     let (normalized_width, normalized_height) = normalized_gif_dimensions(info.width, info.height);
+    let crop = normalized_gif_crop(crop, normalized_width, normalized_height);
     publish_managed_member_avatar_gif(
         data_dir,
         asset_id,
@@ -292,19 +293,26 @@ fn import_gif_selected(
     )
 }
 
-/// Keeps the original GIF bytes verbatim when the logical canvas already fits
-/// the normalized limit, otherwise resizes every frame and re-encodes.
+/// Strips non-rendering metadata without changing pixels when the canvas fits;
+/// otherwise resizes every composited frame and re-encodes.
 fn normalize_gif_source_bytes(
     selected_bytes: &[u8],
     frames: &[CompositedGifFrame],
-    loop_count: u16,
+    loop_count: Option<u16>,
 ) -> std::result::Result<Vec<u8>, MemberAvatarImportError> {
     let (width, height) = frames
         .first()
         .map(|frame| frame.image.dimensions())
         .ok_or_else(|| invalid_gif_structure())?;
     if width.max(height) <= NORMALIZED_MAXIMUM_EDGE {
-        return Ok(selected_bytes.to_vec());
+        // Copy only rendering blocks: remove comments, unknown application
+        // metadata and bytes after the trailer without requantizing the source.
+        let info = parse_gif_info(selected_bytes)?;
+        let mut normalized = Vec::with_capacity(selected_bytes.len());
+        for (start, end) in info.rendering_blocks {
+            normalized.extend_from_slice(&selected_bytes[start..end]);
+        }
+        return Ok(normalized);
     }
     resize_gif_frames(frames, loop_count, NORMALIZED_MAXIMUM_EDGE)
 }
@@ -321,7 +329,7 @@ fn normalize_selected_avatar(
         ));
     }
     if format == ImageFormat::Png {
-        reject_animated_png(&selected_bytes)?;
+        inspect_upload_png(&selected_bytes)?;
     }
 
     let mut reader = ImageReader::with_format(Cursor::new(&selected_bytes), format);
@@ -361,60 +369,6 @@ fn normalize_selected_avatar(
     };
     let normalized = DynamicImage::ImageRgba8(normalized.to_rgba8());
     Ok(normalized)
-}
-
-/// Validates a run-readable PNG, JPEG or animated GIF avatar file without
-/// publishing any asset. Mirrors the import-time checks so a preview can
-/// confirm the file before any member creation is attempted; nothing is written
-/// to the managed asset store.
-pub fn validate_avatar_file(path: &Path) -> std::result::Result<(), MemberAvatarImportError> {
-    let bytes = read_selected_avatar(path)?;
-    let format = image::guess_format(&bytes)
-        .map_err(|_| MemberAvatarImportError::invalid("Avatar must be a PNG, JPEG or GIF image"))?;
-    if format == ImageFormat::Gif {
-        let info = parse_gif_info(&bytes)?;
-        validate_gif_file_info(&info)?;
-        decode_composited_gif_frames(&bytes)?;
-        return Ok(());
-    }
-    if !matches!(format, ImageFormat::Png | ImageFormat::Jpeg) {
-        return Err(MemberAvatarImportError::invalid(
-            "Avatar must be a PNG, JPEG or GIF image",
-        ));
-    }
-    if format == ImageFormat::Png {
-        reject_animated_png(&bytes)?;
-    }
-    let mut reader = ImageReader::with_format(Cursor::new(&bytes), format);
-    let mut limits = Limits::default();
-    limits.max_image_width = Some(MAXIMUM_DECODED_EDGE);
-    limits.max_image_height = Some(MAXIMUM_DECODED_EDGE);
-    limits.max_alloc = Some(MAXIMUM_DECODE_ALLOCATION);
-    reader.limits(limits);
-    let mut decoder = reader
-        .into_decoder()
-        .map_err(|_| MemberAvatarImportError::invalid("Avatar image could not be decoded"))?;
-    let (decoded_width, decoded_height) = decoder.dimensions();
-    validate_decoded_dimensions(decoded_width, decoded_height)?;
-    if decoder.total_bytes() > MAXIMUM_DECODE_ALLOCATION {
-        return Err(MemberAvatarImportError::invalid(
-            "Avatar image exceeds the decoded resource limit",
-        ));
-    }
-    let orientation = decoder
-        .orientation()
-        .map_err(|_| MemberAvatarImportError::invalid("Avatar orientation is invalid"))?;
-    let mut decoded = DynamicImage::from_decoder(decoder)
-        .map_err(|_| MemberAvatarImportError::invalid("Avatar image could not be decoded"))?;
-    decoded.apply_orientation(orientation);
-    validate_decoded_dimensions(decoded.width(), decoded.height())?;
-    Ok(())
-}
-
-/// Returns the SHA-256 of a selected avatar file without importing any asset.
-pub fn hash_selected_avatar(path: &Path) -> std::result::Result<String, MemberAvatarImportError> {
-    let bytes = read_selected_avatar(path)?;
-    Ok(sha256(&bytes))
 }
 
 /// Reuses creation's decoder and normalization, with an optional explicit crop.
@@ -467,6 +421,7 @@ fn prepare_gif_avatar(
         "Avatar exceeds the managed asset limit"
     );
     let (normalized_width, normalized_height) = normalized_gif_dimensions(info.width, info.height);
+    let crop = normalized_gif_crop(crop, normalized_width, normalized_height);
     if verify_existing_only {
         let directory = data_dir.join("member-avatars").join(asset_id.to_string());
         if !existing_asset_matches(
@@ -520,7 +475,7 @@ pub fn recrop_member_avatar(
     let source_bytes = member_avatar_bytes(data_dir, avatar_ref, true)?;
     if parse_gif_info(&source_bytes).is_ok() {
         let info = parse_gif_info(&source_bytes)?;
-        return Ok(save_managed_member_avatar_gif(
+        return Ok(save_normalized_member_avatar_gif(
             data_dir,
             &source_bytes,
             info.width,
@@ -784,8 +739,32 @@ pub fn save_managed_member_avatar(
 /// GIF plus the shared crop; the icon is derived here frame-by-frame so the
 /// animation survives and never degrades to a static first frame. When the
 /// logical canvas exceeds the normalized limit, every frame is resized and the
-/// animation re-encoded; otherwise the original bytes are kept verbatim.
+/// animation re-encoded; otherwise only non-rendering metadata is removed.
 pub fn save_managed_member_avatar_gif(
+    data_dir: &Path,
+    source_gif: &[u8],
+    source_width: u32,
+    source_height: u32,
+    crop: MemberAvatarCrop,
+    frame_count: u32,
+) -> Result<ManagedMemberAvatarSummary> {
+    anyhow::ensure!(
+        source_gif.len() <= SELECTED_FILE_BYTES as usize,
+        "Avatar file must be no larger than 10 MiB"
+    );
+    let info = parse_gif_info(source_gif)?;
+    validate_gif_file_info(&info)?;
+    save_normalized_member_avatar_gif(
+        data_dir,
+        source_gif,
+        source_width,
+        source_height,
+        crop,
+        frame_count,
+    )
+}
+
+fn save_normalized_member_avatar_gif(
     data_dir: &Path,
     source_gif: &[u8],
     source_width: u32,
@@ -802,7 +781,7 @@ pub fn save_managed_member_avatar_gif(
         info.frame_count == frame_count,
         "Avatar frame count does not match"
     );
-    validate_gif_file_info(&info)?;
+    validate_gif_resources(&info)?;
     validate_crop(&crop, source_width, source_height)?;
     let frames = decode_composited_gif_frames(source_gif)?;
     let icon_gif =
@@ -813,6 +792,7 @@ pub fn save_managed_member_avatar_gif(
         "Avatar exceeds the managed asset limit"
     );
     let (normalized_width, normalized_height) = normalized_gif_dimensions(info.width, info.height);
+    let crop = normalized_gif_crop(crop, normalized_width, normalized_height);
     let mut digest = Sha256::new();
     digest.update(&source_gif);
     digest.update(&icon_gif);
@@ -832,6 +812,17 @@ pub fn save_managed_member_avatar_gif(
         frame_count,
         info.loop_count,
     )?)
+}
+
+// Rounding either edge while resizing can move a crop that touched the old
+// border just outside the new canvas. Store the same crop clipped to that canvas.
+fn normalized_gif_crop(mut crop: MemberAvatarCrop, width: u32, height: u32) -> MemberAvatarCrop {
+    let edge = crop.size * f64::from(width.min(height));
+    let inset_x = edge / 2.0 / f64::from(width);
+    let inset_y = edge / 2.0 / f64::from(height);
+    crop.center_x = crop.center_x.clamp(inset_x, 1.0 - inset_x);
+    crop.center_y = crop.center_y.clamp(inset_y, 1.0 - inset_y);
+    crop
 }
 
 fn normalized_gif_dimensions(width: u32, height: u32) -> (u32, u32) {
@@ -982,6 +973,30 @@ pub fn read_managed_member_avatar(
     }))
 }
 
+/// Channels consume a PNG icon. Select the first composited animation frame
+/// here so neither the Agent nor a channel adapter needs frame-selection logic.
+pub fn read_managed_member_avatar_static_icon(
+    data_dir: &Path,
+    avatar_ref: &str,
+) -> Result<Option<ManagedMemberAvatarRendition>> {
+    use base64::Engine;
+    let Some(mut image) = read_managed_member_avatar(data_dir, avatar_ref, false)? else {
+        return Ok(None);
+    };
+    if image.media_type == "image/gif" {
+        let bytes = base64::engine::general_purpose::STANDARD.decode(&image.base64)?;
+        let frames = decode_composited_gif_frames(&bytes)?;
+        let frame = frames
+            .into_iter()
+            .next()
+            .ok_or_else(invalid_gif_structure)?;
+        let png = encode_png(&DynamicImage::ImageRgba8(frame.image))?;
+        image.base64 = base64::engine::general_purpose::STANDARD.encode(png);
+        image.media_type = "image/png";
+    }
+    Ok(Some(image))
+}
+
 fn publish_managed_member_avatar(
     data_dir: &Path,
     asset_id: Uuid,
@@ -1000,7 +1015,7 @@ fn publish_managed_member_avatar(
         source_width,
         source_height,
         0,
-        0,
+        None,
         crop,
     )
 }
@@ -1014,7 +1029,7 @@ fn publish_managed_member_avatar_gif(
     source_height: u32,
     crop: MemberAvatarCrop,
     frame_count: u32,
-    loop_count: u16,
+    loop_count: Option<u16>,
 ) -> std::result::Result<ManagedMemberAvatarSummary, MemberAvatarImportError> {
     publish_managed_member_avatar_with(
         data_dir,
@@ -1045,7 +1060,7 @@ fn publish_managed_member_avatar_with(
     source_width: u32,
     source_height: u32,
     frame_count: u32,
-    _loop_count: u16,
+    _loop_count: Option<u16>,
     crop: MemberAvatarCrop,
 ) -> std::result::Result<ManagedMemberAvatarSummary, MemberAvatarImportError> {
     let asset_id = asset_id.hyphenated().to_string();
@@ -1146,19 +1161,6 @@ fn publish_managed_member_avatar_with(
 /// Removes a published managed avatar asset. Used to compensate a member
 /// creation that imported the avatar but failed before the profile was written,
 /// so no orphan asset is left behind.
-pub fn remove_managed_member_avatar(data_dir: &Path, avatar_ref: &str) -> Result<()> {
-    let MemberAvatarReference::Managed(asset_id) = parse_member_avatar_ref(avatar_ref)? else {
-        return Ok(());
-    };
-    let directory = data_dir
-        .join("member-avatars")
-        .join(asset_id.hyphenated().to_string());
-    if !path_exists(&directory)? {
-        return Ok(());
-    }
-    Ok(remove_scoped_temporary_path(&directory)?)
-}
-
 fn validate_decoded_dimensions(
     width: u32,
     height: u32,
@@ -1180,6 +1182,15 @@ fn validate_decoded_dimensions(
 }
 
 fn reject_animated_png(bytes: &[u8]) -> std::result::Result<(), MemberAvatarImportError> {
+    if inspect_upload_png(bytes)? != bytes.len() {
+        return Err(MemberAvatarImportError::invalid(
+            "Avatar PNG has trailing data",
+        ));
+    }
+    Ok(())
+}
+
+fn inspect_upload_png(bytes: &[u8]) -> std::result::Result<usize, MemberAvatarImportError> {
     const PNG_SIGNATURE_BYTES: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
     if !bytes.starts_with(PNG_SIGNATURE_BYTES) {
         return Err(MemberAvatarImportError::invalid(
@@ -1224,7 +1235,7 @@ fn reject_animated_png(bytes: &[u8]) -> std::result::Result<(), MemberAvatarImpo
                     "Avatar PNG structure is invalid",
                 ));
             }
-            return Ok(());
+            return Ok(chunk_end);
         }
         offset = chunk_end;
     }
@@ -1243,12 +1254,13 @@ fn reject_animated_png(bytes: &[u8]) -> std::result::Result<(), MemberAvatarImpo
 // so frame order, per-frame delay and the Netscape loop count survive.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct GifFileInfo {
     width: u32,
     height: u32,
     frame_count: u32,
-    loop_count: u16,
+    loop_count: Option<u16>,
+    rendering_blocks: Vec<(usize, usize)>,
 }
 
 struct CompositedGifFrame {
@@ -1292,16 +1304,25 @@ fn parse_gif_info(bytes: &[u8]) -> std::result::Result<GifFileInfo, MemberAvatar
         ));
     }
     let mut frame_count = 0u32;
-    let mut loop_count = 0u16;
+    let mut loop_count = None;
+    let mut saw_end = false;
+    let mut rendering_blocks = vec![(0, offset)];
     while offset < bytes.len() {
+        let start = offset;
+        let mut keep = true;
         match bytes[offset] {
-            0x3b => break, // trailer
+            0x3b => {
+                rendering_blocks.push((offset, offset + 1));
+                saw_end = true;
+                break;
+            }
             0x21 => {
                 // Extension introducer.
                 offset = offset
                     .checked_add(1)
                     .ok_or_else(|| invalid_gif_structure())?;
                 let label = *bytes.get(offset).ok_or_else(|| invalid_gif_structure())?;
+                keep = label == 0xf9;
                 offset = offset
                     .checked_add(1)
                     .ok_or_else(|| invalid_gif_structure())?;
@@ -1317,16 +1338,20 @@ fn parse_gif_info(bytes: &[u8]) -> std::result::Result<GifFileInfo, MemberAvatar
                     offset = offset
                         .checked_add(size)
                         .ok_or_else(|| invalid_gif_structure())?;
-                    if block == b"NETSCAPE2.0" {
+                    if size != 11 {
+                        return Err(invalid_gif_structure());
+                    }
+                    if block == b"NETSCAPE2.0" || block == b"ANIMEXTS1.0" {
+                        keep = true;
                         // Peek the loop-count sub-block; skip_gif_sub_blocks
                         // consumes it (and the terminator) afterwards.
                         if let Some(sub) = bytes.get(offset).copied().map(usize::from) {
-                            if sub >= 3 {
+                            if sub == 3 {
                                 let payload = bytes
                                     .get(offset + 1..offset.saturating_add(4))
                                     .ok_or_else(|| invalid_gif_structure())?;
                                 if payload[0] == 0x01 {
-                                    loop_count = u16::from_le_bytes([payload[1], payload[2]]);
+                                    loop_count = Some(u16::from_le_bytes([payload[1], payload[2]]));
                                 }
                             }
                         }
@@ -1335,6 +1360,22 @@ fn parse_gif_info(bytes: &[u8]) -> std::result::Result<GifFileInfo, MemberAvatar
                 offset = skip_gif_sub_blocks(bytes, offset)?;
             }
             0x2c => {
+                let descriptor = bytes
+                    .get(offset + 1..offset + 10)
+                    .ok_or_else(invalid_gif_structure)?;
+                let left = u32::from(u16::from_le_bytes([descriptor[0], descriptor[1]]));
+                let top = u32::from(u16::from_le_bytes([descriptor[2], descriptor[3]]));
+                let frame_width = u32::from(u16::from_le_bytes([descriptor[4], descriptor[5]]));
+                let frame_height = u32::from(u16::from_le_bytes([descriptor[6], descriptor[7]]));
+                if frame_width == 0
+                    || frame_height == 0
+                    || left + frame_width > width
+                    || top + frame_height > height
+                {
+                    return Err(MemberAvatarImportError::invalid(
+                        "Avatar GIF frame exceeds the canvas bounds",
+                    ));
+                }
                 // Image descriptor: one animated frame.
                 frame_count = frame_count
                     .checked_add(1)
@@ -1373,6 +1414,12 @@ fn parse_gif_info(bytes: &[u8]) -> std::result::Result<GifFileInfo, MemberAvatar
                 ));
             }
         }
+        if keep {
+            rendering_blocks.push((start, offset));
+        }
+    }
+    if !saw_end {
+        return Err(invalid_gif_structure());
     }
     if frame_count == 0 {
         return Err(MemberAvatarImportError::invalid(
@@ -1384,6 +1431,7 @@ fn parse_gif_info(bytes: &[u8]) -> std::result::Result<GifFileInfo, MemberAvatar
         height,
         frame_count,
         loop_count,
+        rendering_blocks,
     })
 }
 
@@ -1419,6 +1467,7 @@ fn gif_decoder(
 ) -> std::result::Result<GifDecoder<Cursor<&[u8]>>, MemberAvatarImportError> {
     let mut options = DecodeOptions::new();
     options.set_color_output(gif::ColorOutput::RGBA);
+    options.check_frame_consistency(true);
     options.set_memory_limit(gif::MemoryLimit::Bytes(
         std::num::NonZeroU64::new(MAXIMUM_DECODE_ALLOCATION)
             .ok_or_else(|| invalid_gif_structure())?,
@@ -1430,6 +1479,18 @@ fn gif_decoder(
 
 fn validate_gif_file_info(info: &GifFileInfo) -> std::result::Result<(), MemberAvatarImportError> {
     validate_decoded_dimensions(info.width, info.height)?;
+    validate_gif_resources(info)
+}
+
+fn validate_gif_resources(info: &GifFileInfo) -> std::result::Result<(), MemberAvatarImportError> {
+    if info.width > MAXIMUM_DECODED_EDGE
+        || info.height > MAXIMUM_DECODED_EDGE
+        || u64::from(info.width) * u64::from(info.height) > MAXIMUM_DECODED_PIXELS
+    {
+        return Err(MemberAvatarImportError::invalid(
+            "Avatar GIF exceeds the decoded resource limit",
+        ));
+    }
     if info.frame_count > MAXIMUM_GIF_FRAMES {
         return Err(MemberAvatarImportError::invalid(
             "Animated avatar exceeds the frame limit",
@@ -1453,6 +1514,7 @@ fn decode_composited_gif_frames(
     bytes: &[u8],
 ) -> std::result::Result<Vec<CompositedGifFrame>, MemberAvatarImportError> {
     let info = parse_gif_info(bytes)?;
+    validate_gif_resources(&info)?;
     let mut decoder = gif_decoder(bytes)?;
     let canvas_width = u32::from(decoder.width());
     let canvas_height = u32::from(decoder.height());
@@ -1542,7 +1604,7 @@ fn clear_gif_rect(canvas: &mut RgbaImage, left: u32, top: u32, width: u32, heigh
 
 fn encode_animated_gif(
     frames: &[CompositedGifFrame],
-    loop_count: u16,
+    loop_count: Option<u16>,
 ) -> std::result::Result<Vec<u8>, MemberAvatarImportError> {
     let (width, height) = frames
         .first()
@@ -1552,20 +1614,26 @@ fn encode_animated_gif(
     {
         let mut encoder = GifEncoder::new(&mut output, width as u16, height as u16, &[])
             .map_err(|_| MemberAvatarImportError::invalid("Avatar GIF could not be normalized"))?;
-        let repeat = if loop_count == 0 {
-            Repeat::Infinite
-        } else {
-            Repeat::Finite(loop_count)
-        };
-        encoder
-            .set_repeat(repeat)
-            .map_err(|_| MemberAvatarImportError::invalid("Avatar GIF could not be normalized"))?;
+        if let Some(count) = loop_count {
+            encoder
+                .set_repeat(if count == 0 {
+                    Repeat::Infinite
+                } else {
+                    Repeat::Finite(count)
+                })
+                .map_err(|_| {
+                    MemberAvatarImportError::invalid("Avatar GIF could not be normalized")
+                })?;
+        }
         for frame in frames {
             let (frame_width, frame_height) = frame.image.dimensions();
             let mut buffer = frame.image.to_vec();
             let mut gif_frame =
                 GifFrame::from_rgba_speed(frame_width as u16, frame_height as u16, &mut buffer, 10);
             gif_frame.delay = frame.delay_centiseconds;
+            // Every frame is a complete composited canvas. Clear it before the
+            // next frame so transparent pixels cannot retain old content.
+            gif_frame.dispose = DisposalMethod::Background;
             encoder.write_frame(&gif_frame).map_err(|_| {
                 MemberAvatarImportError::invalid("Avatar GIF could not be normalized")
             })?;
@@ -1578,7 +1646,7 @@ fn encode_animated_gif(
 /// and re-encodes the animation.
 fn resize_gif_frames(
     frames: &[CompositedGifFrame],
-    loop_count: u16,
+    loop_count: Option<u16>,
     maximum_edge: u32,
 ) -> std::result::Result<Vec<u8>, MemberAvatarImportError> {
     let (width, height) = frames
@@ -1612,7 +1680,7 @@ fn resize_gif_frames(
 /// 192×192 icon, preserving frame order, per-frame delay and loop count.
 fn crop_gif_frames_to_icon(
     frames: &[CompositedGifFrame],
-    loop_count: u16,
+    loop_count: Option<u16>,
     crop: &MemberAvatarCrop,
     width: u32,
     height: u32,
@@ -1660,6 +1728,7 @@ fn validate_normalized_gif(
         ));
     }
     let info = parse_gif_info(bytes)?;
+    validate_gif_resources(&info)?;
     if info.width != width || info.height != height {
         return Err(MemberAvatarImportError::invalid(
             "Avatar dimensions do not match",
@@ -2282,7 +2351,7 @@ mod tests {
     }
 
     #[test]
-    fn reject_animated_png_ignores_trailing_bytes_after_iend() {
+    fn upload_png_accepts_trailing_metadata_but_managed_assets_reject_it() {
         let mut bytes = encode_png(&DynamicImage::new_rgba8(300, 300)).unwrap();
         let iend_end = iend_chunk_end(&bytes).unwrap();
         assert_eq!(iend_end, bytes.len());
@@ -2290,7 +2359,9 @@ mod tests {
         for index in 0..281 {
             bytes.push(((index * 37) % 251) as u8);
         }
-        assert!(reject_animated_png(&bytes).is_ok());
+        assert_eq!(inspect_upload_png(&bytes).unwrap(), iend_end);
+        assert!(reject_animated_png(&bytes).is_err());
+        assert!(validate_normalized_png(&bytes, 300, 300, NORMALIZED_MAXIMUM_EDGE).is_err());
     }
 
     #[test]
@@ -2399,12 +2470,118 @@ mod tests {
         assert_eq!(icon_frames[0].delay_centiseconds, 10);
         assert_eq!(icon_frames[1].delay_centiseconds, 10);
 
+        let static_icon = read_managed_member_avatar_static_icon(&directory, &summary.avatar_ref)
+            .unwrap()
+            .unwrap();
+        assert_eq!(static_icon.media_type, "image/png");
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(static_icon.base64)
+            .unwrap();
+        let cover = image::load_from_memory_with_format(&png, ImageFormat::Png)
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(cover, icon_frames[0].image);
+
         // Materialization exposes a .gif file so consumers keep the animation.
         let portrait_path =
             materialize_member_avatar(&directory, &directory, &summary.avatar_ref, true).unwrap();
         assert!(portrait_path.ends_with(".gif"));
         assert!(Path::new(&portrait_path).is_file());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    // Pure codec owner: disposal, partial frames and absent/finite/infinite
+    // loops must survive cropping; no filesystem or complete Core fixture.
+    #[test]
+    fn gif_crop_preserves_transparency_disposal_and_loop_semantics() {
+        use std::borrow::Cow;
+        for loop_count in [None, Some(0), Some(3)] {
+            for disposal in [
+                DisposalMethod::Keep,
+                DisposalMethod::Background,
+                DisposalMethod::Previous,
+            ] {
+                let mut bytes = Vec::new();
+                {
+                    let mut encoder =
+                        GifEncoder::new(&mut bytes, 256, 256, &[0, 0, 0, 255, 0, 0, 0, 255, 0])
+                            .unwrap();
+                    if let Some(count) = loop_count {
+                        encoder
+                            .set_repeat(if count == 0 {
+                                Repeat::Infinite
+                            } else {
+                                Repeat::Finite(count)
+                            })
+                            .unwrap();
+                    }
+                    for (left, color, delay, dispose) in
+                        [(0, 1, 7, disposal), (128, 2, 13, DisposalMethod::Keep)]
+                    {
+                        encoder
+                            .write_frame(&GifFrame {
+                                width: 128,
+                                height: 256,
+                                left,
+                                delay,
+                                dispose,
+                                transparent: Some(0),
+                                buffer: Cow::Owned(vec![color; 128 * 256]),
+                                ..GifFrame::default()
+                            })
+                            .unwrap();
+                    }
+                }
+                let frames = decode_composited_gif_frames(&bytes).unwrap();
+                let icon = crop_gif_frames_to_icon(
+                    &frames,
+                    loop_count,
+                    &default_member_avatar_crop(256, 256),
+                    256,
+                    256,
+                )
+                .unwrap();
+                let output = decode_composited_gif_frames(&icon).unwrap();
+                assert_eq!(parse_gif_info(&icon).unwrap().loop_count, loop_count);
+                assert_eq!(
+                    gif_decoder(&icon).unwrap().repeat(),
+                    match loop_count {
+                        None => Repeat::Finite(0),
+                        Some(0) => Repeat::Infinite,
+                        Some(n) => Repeat::Finite(n),
+                    }
+                );
+                assert_eq!(
+                    output
+                        .iter()
+                        .map(|f| f.delay_centiseconds)
+                        .collect::<Vec<_>>(),
+                    vec![7, 13]
+                );
+                assert_eq!(
+                    output[1].image.get_pixel(48, 96).0,
+                    if disposal == DisposalMethod::Keep {
+                        [255, 0, 0, 255]
+                    } else {
+                        [0, 0, 0, 0]
+                    }
+                );
+                assert_eq!(output[1].image.get_pixel(144, 96).0, [0, 255, 0, 255]);
+                // Strip comments, unrelated applications and trailing bytes,
+                // keeping the rendering stream (including the loop extension).
+                let canonical = bytes.clone();
+                let mut metadata = vec![0x21, 0xfe, 6];
+                metadata.extend_from_slice(b"SECRET");
+                metadata.push(0);
+                metadata.extend_from_slice(&[0x21, 0xff, 11]);
+                metadata.extend_from_slice(b"VENDOR01abc");
+                metadata.extend_from_slice(&[3, 1, 2, 3, 0]);
+                bytes.splice(25..25, metadata); // header + four-entry global palette
+                bytes.extend_from_slice(b"TRAILING_METADATA");
+                let normalized = normalize_gif_source_bytes(&bytes, &frames, loop_count).unwrap();
+                assert_eq!(normalized, canonical);
+            }
+        }
     }
 
     #[test]
@@ -2453,6 +2630,39 @@ mod tests {
                 .media_type,
             "image/gif"
         );
+        for (width, height) in [(4096, 256), (256, 4096), (4097, 256)] {
+            write_test_gif(&input, &[solid_rgba(width, height, [24, 48, 96, 255])]);
+            let left_edge_crop = MemberAvatarCrop {
+                center_x: f64::from(width.min(height)) / 2.0 / f64::from(width),
+                center_y: 0.5,
+                size: 1.0,
+            };
+            let original = prepare_member_avatar(
+                &directory,
+                Uuid::new_v4(),
+                &input,
+                Some(left_edge_crop),
+                false,
+            )
+            .unwrap();
+            assert!(
+                read_managed_member_avatar(&directory, &original.avatar_ref, true)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(original.source_width.min(original.source_height) < MINIMUM_DECODED_EDGE);
+            let recropped =
+                recrop_member_avatar(&directory, &original.avatar_ref, crop.clone()).unwrap();
+            assert!(
+                read_managed_member_avatar(&directory, &recropped.avatar_ref, false)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                recrop_member_avatar(&directory, &original.avatar_ref, crop.clone()).unwrap(),
+                recropped
+            );
+        }
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2484,8 +2694,36 @@ mod tests {
     fn gif_frame_count_helper_matches_import_and_rejects_static_only_bytes() {
         let gif = structure_gif(512, 512, 3, 2);
         assert_eq!(gif_frame_count_for(&gif).unwrap(), 3);
-        assert_eq!(parse_gif_info(&gif).unwrap().loop_count, 2);
+        assert_eq!(parse_gif_info(&gif).unwrap().loop_count, Some(2));
         let png = encode_png(&DynamicImage::new_rgba8(512, 512)).unwrap();
         assert!(gif_frame_count_for(&png).is_err());
+        assert_eq!(
+            parse_gif_info(&structure_gif(256, 256, 1, 0))
+                .unwrap()
+                .loop_count,
+            None
+        );
+        for end in 0..gif.len() {
+            assert!(parse_gif_info(&gif[..end]).is_err(), "truncation at {end}");
+        }
+        let mut outside = structure_gif(256, 256, 1, 0);
+        // Header + palette + graphic control = 27 bytes, then image descriptor.
+        outside[28..30].copy_from_slice(&256_u16.to_le_bytes());
+        assert!(decode_composited_gif_frames(&outside).is_err());
+        let mut oversized = gif.clone();
+        oversized.resize(SELECTED_FILE_BYTES as usize + 1, 0);
+        assert!(
+            save_managed_member_avatar_gif(
+                Path::new("unused"),
+                &oversized,
+                512,
+                512,
+                default_member_avatar_crop(512, 512),
+                3
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("10 MiB")
+        );
     }
 }

@@ -8,6 +8,7 @@ import { ResourceReferenceIcon } from './FilePreviewTabIcon'
 import { remarkRepairCjkUrlTail } from './remark-repair-cjk-url-tail'
 import { parseFileReference } from '../../file-preview-reference'
 import { MarkdownCodeBlock } from './MarkdownCodeBlock'
+import { MarkdownCodeFrame } from './MarkdownCodeFrame'
 import {
   fileReferenceSpacingClassName,
   visitMarkdownFileReferences,
@@ -257,13 +258,18 @@ export function SafeMarkdown({
               </p>
             )
           },
+          pre({ children: preChildren }) {
+            const block = markdownCodeBlock(preChildren)
+            if (!block) return <pre>{preChildren}</pre>
+            return (
+              <MarkdownCodeFrame code={inlineContentKeys === '[]' ? block.code : undefined}>
+                {mode === 'document'
+                  ? <MarkdownCodeBlock code={block.code} languageName={block.languageName} theme={theme} />
+                  : <pre>{preChildren}</pre>}
+              </MarkdownCodeFrame>
+            )
+          },
           ...(mode === 'document' ? {
-            pre({ children: preChildren }) {
-              const block = markdownCodeBlock(preChildren)
-              return block
-                ? <MarkdownCodeBlock code={block.code} languageName={block.languageName} theme={theme} />
-                : <pre>{preChildren}</pre>
-            },
             table({ children: tableChildren }) {
               return <div className="markdown-table-scroll"><table>{tableChildren}</table></div>
             }

@@ -531,7 +531,7 @@ fn camp_open_preserves_business_state_without_reading_event_history() {
 }
 
 #[test]
-fn camp_open_run_titles_survive_message_paging() {
+fn camp_open_run_titles_and_start_boundaries_survive_message_paging() {
     let (mut database, camp_id, completed_run, active_run) = business_fixture();
     let source_id: String = database.connection().query_row(
         "SELECT message_id FROM agent_run_input WHERE agent_run_id = ?1 ORDER BY ordinal LIMIT 1",
@@ -549,7 +549,8 @@ fn camp_open_run_titles_survive_message_paging() {
     database
         .connection()
         .execute(
-            "UPDATE agent_run SET anchor_message_id = 'open-agent-message' WHERE id = ?1",
+            "UPDATE agent_run SET anchor_message_id = 'open-agent-message',
+             current_public_tail_sequence = 2 WHERE id = ?1",
             [&active_run],
         )
         .unwrap();
@@ -626,7 +627,29 @@ fn camp_open_run_titles_survive_message_paging() {
         assert!(open.messages.iter().all(|message| message.id != source_id));
         for run in &open.agent_runs {
             assert_eq!(run.input_summary.as_deref(), expected, "{}", run.id);
+            // The immutable claim boundary survives after its message leaves
+            // the page; it must not become the newer public tail (32).
+            assert_eq!(
+                run.public_tail_sequence_at_start,
+                if run.id == active_run { Some(2) } else { None },
+                "{}",
+                run.id
+            );
         }
+    }
+    let snapshot = ReadModelService
+        .camp_snapshot(&mut database, &camp_id)
+        .unwrap();
+    for run in &snapshot.agent_runs {
+        let expected = if run.id == active_run {
+            json!(2)
+        } else {
+            Value::Null
+        };
+        assert_eq!(
+            serde_json::to_value(run).unwrap()["publicTailSequenceAtStart"],
+            expected
+        );
     }
 }
 

@@ -920,7 +920,6 @@ export interface SingleChatMessageView {
 
 export interface SingleChatRunView {
   id: string
-  nativeSessionReplaced?: boolean
   threadTurnId: string
   triggerConversationMessageId: string
   status: 'queued' | 'running' | 'waiting' | 'succeeded' | 'failed' | 'cancelled'
@@ -1861,12 +1860,12 @@ export interface AgentRunView {
   threadTurnId: string | null
   inputMessageIds?: string[]
   anchorMessageId?: string | null
+  /** Frozen public message boundary captured when Core claimed this Run's inputs. */
+  publicTailSequenceAtStart?: number | null
   /** Core-rendered title source, independent of the loaded conversation page. */
   inputSummary?: string | null
   /** At least one continuation Delivery was accepted for this Run; not an execution-eligibility lock. */
   hasAcceptedContinuation?: boolean
-  /** Native replacement succeeded; never emitted for an attempted or failed fallback. */
-  nativeSessionReplaced?: boolean
   conversationId: string
   agentId: string
   taskId: string | null
@@ -3457,7 +3456,7 @@ export interface MemberAvatarSourceSelection {
   byteLength: number
   /** Present only for animated GIF selections (frame/loop semantics). */
   frameCount?: number
-  loopCount?: number
+  loopCount?: number | null
 }
 
 export interface SaveMemberAvatarRasterInput {
@@ -3477,7 +3476,14 @@ export interface SaveMemberAvatarGifInput {
   crop: MemberAvatarCrop
 }
 
+export interface RecropMemberAvatarAssetInput {
+  kind: 'recrop'
+  avatarRef: string
+  crop: MemberAvatarCrop
+}
+
 export type SaveMemberAvatarAssetInput =
+  | RecropMemberAvatarAssetInput
   | SaveMemberAvatarRasterInput
   | SaveMemberAvatarGifInput
 
@@ -4443,3 +4449,5 @@ export interface MissionChangedFile { id: string; path: string; oldPath: string 
 export type CheckoutState = { kind: 'branch'; branch: string; head: string } | { kind: 'detached'; head: string } | { kind: 'unavailable' }
 export interface MissionWorkspaceChangesView { checkoutState: CheckoutState; viewId: string | null; files: MissionChangedFile[] | null; diffError: string | null }
 export interface MissionFileDiff { file: MissionChangedFile; patch: string; hunks: { oldStart: number; newStart: number; lines: { kind: 'addition' | 'deletion' | 'context' | 'metadata'; text: string; oldLine: number | null; newLine: number | null }[] }[] }
+
+export * from './member-avatar-image'

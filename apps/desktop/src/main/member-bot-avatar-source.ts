@@ -43,7 +43,10 @@ export class ControlledMemberBotAvatarSourceResolver implements MemberBotAvatarS
 
     if (parsed.kind === 'managed') {
       const rendition = await this.#managedAvatars.read(avatarRef, 'icon')
-      if (!rendition) throw new Error('feishu_member_bot_avatar_unavailable')
+      if (!rendition || rendition.mediaType !== 'image/png'
+        || rendition.width !== MEMBER_AVATAR_LIMITS.iconEdge || rendition.height !== MEMBER_AVATAR_LIMITS.iconEdge) {
+        throw new Error('feishu_member_bot_avatar_unavailable')
+      }
       return {
         pngBytes: rendition.bytes,
         width: rendition.width,

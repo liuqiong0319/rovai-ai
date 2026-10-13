@@ -4,6 +4,7 @@ import type { NormalizedMemberAvatarSource } from './member-avatar-image'
 export type PendingMemberAvatarSource = NormalizedMemberAvatarSource & {
   crop: MemberAvatarCrop
   needsSave: boolean
+  sourceAvatarRef?: string
 }
 
 export interface PersistedMemberAvatar {

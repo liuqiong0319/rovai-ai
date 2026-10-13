@@ -36,7 +36,7 @@ const identity = () => b.evaluate(`(() => {const row=document.querySelector('${r
 try {
   await b.send('Page.navigate',{url:pathToFileURL(join(root,'rovai-teammate-presence.html')).href})
   await b.wait('!!window.__presence && !!document.querySelector(".composer-box")')
-  for (const [name,total] of Object.entries({stream:5,parallel:5,single:5,interleaved:6,same_member:5,followup:5,failed:3,silent:3})) {
+  for (const [name,total] of Object.entries({stream:5,parallel:5,single:5,interleaved:6,same_member:5,followup:6,failed:3,silent:3})) {
     for(let n=0;n<total;n++) {
       await scenario(name,n)
       const result=await b.evaluate('__presence.verify()')
@@ -46,6 +46,22 @@ try {
     }
     console.log(`PASS ${name}: ${total} stages`)
   }
+
+  // Explicit DOM expectations: do not use the projector itself as the oracle.
+  const followupOrder = () => b.evaluate(`Array.from(document.querySelectorAll('[data-message-id],[data-presence-run],.member-joined-card,.run-file-changes-card')).map(e => e.dataset.messageId ?? (e.dataset.presenceRun ? 'run-presence:'+e.dataset.presenceRun : e.classList.contains('member-joined-card') ? 'joined' : 'files'))`)
+  const fixedStart = ['history-user','history-alice','request-main','followup-1','followup-2','reply-alice','joined','files','run-presence:run-alice-next','followup-peer']
+  await scenario('followup',3)
+  assert.deepEqual(await followupOrder(),fixedStart)
+  assert.equal(await b.evaluate(`document.querySelector('[data-presence-run="run-alice-next"]').dataset.continuation`),'false')
+  assert.equal(await b.evaluate(`document.querySelectorAll('[data-message-output-id="reply-alice"] .run-result-stack > article').length`),2)
+  await b.evaluate('__presence.resync()'); await settle()
+  assert.deepEqual(await followupOrder(),fixedStart)
+  await b.capture(join(out,'followup-start-after-output-group.png'))
+  await stage(4)
+  assert.deepEqual(await followupOrder(),[...fixedStart.filter(id=>!id.startsWith('run-presence:')),'reply-followup','run-presence:run-alice-next'])
+  assert.equal(await b.evaluate(`document.querySelector('[data-presence-run="run-alice-next"]').dataset.continuation`),'true')
+  await b.capture(join(out,'followup-own-publication.png'))
+  report.interactions.push('queued follow-up starts after the previous reply, joined and Files Changed cards; later peer message and resync preserve position; only its own publication advances it')
 
   // A real incremental evidence stream, not a CSS animation of a completed body.
   await scenario('stream',0)
@@ -100,6 +116,15 @@ try {
   report.interactions.push('authoritative initialization changes to accepted-request fallback in the same row')
 
   await scenario('stream',1)
+  const activeCommand = await b.evaluate('document.querySelector(".run-presence-preview").textContent')
+  assert.match(activeCommand,/rg -n/)
+  await b.evaluate('__presence.showStartupStatus("runtime_initializing",true)'); await settle()
+  assert.equal(await b.evaluate('document.querySelector(".run-presence-preview").textContent'),activeCommand)
+  await b.capture(join(out,'command-before-input-ack.png'))
+  await b.evaluate('__presence.showStartupStatus(null,true)'); await settle()
+  assert.equal(await b.evaluate('document.querySelector(".run-presence-preview").textContent'),activeCommand)
+  report.interactions.push('current-epoch command remains visible before and after a delayed input ACK')
+
   const openContext = async () => {
     const point = await b.evaluate('(() => {const r=document.querySelector(".run-presence-open").getBoundingClientRect();return {x:r.x+80,y:r.y+r.height/2}})()')
     await b.send('Input.dispatchMouseEvent',{type:'mousePressed',...point,button:'right',clickCount:1})

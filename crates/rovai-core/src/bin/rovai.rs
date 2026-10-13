@@ -1649,7 +1649,7 @@ fn render_flat_input_help(output: &mut String, description: &BuiltinToolDescript
                     "Supply center X, center Y and size together to crop the source. Centers: 0-1; size: 0.12-1; the crop must fit inside the source."
                 }
                 "avatarFile" => {
-                    "Run-readable PNG/JPEG source. Replaces the portrait and generates its icon; omit the crop fields to use the default crop."
+                    "Run-readable PNG/JPEG/GIF source. Replaces the portrait and generates its icon; omit the crop fields to use the default crop."
                 }
                 "avatarSize" => {
                     "With all crop fields and no avatarFile, re-crop the existing source without replacing the portrait."
@@ -1725,7 +1725,7 @@ fn render_flat_input_help(output: &mut String, description: &BuiltinToolDescript
         if description.name == "member.create" && argument.field == "avatarFile" {
             writeln!(
                 output,
-                "      Optional run-readable PNG/JPEG path. If unavailable, omit it and Rovai uses the default avatar."
+                "      Optional run-readable PNG/JPEG/GIF path. If unavailable, omit it and Rovai uses the default avatar."
             )
                 .expect("writing help to a String cannot fail");
         }

@@ -1886,11 +1886,11 @@ html.file-preview-resizing .file-preview-pane { pointer-events: none; }
   .file-preview-markdown { padding-top: 38px; }
   .file-preview-markdown-document { max-width: 1120px; }
   .file-preview-markdown .safe-markdown > * { width: 100%; max-width: 860px; }
-  .file-preview-markdown .safe-markdown > :is(pre, .markdown-table-scroll) { max-width: none; }
+  .file-preview-markdown .safe-markdown > :is(pre, .markdown-code-frame, .markdown-table-scroll) { max-width: none; }
 }
 @container file-preview-pane (min-width: 1200px) {
   .file-preview-markdown .safe-markdown > * { max-width: 930px; }
-  .file-preview-markdown .safe-markdown > :is(pre, .markdown-table-scroll) { max-width: none; }
+  .file-preview-markdown .safe-markdown > :is(pre, .markdown-code-frame, .markdown-table-scroll) { max-width: none; }
 }
 @container file-preview-pane (max-width: 480px) {
   .file-preview-metadata-row { grid-template-columns: 104px minmax(0, 1fr); }
@@ -3543,7 +3543,7 @@ button.camp-world-map-live-caption { cursor: pointer; font: inherit; }
 .run-message-state.tone-neutral { color: var(--muted); }
 .agent-run-message.is-cancelling .bubble-meta > strong { color: var(--muted); }
 .conversation-bubble p { margin: 0; overflow-wrap: anywhere; font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
-.safe-markdown { min-width: 0; overflow-wrap: anywhere; color: inherit; font-size: 13px; line-height: 1.65; }
+.safe-markdown { --markdown-code-line: var(--evidence-line); --markdown-code-canvas: var(--code-block-canvas); --markdown-code-radius: 6px; min-width: 0; overflow-wrap: anywhere; color: inherit; font-size: 13px; line-height: 1.65; }
 .safe-markdown > :first-child { margin-top: 0; }
 .safe-markdown > :last-child { margin-bottom: 0; }
 .safe-markdown p { margin: 0 0 9px; white-space: normal; }
@@ -3551,7 +3551,7 @@ button.camp-world-map-live-caption { cursor: pointer; font: inherit; }
 .safe-markdown ul, .safe-markdown ol { margin: 7px 0 10px; padding-left: 21px; }
 .safe-markdown li + li { margin-top: 3px; }
 .safe-markdown blockquote { margin: 8px 0; padding: 3px 10px; border-left: 3px solid var(--line-strong); color: var(--muted); }
-.safe-markdown pre { max-width: 100%; margin: 9px 0; overflow: auto; padding: 9px 10px; border: 1px solid var(--evidence-line); border-radius: 6px; color: var(--evidence-ink); background: var(--code-block-canvas); font: 11px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre; }
+.safe-markdown pre { max-width: 100%; margin: 9px 0; overflow: auto; padding: 9px 10px; border: 1px solid var(--markdown-code-line); border-radius: var(--markdown-code-radius); color: var(--evidence-ink); background: var(--markdown-code-canvas); font: 11px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre; }
 .safe-markdown code { padding: 0 2px; border-radius: 3px; color: var(--evidence-ink); background: var(--inline-code-canvas); font: .9em/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .safe-markdown .markdown-file-reference code { color: inherit; }
 .safe-markdown pre code { padding: 0; background: transparent; font-size: inherit; }
@@ -3560,7 +3560,10 @@ button.camp-world-map-live-caption { cursor: pointer; font: inherit; }
 .file-preview-markdown .safe-markdown code { padding: 1px 4px; border-radius: 6px; background: var(--conversation-inline-code-canvas); box-decoration-break: clone; -webkit-box-decoration-break: clone; }
 .conversation-bubble :is(.final-copy, .message-bubble) .safe-markdown pre,
 .execution-drawer .safe-markdown pre,
-.file-preview-markdown .safe-markdown pre { padding: 11px 12px; border-color: var(--conversation-code-line); border-radius: 8px; background: var(--conversation-code-block-canvas); }
+.file-preview-markdown .safe-markdown pre { padding: 11px 12px; }
+.conversation-bubble :is(.final-copy, .message-bubble) .safe-markdown,
+.execution-drawer .safe-markdown,
+.file-preview-markdown .safe-markdown { --markdown-code-line: var(--conversation-code-line); --markdown-code-canvas: var(--conversation-code-block-canvas); --markdown-code-radius: 8px; }
 .conversation-bubble :is(.final-copy, .message-bubble) .safe-markdown pre code,
 .execution-drawer .safe-markdown pre code,
 .file-preview-markdown .safe-markdown pre code { padding: 0; border-radius: 0; background: transparent; }
@@ -3588,6 +3591,24 @@ button.camp-world-map-live-caption { cursor: pointer; font: inherit; }
 .safe-markdown.is-document li + li { margin-top: 4px; }
 .safe-markdown.is-document blockquote { margin: 15px 0 17px; padding: 5px 13px; }
 .safe-markdown.is-document pre { margin: 16px 0 19px; padding: 13px 14px; font-size: 13px; line-height: 1.65; }
+/* The copy gutter stays outside the code's horizontal scroll area. */
+.markdown-code-frame { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) 36px; min-width: 0; max-width: 100%; margin: 9px 0; border: 1px solid var(--markdown-code-line); border-radius: var(--markdown-code-radius); background: var(--markdown-code-canvas); }
+.safe-markdown.is-document .markdown-code-frame { margin: 16px 0 19px; }
+.safe-markdown > .markdown-code-frame:first-child { margin-top: 0; }
+.safe-markdown > .markdown-code-frame:last-child { margin-bottom: 0; }
+.safe-markdown .markdown-code-frame > pre { min-width: 0; margin: 0; border: 0; background: transparent; }
+.markdown-code-corner { position: sticky; top: 8px; align-self: start; margin-top: 7px; padding-right: 7px; user-select: none; }
+.markdown-code-copy { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 5px; color: var(--muted); background: transparent; cursor: pointer; }
+.markdown-code-copy svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.markdown-code-copy:hover, .markdown-code-copy:focus-visible { color: var(--ink); background: var(--neutral-selected); }
+.markdown-code-copy:focus-visible { outline: 2px solid var(--muted); outline-offset: 2px; }
+.markdown-code-copy[data-copy-state="copied"] { color: var(--ink); }
+.markdown-code-copy:disabled { cursor: wait; }
+.markdown-code-manual textarea { width: 100%; height: min(300px, 40vh); resize: vertical; padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px; color: var(--ink); background: var(--surface-subtle); font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre; }
+@media (hover: none), (pointer: coarse) {
+  .markdown-code-frame { grid-template-columns: minmax(0, 1fr) 44px; }
+  .markdown-code-copy { width: 36px; height: 36px; }
+}
 .safe-markdown.is-document .markdown-table-scroll { max-width: 100%; margin: 17px 0 20px; overflow-x: auto; overscroll-behavior-x: contain; }
 .safe-markdown.is-document .markdown-table-scroll > table { display: table; width: max-content; min-width: 100%; margin: 0; overflow: visible; font-size: 14px; line-height: 1.55; }
 .safe-markdown.is-document th,
@@ -4796,7 +4817,7 @@ body:has(.composer-image-attachment[data-context-open="true"]) .image-action-not
   .conversation-bubble.agent .safe-markdown > :where(p, h3, h4, ul, ol, blockquote) {
     max-width: var(--conversation-prose-width);
   }
-  .conversation-bubble.agent .safe-markdown > :where(pre, table) {
+  .conversation-bubble.agent .safe-markdown > :where(pre, .markdown-code-frame, table) {
     width: min(var(--conversation-artifact-width), 100%);
   }
 }

@@ -8,7 +8,7 @@ last_updated: 2026-10-12
 
 # Camp Open Read Path 架构
 
-字段与窗口见 [Camp Open Projection v26](../contracts/camp-open-projection-v26.md)与
+字段与窗口见 [Camp Open Projection v27](../contracts/camp-open-projection-v27.md)与
 [Camp Conversation Find v1](../contracts/camp-conversation-find-v1.md)。本架构把“进入会话”、
 “继续阅读”、“查找完整当前会话”和“检查运行详情”分成用途明确的接口，同时保持 SQLite Read Side
 为唯一权威。
@@ -136,7 +136,7 @@ Renderer 不通过 event replay 补齐权威对象。
 ## 用户消息目录与定位窗口
 
 进入 Thread 时先取得并展示正文首屏，再由页面独立读取完整用户目录；同一有效目录请求合并，不在激活／恢复时预取。
-Core 仅选择直接 reply 到目标用户消息的首条有效队员回复，悬浮／聚焦后才读取一个摘要，不使用 Run／Turn 推断。详见 [全会话导航合同](../contracts/camp-open-projection-v26.md)。
+Core 仅选择直接 reply 到目标用户消息的首条有效队员回复，悬浮／聚焦后才读取一个摘要，不使用 Run／Turn 推断。详见 [全会话导航合同](../contracts/camp-open-projection-v27.md)。
 正文保持原有连续分页。Renderer 的锚点局部模块持有目录、访问过的预览与单个可替换定位窗口；不把 around 消息
 回填到正常正文 coverage。只在展示层按 ID/版本合并；读取窗口与真实 next-row 边界证明缺口，分页入口和自动加载
 均留在正常连续区间之前。已有通知、引用、查找读取不扩展成统一窗口框架。
@@ -208,7 +208,7 @@ Memory 仍分别拥有读取与错误状态，但冷启动可见反馈共用不�
 
 - [Core 受管内容不变量](foundational-invariants.md#core-managed-content)
 - [协作与执行准入不变量](foundational-invariants.md#collaboration-admission)
-- [Camp Open Projection v26](../contracts/camp-open-projection-v26.md)
+- [Camp Open Projection v27](../contracts/camp-open-projection-v27.md)
 - [Camp Conversation Find v1](../contracts/camp-conversation-find-v1.md)
 - [Desktop Navigation Refresh](desktop-navigation-refresh.md)
 

@@ -1166,7 +1166,7 @@ fn build_builtin_tool_definitions() -> Vec<Value> {
         json!({
             "name": MEMBER_CREATE_TOOL_NAME,
             "title": "Create a confirmed Rovai member",
-            "description": "Create one durable Rovai member from the final member card only after the user explicitly confirms it in this direct user-triggered run. Reuse creationKey only for an exact retry. avatarFile is optional and must name a run-readable local PNG or JPEG; Rovai safely normalizes and imports it without persisting the path. If image preparation is unavailable or fails, retry without avatarFile to use the default avatar.",
+            "description": "Create one durable Rovai member from the final member card only after the user explicitly confirms it in this direct user-triggered run. Reuse creationKey only for an exact retry. avatarFile is optional and must name a run-readable local PNG, JPEG or GIF; Rovai safely normalizes and imports it without persisting the path. If image preparation is unavailable or fails, retry without avatarFile to use the default avatar.",
             "inputSchema": member_create_input_schema(),
             "outputSchema": member_create_success_schema()
         }),

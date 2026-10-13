@@ -448,7 +448,12 @@ function requireMemberAvatars(): MemberAvatarAssetService {
 }
 
 const memberBotAvatarSource = new ControlledMemberBotAvatarSourceResolver({
-  read: (...args) => requireMemberAvatars().read(...args)
+  read: async (avatarRef) => {
+    const image = await core.request<{
+      base64: string; mediaType: 'image/png'; width: number; height: number; crop: import('@contracts').MemberAvatarCrop
+    } | null>('memberAvatars.read', { avatarRef, rendition: 'icon', staticPng: true })
+    return image ? { ...image, bytes: Uint8Array.from(Buffer.from(image.base64, 'base64')) } : null
+  }
 })
 const channelCredentialStore = new SqliteChannelCredentialStore(core)
 const channelDeveloperSessionStore = new SqliteChannelDeveloperSessionStore(core)
@@ -1744,6 +1749,9 @@ ipcMain.handle('rovai:member-avatar-select-source', async () => {
 ipcMain.handle(
   'rovai:member-avatar-save',
   async (_event, input: SaveMemberAvatarAssetInput) => {
+    if (input.kind === 'recrop') {
+      return core.request('memberAvatars.save', { kind: 'recrop', avatarRef: input.avatarRef, crop: input.crop })
+    }
     if (input.kind === 'gif') {
       return core.request('memberAvatars.save', {
         kind: 'gif',

@@ -8840,84 +8840,122 @@ impl Core {
                 struct Read {
                     avatar_ref: String,
                     rendition: String,
+                    #[serde(default)]
+                    static_png: bool,
                 }
                 let params: Read = serde_json::from_value(request.params.clone())?;
                 anyhow::ensure!(
                     matches!(params.rendition.as_str(), "icon" | "portrait"),
                     "Avatar rendition is invalid"
                 );
-                Ok(serde_json::to_value(
+                anyhow::ensure!(
+                    !params.static_png || params.rendition == "icon",
+                    "Only icons support a static PNG rendition"
+                );
+                let image = if params.static_png {
+                    rovai_core::member_avatar::read_managed_member_avatar_static_icon(
+                        &self.data_dir,
+                        &params.avatar_ref,
+                    )?
+                } else {
                     rovai_core::member_avatar::read_managed_member_avatar(
                         &self.data_dir,
                         &params.avatar_ref,
                         params.rendition == "portrait",
-                    )?,
-                )?)
+                    )?
+                };
+                Ok(serde_json::to_value(image)?)
             }
             "memberAvatars.save" => {
                 use base64::Engine;
                 #[derive(Deserialize)]
-                #[serde(rename_all = "camelCase", deny_unknown_fields)]
-                struct Save {
-                    kind: Option<String>,
-                    source_base64: Option<String>,
-                    icon_base64: Option<String>,
-                    source_gif_base64: Option<String>,
-                    source_width: u32,
-                    source_height: u32,
-                    crop: rovai_core::member_avatar::MemberAvatarCrop,
+                #[serde(
+                    tag = "kind",
+                    rename_all = "camelCase",
+                    rename_all_fields = "camelCase",
+                    deny_unknown_fields
+                )]
+                enum Save {
+                    Raster {
+                        source_base64: String,
+                        icon_base64: String,
+                        source_width: u32,
+                        source_height: u32,
+                        crop: rovai_core::member_avatar::MemberAvatarCrop,
+                    },
+                    Gif {
+                        source_gif_base64: String,
+                        source_width: u32,
+                        source_height: u32,
+                        crop: rovai_core::member_avatar::MemberAvatarCrop,
+                    },
+                    Recrop {
+                        avatar_ref: String,
+                        crop: rovai_core::member_avatar::MemberAvatarCrop,
+                    },
                 }
-                let params: Save = serde_json::from_value(request.params.clone())?;
-                match params.kind.as_deref() {
-                    None | Some("raster") => {
-                        let source = params.source_base64.as_deref().ok_or_else(|| {
-                            anyhow::anyhow!("Raster avatar save requires sourceBase64")
-                        })?;
-                        let icon = params.icon_base64.as_deref().ok_or_else(|| {
-                            anyhow::anyhow!("Raster avatar save requires iconBase64")
-                        })?;
+                let mut value = request.params.clone();
+                // Existing static clients omit kind.
+                if let Some(object) = value.as_object_mut() {
+                    object.entry("kind").or_insert(json!("raster"));
+                }
+                let params: Save = serde_json::from_value(value)?;
+                let summary = match params {
+                    Save::Raster {
+                        source_base64,
+                        icon_base64,
+                        source_width,
+                        source_height,
+                        crop,
+                    } => {
                         anyhow::ensure!(
-                            source.len() <= 23 * 1024 * 1024 && icon.len() <= 1400 * 1024,
+                            source_base64.len() <= 23 * 1024 * 1024
+                                && icon_base64.len() <= 1400 * 1024,
                             "Avatar exceeds the managed asset limit"
                         );
-                        let source = base64::engine::general_purpose::STANDARD.decode(source)?;
-                        let icon = base64::engine::general_purpose::STANDARD.decode(icon)?;
-                        Ok(serde_json::to_value(
-                            rovai_core::member_avatar::save_managed_member_avatar(
-                                &self.data_dir,
-                                &source,
-                                &icon,
-                                params.source_width,
-                                params.source_height,
-                                params.crop,
-                            )?,
-                        )?)
+                        let source =
+                            base64::engine::general_purpose::STANDARD.decode(source_base64)?;
+                        let icon = base64::engine::general_purpose::STANDARD.decode(icon_base64)?;
+                        rovai_core::member_avatar::save_managed_member_avatar(
+                            &self.data_dir,
+                            &source,
+                            &icon,
+                            source_width,
+                            source_height,
+                            crop,
+                        )?
                     }
-                    Some("gif") => {
-                        let source_gif = params.source_gif_base64.as_deref().ok_or_else(|| {
-                            anyhow::anyhow!("GIF avatar save requires sourceGifBase64")
-                        })?;
+                    Save::Gif {
+                        source_gif_base64,
+                        source_width,
+                        source_height,
+                        crop,
+                    } => {
                         anyhow::ensure!(
-                            source_gif.len() <= 14 * 1024 * 1024,
+                            source_gif_base64.len() <= 14 * 1024 * 1024,
                             "Avatar exceeds the managed asset limit"
                         );
-                        let source_gif =
-                            base64::engine::general_purpose::STANDARD.decode(source_gif)?;
-                        let frame_count =
-                            rovai_core::member_avatar::gif_frame_count_for(&source_gif)?;
-                        Ok(serde_json::to_value(
-                            rovai_core::member_avatar::save_managed_member_avatar_gif(
-                                &self.data_dir,
-                                &source_gif,
-                                params.source_width,
-                                params.source_height,
-                                params.crop,
-                                frame_count,
-                            )?,
-                        )?)
+                        let source =
+                            base64::engine::general_purpose::STANDARD.decode(source_gif_base64)?;
+                        let frame_count = rovai_core::member_avatar::gif_frame_count_for(&source)?;
+                        rovai_core::member_avatar::save_managed_member_avatar_gif(
+                            &self.data_dir,
+                            &source,
+                            source_width,
+                            source_height,
+                            crop,
+                            frame_count,
+                        )?
                     }
-                    Some(_) => Err(anyhow::anyhow!("Unsupported avatar save kind")),
-                }
+                    Save::Recrop { avatar_ref, crop } => {
+                        rovai_core::member_avatar::recrop_member_avatar(
+                            &self.data_dir,
+                            &avatar_ref,
+                            crop,
+                        )?
+                    }
+                };
+                Ok(serde_json::to_value(summary)?)
             }
             "members.list" => {
                 let database = self.database.lock().await;
@@ -15729,6 +15767,9 @@ impl Core {
                     uuid::Uuid::new_v4()
                 );
                 launch_permit.check_cancelled()?;
+                // Failed activation has retired the previous Host and its
+                // process-scoped tools. Prepare the replacement before spawn.
+                let replacement_builtin_tools = self.prepare_builtin_tool_process_config()?;
                 let replacement = self
                     .pi
                     .ensure_agent_run_runtime(PiAgentRunRuntimeRequest {
@@ -15745,7 +15786,7 @@ impl Core {
                         native_binding_id: &replacement_binding.native_binding_id,
                         native_binding_generation: replacement_binding.native_binding_generation,
                         bootstrap: &replacement_bootstrap,
-                        builtin_tools: &builtin_tools,
+                        builtin_tools: &replacement_builtin_tools,
                     })
                     .await
                     .with_context(|| {
@@ -17354,6 +17395,7 @@ impl Core {
                         &runtime_compatibility_digest,
                     )
                     .await?;
+                    let replacement_builtin_tools = self.prepare_builtin_tool_process_config()?;
                     runtime = adapter
                         .ensure_agent_run_runtime(
                             &execution.agent_run_id,
@@ -17364,7 +17406,7 @@ impl Core {
                             &execution.workspace,
                             execution.permission_semantics,
                             &execution.runtime,
-                            &builtin_tools,
+                            &replacement_builtin_tools,
                             &mcp_projection.servers,
                             &mcp_projection.projection_digest,
                             attachment_access_root,
@@ -17470,6 +17512,9 @@ impl Core {
                 self.persist_runtime_compatibility_digest(execution, &runtime_compatibility_digest)
                     .await?;
                 launch_permit.check_cancelled()?;
+                // forget_agent_run retired the old run-tmp and tool identity.
+                // The CLI may validate these paths before we can bind its lease.
+                let replacement_builtin_tools = self.prepare_builtin_tool_process_config()?;
                 runtime = adapter
                     .ensure_agent_run_runtime(
                         &execution.agent_run_id,
@@ -17480,7 +17525,7 @@ impl Core {
                         &execution.workspace,
                         execution.permission_semantics,
                         &execution.runtime,
-                        &builtin_tools,
+                        &replacement_builtin_tools,
                         &mcp_projection.servers,
                         &mcp_projection.projection_digest,
                         attachment_access_root,

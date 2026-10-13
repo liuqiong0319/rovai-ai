@@ -1,3 +1,5 @@
+import { copyCode } from './code-copy'
+
 let installed = false
 
 export function installInteractions() {
@@ -10,19 +12,7 @@ export function installInteractions() {
 
     const copy = target.closest<HTMLButtonElement>('.prompt-copy')
     if (copy) {
-      const prompt = copy.previousElementSibling
-      if (!prompt) return
-      try {
-        await navigator.clipboard.writeText(prompt.textContent || '')
-        copy.textContent = document.body.dataset.lang === 'zh' ? '已复制' : 'Copied'
-      } catch {
-        const selection = getSelection()
-        const range = document.createRange()
-        range.selectNodeContents(prompt)
-        selection?.removeAllRanges()
-        selection?.addRange(range)
-        copy.textContent = document.body.dataset.lang === 'zh' ? '已选中，请用键盘复制' : 'Selected — copy with keyboard'
-      }
+      await copyCode(copy)
       return
     }
 

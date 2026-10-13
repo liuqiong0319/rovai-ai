@@ -10,8 +10,9 @@ import {
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { randomUUID } from 'node:crypto'
-import { afterEach, describe, expect, it } from 'vitest'
-import { MEMBER_AVATAR_LIMITS } from '@contracts'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { MEMBER_AVATAR_LIMITS, inspectMemberAvatarUpload } from '@contracts'
+import { browserMemberAvatars } from '../../../web/src/member-avatars'
 import {
   inspectGif,
   inspectImage,
@@ -25,6 +26,7 @@ import {
 const temporaryDirectories: string[] = []
 
 afterEach(async () => {
+  vi.unstubAllGlobals()
   await Promise.all(
     temporaryDirectories.splice(0).map((directory) =>
       rm(directory, { recursive: true, force: true })
@@ -78,6 +80,7 @@ describe('member avatar image inspection', () => {
     // ① Tolerant entry: same PNG passes and reports the exact canonical boundary.
     const upload = inspectMemberAvatarUploadPng(withTail)
     expect(upload.iendOffset).toBe(png.byteLength)
+    expect(inspectMemberAvatarUpload(withTail).bytes).toEqual(png)
     expect([upload.width, upload.height]).toEqual([582, 584])
 
     // ② The shared strict parser is unchanged and rejects the same bytes.
@@ -116,6 +119,19 @@ describe('member avatar image inspection', () => {
       loopCount: 0
     })
     expect(inspectGif(makeGif(256, 256, 3, 5)).loopCount).toBe(5)
+    expect(inspectGif(makeGif(256, 256, 1, null)).loopCount).toBeNull()
+    // Browser file MIME is advisory: both clients sniff the same bytes.
+    let changed: (() => void) | undefined
+    const input = {
+      files: [{ name: 'renamed.png', type: 'image/png', size: gif.byteLength, arrayBuffer: async () => gif.buffer }],
+      addEventListener: (type: string, listener: () => void) => { if (type === 'change') changed = listener },
+      click: () => changed?.(), remove: () => undefined
+    }
+    vi.stubGlobal('document', { createElement: () => input, body: { append: () => undefined } })
+    const browser = browserMemberAvatars({ avatar: vi.fn() } as never)
+    const browserImage = await browser.selectSource()
+    expect(browserImage).toMatchObject({ mediaType: 'image/gif', frameCount: 2, loopCount: 0 })
+    expect(browserImage?.bytes).toEqual(gif)
     const directory = await temporaryDirectory()
     const path = join(directory, 'animated.gif')
     await writeFile(path, gif)
@@ -137,6 +153,16 @@ describe('member avatar image inspection', () => {
     )
     expect(() => inspectGif(makeGif(255, 512, 1, 0))).toThrow('below the minimum')
     expect(() => inspectGif(makeGif(512, 512, 0, 0))).toThrow('contains no frames')
+    const looping = makeGif(256, 256, 1, 3)
+    for (let end = 0; end < looping.byteLength; end++) {
+      expect(() => inspectGif(looping.subarray(0, end))).toThrow()
+    }
+    const outside = makeGif(256, 256, 1, null)
+    writeU16LE(outside, 28, 256)
+    expect(() => inspectGif(outside)).toThrow('canvas bounds')
+    const unknownApp = Uint8Array.from(looping)
+    unknownApp.set(new TextEncoder().encode('VENDOR01abc'), 22)
+    expect(inspectGif(unknownApp)).toMatchObject({ frameCount: 1, loopCount: null })
     expect(() => inspectGif(makePng(512, 512))).toThrow('Unsupported')
   })
 })
@@ -310,7 +336,7 @@ function makeGif(
   width: number,
   height: number,
   frameCount: number,
-  loopCount: number
+  loopCount: number | null
 ): Uint8Array {
   const parts: Uint8Array[] = [new TextEncoder().encode('GIF89a')]
   const lsd = new Uint8Array(7)
@@ -319,7 +345,7 @@ function makeGif(
   lsd[4] = 0x80 | 0x00 // global color table, 2 entries
   parts.push(lsd)
   parts.push(Uint8Array.of(0, 0, 0, 255, 255, 255))
-  if (loopCount !== 0) {
+  if (loopCount !== null) {
     parts.push(
       Uint8Array.of(
         0x21, 0xff, 0x0b,

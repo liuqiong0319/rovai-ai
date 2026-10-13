@@ -97,8 +97,8 @@ export function AgentRunDeliveryRecipients({
   }
 
   if (!hasRecipients) return null
-  return <div className="execution-run-recipients" aria-label={uiAttribute("本次执行的协作投递对象")}>
-    <small><UiText zh={"协作投递"} /></small>
+  return <div className="execution-run-recipients" aria-label={uiAttribute("本次执行的消息接收队员")}>
+    <small title={uiAttribute("本次执行向这些队员发送了消息。")}><UiText zh={"协作"} /></small>
     <div className="execution-recipient-track" ref={trackRef}>
       {visible.map(recipient => <span
         key={recipient.agentId}

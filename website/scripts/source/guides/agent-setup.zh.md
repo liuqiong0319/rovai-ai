@@ -66,7 +66,7 @@ Rovai v0.4.7 补充读取的是**标准 Web Profile** 的模型配置；同名 P
 
 ## Codex 与 Claude Code 的账号、模型服务 {#native-settings}
 
-这两种智能体沿用自己的登录、Provider 和模型配置。Rovai 中的「启动设置」负责程序路径与子进程环境；账号、Key 和网关地址在对应智能体中管理。
+这两种智能体默认沿用自己的登录、Provider 和模型配置。Rovai 中的「启动设置」用于选择程序路径；需要让不同队员连接不同服务时，可以在队员的「运行配置 → 环境变量」中分别填写连接参数，见[一个 CLI，多个 Provider](https://rovai.dev/zh/docs/multiple-providers.html)。
 
 同时保留多个安装版本或配置目录时，Rovai 的程序路径和环境需要对应你已经登录的那一份。终端里能够运行、Rovai 却找不到程序时，可以在启动设置中填写可执行文件的绝对路径。
 

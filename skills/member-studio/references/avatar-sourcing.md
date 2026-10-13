@@ -12,7 +12,7 @@ Pass the local path through `--avatar-file`. Do not write directly to `userData/
 
 ## Image requirements
 
-- Static PNG or JPEG, at least 256 x 256, within the product byte limit.
+- PNG, JPEG or GIF, at least 256 x 256, within the product byte limit.
 - Prefer a 4:5 portrait at 1024 x 1280, with head and shoulders or upper body centered slightly above the middle.
 - Leave crop space; use a simple background without text, logos, watermarks, or complex borders.
 - Keep the central subject suitable for a square avatar.
@@ -33,7 +33,7 @@ Use available, authorized search or network capabilities when the user chooses t
 2. Public-domain or explicitly reusable collections.
 3. Other sources with a clear source page and license.
 
-Download the original static image, not a search thumbnail or unknown CDN hotlink. Retain the source page and available author, institution, license, or usage information. If provenance or permission is unclear, choose another image or omit the avatar.
+Download the original image file, not a search thumbnail or unknown CDN hotlink. Retain the source page and available author, institution, license, or usage information. If provenance or permission is unclear, choose another image or omit the avatar.
 
 ## Fallback
 
@@ -43,4 +43,6 @@ The default order is original generation, sourced image, then default avatar. Us
 
 Visually check a square crop using the image's shorter side, horizontally centered. For a 4:5 portrait, start about 3%-8% below the top. Keep the head, chin, and identifying features visible. The product creates the 192 x 192 icon; a finished icon file is unnecessary.
 
-Before creation, verify the readable static PNG/JPEG, dimensions and bytes against `rovai member create --help`, crop, and current-Run path. Match the confirmed identity without inferring identity facts from the image.
+Before creation, verify the readable PNG/JPEG/GIF, dimensions and bytes against `rovai member create --help`, crop, and current-Run path. Match the confirmed identity without inferring identity facts from the image.
+
+For GIF, pass the animation intact and prefer a stable subject within the square crop. Rovai applies the same crop to every frame.

@@ -341,7 +341,7 @@ impl MainThreadMigrationSource {
 }
 
 pub(crate) const CURRENT_DATA_CONTRACT_VERSION: &str = "v1.72";
-pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 147;
+pub(crate) const CURRENT_PROJECTION_SCHEMA_VERSION: i64 = 146;
 const V147_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.54";
 const V147_MIGRATION_SOURCE_PROJECTION_SCHEMA_VERSION: i64 = 96;
 const V145_MIGRATION_SOURCE_DATA_CONTRACT_VERSION: &str = "v1.53";
@@ -812,7 +812,6 @@ struct CurrentMigrationState {
     v194: bool,
     v195: bool,
     v196: bool,
-    v197: bool,
 }
 
 impl CurrentMigrationState {
@@ -834,19 +833,11 @@ impl CurrentMigrationState {
     }
 
     fn admits(&self, contract: &str, schema: i64, classifier: &str) -> bool {
-        if self.v197 {
-            let mut previous = *self;
-            previous.v197 = false;
-            return contract == CURRENT_DATA_CONTRACT_VERSION
-                && schema == CURRENT_PROJECTION_SCHEMA_VERSION
-                && self.v196
-                && previous.admits("v1.72", 146, classifier);
-        }
         if self.v196 {
             let mut previous = *self;
             previous.v196 = false;
             return contract == CURRENT_DATA_CONTRACT_VERSION
-                && schema == 146
+                && schema == CURRENT_PROJECTION_SCHEMA_VERSION
                 && self.v195
                 && previous.admits("v1.72", 145, classifier);
         }
@@ -2953,7 +2944,7 @@ fn connection_has_admissible_data_contract(connection: &Connection) -> rusqlite:
         .ok()
         .and_then(Option::as_ref)
         .is_some_and(|(contract, schema, _)| {
-            contract == CURRENT_DATA_CONTRACT_VERSION && matches!(schema, 145..=147)
+            contract == CURRENT_DATA_CONTRACT_VERSION && matches!(schema, 145 | 146)
         })
     {
         return Ok(matches!(
@@ -3360,27 +3351,23 @@ pub(crate) fn classify_database_contract(
     // Current databases do not re-prove every historical migration's SQL text.
     // Older layouts retain their migration-specific source recognition below.
     if marker.contract_version == CURRENT_DATA_CONTRACT_VERSION
-        && matches!(marker.projection_schema_version, 145..=147)
+        && matches!(marker.projection_schema_version, 145 | 146)
     {
-        // Schema 147 builds on the simplification receipt (196) as well as its own.
-        let (expected_migration, prerequisite) = match marker.projection_schema_version {
-            147 => (197, 196),
-            146 => (196, 196),
-            _ => (195, 195),
+        let expected_migration = if marker.projection_schema_version == 146 {
+            196
+        } else {
+            195
         };
         let completed: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM schema_migration WHERE version=?1)
-                AND EXISTS(SELECT 1 FROM schema_migration WHERE version=?2)",
-            [expected_migration, prerequisite],
+            "SELECT EXISTS(SELECT 1 FROM schema_migration WHERE version=?1)",
+            [expected_migration],
             |row| row.get(0),
         )?;
         let valid = completed
             && marker.classifier_version == V147_CLASSIFIER_VERSION
             && simplification::current_structure_matches(connection)?
-            && (marker.projection_schema_version < 146
-                || simplification::schema_matches(connection)?)
-            && (marker.projection_schema_version < 147
-                || member_confirmation_schema_matches(connection)?);
+            && (marker.projection_schema_version != 146
+                || simplification::schema_matches(connection)?);
         return Ok(if !valid {
             DatabaseContractClassification::Unknown(Some(marker))
         } else if marker.projection_schema_version == CURRENT_PROJECTION_SCHEMA_VERSION {
@@ -5607,8 +5594,7 @@ fn load_current_migration_state(
                EXISTS(SELECT 1 FROM schema_migration WHERE version = 193),
                EXISTS(SELECT 1 FROM schema_migration WHERE version = 194),
                EXISTS(SELECT 1 FROM schema_migration WHERE version = 195),
-               EXISTS(SELECT 1 FROM schema_migration WHERE version = 196),
-               EXISTS(SELECT 1 FROM schema_migration WHERE version = 197)
+               EXISTS(SELECT 1 FROM schema_migration WHERE version = 196)
         "#,
         [],
         |row| {
@@ -5740,7 +5726,6 @@ fn load_current_migration_state(
                 v194: row.get(124)?,
                 v195: row.get(125)?,
                 v196: row.get(126)?,
-                v197: row.get(127)?,
             })
         },
     )
@@ -6511,20 +6496,6 @@ fn restore_rebuild_schema_objects(
     Ok(())
 }
 
-fn member_confirmation_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
-    connection.query_row(
-        r#"
-        SELECT (SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN (
-                    'member_create_preview','member_confirmation_event',
-                    'member_create_capability','member_avatar_publish_intent'))=4
-           AND EXISTS(SELECT 1 FROM pragma_index_list('member_create_preview')
-                      WHERE name='idx_preview_creation_key' AND "unique"=1)
-        "#,
-        [],
-        |row| row.get(0),
-    )
-}
-
 fn run_bootstrap_schema_matches(connection: &Connection) -> rusqlite::Result<bool> {
     connection.query_row(r#"
         SELECT EXISTS(SELECT 1 FROM pragma_index_list('native_session_bootstrap_evidence') idx
@@ -6537,34 +6508,7 @@ fn run_bootstrap_schema_matches(connection: &Connection) -> rusqlite::Result<boo
 }
 
 #[cfg(test)]
-fn downgrade_member_confirmation_for_test(connection: &Connection) {
-    let applied: bool = connection
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM schema_migration WHERE version=197)",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    if !applied {
-        return;
-    }
-    connection
-        .execute_batch(
-            "PRAGMA foreign_keys=OFF;
-        DROP TABLE member_avatar_publish_intent;
-        DROP TABLE member_create_capability;
-        DROP TABLE member_confirmation_event;
-        DROP TABLE member_create_preview;
-        DELETE FROM schema_migration WHERE version=197;
-        UPDATE rovai_data_contract SET projection_schema_version=146 WHERE singleton=1;
-        PRAGMA foreign_keys=ON;",
-        )
-        .unwrap();
-}
-
-#[cfg(test)]
 pub(crate) fn downgrade_run_bootstrap_for_test(connection: &Connection) {
-    downgrade_member_confirmation_for_test(connection);
     if !connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM schema_migration WHERE version=195)",
@@ -9001,9 +8945,6 @@ impl Database {
             if !self.schema_migration_applied(196)? {
                 migration_step!("migration_196", simplification::migrate(self));
             }
-            if !self.schema_migration_applied(197)? {
-                migration_step!("migration_197", self.migrate_member_confirmation_v197());
-            }
             if let Err(error) =
                 crate::notification::maintain_notification_episode_retention(self.connection())
             {
@@ -9810,9 +9751,6 @@ impl Database {
         }
         if !self.schema_migration_applied(196)? {
             migration_step!("migration_196", simplification::migrate(self));
-        }
-        if !self.schema_migration_applied(197)? {
-            migration_step!("migration_197", self.migrate_member_confirmation_v197());
         }
         if let Err(error) =
             crate::notification::maintain_notification_episode_retention(self.connection())
@@ -29401,157 +29339,6 @@ impl Database {
         Ok(())
     }
 
-    /// migration 197: member.create confirmation state machine (preview/event/
-    /// capability/publish-intent tables) + reversible archived presence status.
-    /// Source v1.72/146; post state v1.72/147 == Current. SQL validated end-to-end against
-    /// SQLite 3.43.2 (see p0-v24-sql-harness.py in the plan notes).
-    fn migrate_member_confirmation_v197(&mut self) -> Result<()> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        anyhow::ensure!(
-            matches!(
-                classify_database_contract(&tx)?,
-                DatabaseContractClassification::SupportedMigrationSource(ref marker)
-                    if marker.contract_version == "v1.72"
-                        && marker.projection_schema_version == 146
-            ),
-            "member confirmation migration requires the v1.72/schema 146 source"
-        );
-        tx.execute_batch(
-            r#"
-            DROP TRIGGER IF EXISTS agent_profile_presence_insert_guard;
-            DROP TRIGGER IF EXISTS agent_profile_presence_update_guard;
-
-            CREATE TRIGGER agent_profile_presence_insert_guard BEFORE INSERT ON agent_profile
-            WHEN NEW.profile_status NOT IN ('present','away','archived','removed')
-              OR (NEW.profile_status='removed' AND NEW.removed_at IS NULL)
-              OR (NEW.profile_status<>'removed' AND NEW.removed_at IS NOT NULL)
-              OR (NEW.profile_status='archived' AND NEW.archived_at IS NULL)
-              OR (NEW.profile_status<>'archived' AND NEW.archived_at IS NOT NULL)
-            BEGIN SELECT RAISE(ABORT,'invalid presence'); END;
-
-            CREATE TRIGGER agent_profile_presence_update_guard BEFORE UPDATE OF profile_status, removed_at, archived_at ON agent_profile
-            WHEN NEW.profile_status NOT IN ('present','away','archived','removed')
-              OR (NEW.profile_status='removed' AND NEW.removed_at IS NULL)
-              OR (NEW.profile_status<>'removed' AND NEW.removed_at IS NOT NULL)
-              OR (NEW.profile_status='archived' AND NEW.archived_at IS NULL)
-              OR (NEW.profile_status<>'archived' AND NEW.archived_at IS NOT NULL)
-              OR (OLD.profile_status='removed' AND NEW.profile_status<>'removed')
-              OR (OLD.profile_status='removed' AND NEW.removed_at<>OLD.removed_at)
-            BEGIN SELECT RAISE(ABORT,'invalid presence'); END;
-
-            CREATE TABLE IF NOT EXISTS member_create_preview (
-                preview_id TEXT PRIMARY KEY,
-                creation_key TEXT NOT NULL,
-                user_id TEXT NOT NULL,
-                scope_kind TEXT NOT NULL CHECK(scope_kind IN ('camp','global_ui')),
-                scope_id TEXT,
-                card_digest TEXT NOT NULL,
-                avatar_sha256 TEXT,
-                identity_json TEXT NOT NULL,
-                status TEXT NOT NULL CHECK(status IN ('active','confirmed','consumed','superseded','cancelled','expired')),
-                superseded_by TEXT REFERENCES member_create_preview(preview_id),
-                confirmation_event_id TEXT REFERENCES member_confirmation_event(event_id),
-                source_run_id TEXT NOT NULL,
-                issued_at TEXT NOT NULL,
-                expires_at TEXT NOT NULL,
-                confirmed_at TEXT,
-                consumed_at TEXT,
-                superseded_at TEXT,
-                cancelled_at TEXT,
-                CHECK ((status NOT IN ('confirmed','consumed')) OR (confirmed_at IS NOT NULL)),
-                CHECK ((status NOT IN ('active','expired')) OR (confirmed_at IS NULL)),
-                CHECK ((status NOT IN ('active','expired','confirmed')) OR (consumed_at IS NULL AND superseded_at IS NULL AND cancelled_at IS NULL)),
-                CHECK ((status='consumed') = (consumed_at IS NOT NULL)),
-                CHECK ((status='superseded') = (superseded_at IS NOT NULL)),
-                CHECK ((status='cancelled') = (cancelled_at IS NOT NULL)),
-                CHECK ((status<>'consumed') OR (superseded_at IS NULL AND cancelled_at IS NULL)),
-                CHECK ((status<>'superseded') OR (consumed_at IS NULL AND cancelled_at IS NULL)),
-                CHECK ((status<>'cancelled') OR (consumed_at IS NULL AND superseded_at IS NULL)),
-                CHECK ((confirmation_event_id IS NOT NULL) = (confirmed_at IS NOT NULL)),
-                CHECK ((scope_kind='camp' AND scope_id IS NOT NULL) OR (scope_kind='global_ui' AND scope_id IS NULL)),
-                CHECK (expires_at > issued_at)
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_preview_creation_key ON member_create_preview(creation_key);
-            CREATE INDEX IF NOT EXISTS idx_preview_scope ON member_create_preview(scope_kind, scope_id);
-
-            CREATE TABLE IF NOT EXISTS member_confirmation_event (
-                event_id TEXT PRIMARY KEY,
-                message_id TEXT,
-                preview_id TEXT NOT NULL REFERENCES member_create_preview(preview_id),
-                action TEXT NOT NULL CHECK(action IN ('confirm','cancel')),
-                user_id TEXT NOT NULL,
-                camp_id TEXT,
-                created_at TEXT NOT NULL,
-                event_json TEXT NOT NULL
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_event_confirm_once ON member_confirmation_event(preview_id) WHERE action='confirm';
-
-            CREATE TABLE IF NOT EXISTS member_create_capability (
-                credential_id TEXT PRIMARY KEY,
-                preview_id TEXT NOT NULL REFERENCES member_create_preview(preview_id),
-                creation_key TEXT NOT NULL,
-                user_id TEXT NOT NULL,
-                scope_kind TEXT NOT NULL CHECK(scope_kind IN ('camp','global_ui')),
-                scope_id TEXT,
-                card_digest TEXT NOT NULL,
-                token_hash TEXT NOT NULL,
-                confirmation_event_id TEXT NOT NULL REFERENCES member_confirmation_event(event_id),
-                authorized_run_id TEXT NOT NULL,
-                status TEXT NOT NULL CHECK(status IN ('issued','consumed','revoked','expired')),
-                invalidated_reason TEXT,
-                issued_at TEXT NOT NULL,
-                expires_at TEXT NOT NULL,
-                consumed_at TEXT,
-                revoked_at TEXT,
-                CHECK ((status='consumed') = (consumed_at IS NOT NULL)),
-                CHECK ((status='revoked') = (revoked_at IS NOT NULL)),
-                CHECK ((status='revoked') = (invalidated_reason IS NOT NULL)),
-                CHECK ((status='issued' OR status='expired') = (consumed_at IS NULL AND revoked_at IS NULL)),
-                CHECK ((scope_kind='camp' AND scope_id IS NOT NULL) OR (scope_kind='global_ui' AND scope_id IS NULL)),
-                CHECK (expires_at > issued_at)
-            );
-            CREATE INDEX IF NOT EXISTS idx_capability_creation_key ON member_create_capability(creation_key);
-            CREATE INDEX IF NOT EXISTS idx_capability_scope ON member_create_capability(scope_kind, scope_id);
-            CREATE INDEX IF NOT EXISTS idx_capability_preview ON member_create_capability(preview_id);
-
-            CREATE TABLE IF NOT EXISTS member_avatar_publish_intent (
-                preview_id TEXT PRIMARY KEY,
-                credential_id TEXT NOT NULL REFERENCES member_create_capability(credential_id),
-                creation_key TEXT NOT NULL,
-                asset_id TEXT NOT NULL,
-                staged_path TEXT NOT NULL,
-                status TEXT NOT NULL CHECK(status IN ('staged','published','recovery_conflict','recovery_failed')),
-                recovery_note TEXT,
-                created_at TEXT NOT NULL,
-                resolved_at TEXT
-            );
-
-            INSERT INTO schema_migration VALUES (197, datetime('now'));
-            UPDATE rovai_data_contract SET projection_schema_version=147, updated_at=datetime('now') WHERE singleton=1;
-            "#,
-        )?;
-        anyhow::ensure!(
-            matches!(
-                classify_database_contract(&tx)?,
-                DatabaseContractClassification::Current(_)
-            ),
-            "member confirmation migration failed current schema admission"
-        );
-        validate_migration_foreign_keys(
-            &tx,
-            &[
-                "member_create_preview",
-                "member_confirmation_event",
-                "member_create_capability",
-                "member_avatar_publish_intent",
-            ],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
     fn migrate_cline_runtime_v184(&mut self) -> Result<()> {
         self.connection.execute_batch("PRAGMA foreign_keys=OFF;")?;
         let result = (|| -> Result<()> {
@@ -41731,7 +41518,6 @@ mod tests {
             v194: version >= 194,
             v195: version >= 195,
             v196: version >= 196,
-            v197: version >= 197,
         }
     }
 
@@ -41926,12 +41712,6 @@ mod tests {
                 "current",
                 CURRENT_DATA_CONTRACT_VERSION,
                 CURRENT_PROJECTION_SCHEMA_VERSION,
-                197,
-            ),
-            (
-                "v1.72/schema 146 before member confirmation security",
-                "v1.72",
-                146,
                 196,
             ),
             (
@@ -42502,7 +42282,7 @@ mod tests {
         }
 
         assert!(migration_state_through(141).admits("v1.52", 92, V142_CLASSIFIER_VERSION));
-        let current = migration_state_through(197);
+        let current = migration_state_through(196);
         let v092_source = migration_state_through(91);
         let mut missing_intermediate = current;
         missing_intermediate.v84 = false;
@@ -42558,18 +42338,9 @@ mod tests {
         missing_member_creation.v182 = false;
         let mut missing_pending_draft = current;
         missing_pending_draft.v183 = false;
-        let mut missing_member_confirmation = current;
-        missing_member_confirmation.v197 = false;
         let mut missing_convergence = current;
         missing_convergence.v186 = false;
         let rejected = [
-            (
-                "current marker without member confirmation security",
-                missing_member_confirmation,
-                CURRENT_DATA_CONTRACT_VERSION,
-                CURRENT_PROJECTION_SCHEMA_VERSION,
-                V147_CLASSIFIER_VERSION,
-            ),
             (
                 "current marker without catalog/continuation convergence",
                 missing_convergence,
@@ -43073,7 +42844,6 @@ mod tests {
             .unwrap();
         database.migrate_run_bootstrap_evidence().unwrap();
         simplification::migrate(&mut database).unwrap();
-        database.migrate_member_confirmation_v197().unwrap();
         assert!(connection_has_current_data_contract(database.connection()).unwrap());
         database.connection().execute_batch("DROP INDEX native_session_bootstrap_binding_idx;
             CREATE UNIQUE INDEX native_session_bootstrap_binding_idx ON native_session_bootstrap_evidence(native_binding_id,native_binding_generation)").unwrap();
@@ -43156,7 +42926,7 @@ mod tests {
             )
             .expect("current contract marker should load");
 
-        assert_eq!(state, migration_state_through(197));
+        assert_eq!(state, migration_state_through(196));
         assert!(state.admits(&contract, schema, &classifier));
         assert!(has_admissible_data_contract(
             &directory.join("rovai.sqlite")
@@ -43267,7 +43037,7 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM schema_migration", [], |row| row
                     .get::<_, i64>(0))
                 .unwrap(),
-            2
+            1
         );
         drop(reopened);
         drop(lease);

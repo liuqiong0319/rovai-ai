@@ -66,7 +66,7 @@ Rovai v0.4.7 supplements models from the **standard Web Profile**. Existing nati
 
 ## Codex and Claude Code accounts and providers {#native-settings}
 
-These agents use their native sign-in, provider and model configuration. Rovai’s startup settings cover executable paths and child-process environment. Accounts, keys and gateway endpoints are managed in the native agent.
+These agents use their native sign-in, provider and model configuration by default. Rovai’s startup settings select the executable path. To connect teammates to different services, set each teammate's connection details under **Run configuration → Environment variables**. See [One CLI, multiple providers](https://rovai.dev/docs/multiple-providers.html).
 
 With multiple installations or configuration directories, Rovai should launch the one you authenticated. If the terminal finds the program but Rovai does not, set its absolute executable path in startup settings.
 

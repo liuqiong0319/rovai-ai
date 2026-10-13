@@ -1,6 +1,6 @@
 # Rovai website
 
-The public English and Chinese website is built with VitePress and deployed from this directory only. The homepage, download page, and 37 guide topics each have an English and Chinese URL. Public routes start at `/` and `/zh/`; VitePress uses `base: '/'` for `rovai.dev`.
+The public English and Chinese website is built with VitePress and deployed from this directory only. The homepage, download page, and 38 guide topics each have an English and Chinese URL. Public routes start at `/` and `/zh/`; VitePress uses `base: '/'` for `rovai.dev`.
 
 ## Local build
 
@@ -10,9 +10,11 @@ npm run build --prefix website
 npm run preview --prefix website
 ```
 
-`scripts/source/` contains the bilingual content and the approved homepage renderer from the local prototype. `scripts/generate.mjs` turns that content into 80 static VitePress pages before the build. Generated Markdown, build output, and caches are ignored. The deployment workflow uploads only `website/site/.vitepress/dist`.
+`scripts/source/` contains the bilingual content and the approved homepage renderer from the local prototype. `scripts/generate.mjs` turns that content into 82 static VitePress pages before the build. Generated Markdown, build output, and caches are ignored. The deployment workflow uploads only `website/site/.vitepress/dist`.
 
-The agent setup guide is maintained in `scripts/source/guides/agent-setup.en.md` and `agent-setup.zh.md`. The build renders these Markdown sources inside the existing documentation layout, with the shared code-copy interaction and language switch. The original `agents.html` guide retains its interface instructions, field reference and screenshots; `agent-setup.html` covers product-specific configuration and links to the contributor integration reference.
+The agent setup guide is maintained in `scripts/source/guides/agent-setup.en.md` and `agent-setup.zh.md`. The build renders these Markdown sources inside the existing documentation layout, with the shared code-copy interaction and language switch. Code and request blocks use an always-visible top-right copy icon, a temporary success checkmark, and a selectable manual-copy dialog if clipboard access fails. The original `agents.html` guide retains its interface instructions, field reference and screenshots; `agent-setup.html` covers product-specific configuration and links to the contributor integration reference.
+
+The `multiple-providers.html` guide uses the same Markdown pipeline, with sources in `scripts/source/guides/multiple-providers.en.md` and `multiple-providers.zh.md`. It explains per-teammate API endpoints and keys using Claude Code and generic Provider A/B examples; its reference links are explicitly labeled as external official documentation.
 
 `site/public/` contains the selected product images, diagrams, and Orbit teaching example. The prototype's review evidence, capture scripts, and local test data are not published. Existing core tutorial screenshots were captured with the local v0.4.0 app; download links and upgrade wording follow the published v0.4.8 release. Screenshots illustrate the documented workflow and are not a separate v0.4.8 visual acceptance result.
 

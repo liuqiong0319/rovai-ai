@@ -1,14 +1,13 @@
 import { useThreadClient } from './camp-client'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { parseControlledMemberAvatarRef } from '@contracts'
+import { parseControlledMemberAvatarRef, type MemberAvatarAssetSummary } from '@contracts'
 import { MemberAvatar } from './MemberAvatar'
 import { MemberAvatarCropper } from './MemberAvatarCropper'
 import { DialogControlIcon } from './AppDialog'
 import { BUILTIN_MEMBER_PRESETS } from './member-presets'
 import {
   deriveMemberAvatarIcon,
-  normalizeMemberAvatarSource,
-  normalizedMemberAvatarBlob
+  normalizeMemberAvatarSource
 } from './member-avatar-image'
 import { defaultAvatarCrop } from './member-avatar-crop'
 import { readErrorMessage } from './error-message'
@@ -36,9 +35,11 @@ export function MemberAvatarEditor({
   const [error, setError] = useState<string | null>(null)
   const generation = useRef(0)
   const loaded = useRef<string | null>(null)
+  const sourceBytes = source?.kind === 'gif' ? source.sourceGif : source?.sourcePng
+  const sourceMediaType = source?.kind === 'gif' ? 'image/gif' : 'image/png'
   const sourceUrl = useMemo(
-    () => (source ? URL.createObjectURL(normalizedMemberAvatarBlob(source)) : null),
-    [source]
+    () => sourceBytes ? URL.createObjectURL(new Blob([Uint8Array.from(sourceBytes).buffer], { type: sourceMediaType })) : null,
+    [sourceBytes, sourceMediaType]
   )
   useEffect(
     () => () => {
@@ -82,6 +83,7 @@ export function MemberAvatarEditor({
                 frameCount: 0,
                 loopCount: 0,
                 crop: image.crop,
+                sourceAvatarRef: value,
                 needsSave: false
               }
             : {
@@ -90,6 +92,7 @@ export function MemberAvatarEditor({
                 width: image.width,
                 height: image.height,
                 crop: image.crop,
+                sourceAvatarRef: value,
                 needsSave: false
               }
         )
@@ -127,31 +130,23 @@ export function MemberAvatarEditor({
     setBusy(true)
     setError(null)
     try {
-      if (source.kind === 'gif') {
-        const persisted = await client.memberAvatars.save({
-          kind: 'gif',
-          sourceGif: source.sourceGif,
-          sourceWidth: source.width,
-          sourceHeight: source.height,
-          crop: source.crop
+      let persisted: MemberAvatarAssetSummary
+      if (source.sourceAvatarRef) {
+        persisted = await client.memberAvatars.save({ kind: 'recrop', avatarRef: source.sourceAvatarRef, crop: source.crop })
+      } else if (source.kind === 'gif') {
+        persisted = await client.memberAvatars.save({
+          kind: 'gif', sourceGif: source.sourceGif,
+          sourceWidth: source.width, sourceHeight: source.height, crop: source.crop
         })
-        if (attempt !== generation.current) return
-        loaded.current = persisted.avatarRef
-        setSource(null)
-        onChange(persisted.avatarRef)
-        onClose()
-        return
+      } else {
+        const asset = await deriveMemberAvatarIcon(source, source.crop)
+        persisted = await client.memberAvatars.save({
+          sourcePng: asset.sourcePng, iconPng: asset.iconPng,
+          sourceWidth: asset.width, sourceHeight: asset.height, crop: asset.crop
+        })
       }
-      const asset = await deriveMemberAvatarIcon(source, source.crop)
-      const persisted = await client.memberAvatars.save({
-        sourcePng: asset.sourcePng,
-        iconPng: asset.iconPng,
-        sourceWidth: asset.width,
-        sourceHeight: asset.height,
-        crop: asset.crop
-      })
       if (attempt !== generation.current) return
-      loaded.current = persisted.avatarRef
+      loaded.current = null
       setSource(null)
       onChange(persisted.avatarRef)
       onClose()
@@ -234,7 +229,7 @@ export function MemberAvatarEditor({
               type="button"
               className="member-editor-cancel"
               disabled={busy}
-              onClick={() => setSource(null)}
+              onClick={() => { loaded.current = null; setSource(null) }}
             ><UiText zh={"取消裁剪"} /></button>
             <button
               type="button"

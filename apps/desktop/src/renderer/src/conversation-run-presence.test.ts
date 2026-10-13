@@ -2,12 +2,12 @@ import { describe, expect, it } from 'vitest'
 import type { AgentRunView, ThreadMessageView } from '@contracts'
 import { conversationRunPresenceTimeline, runPresencePreview } from './conversation-run-presence'
 import type { ThreadConversationTimelineItem } from './ThreadWorkspace'
-import { buildLiveExecutionProgress, type LiveRuntimeEvent } from './ui-model'
+import type { LiveRuntimeEvent } from './ui-model'
 
 const run = (id: string, agentId = id, patch: Partial<AgentRunView> = {}): AgentRunView => ({
   id, agentId, status: 'running', invocationKind: 'batch', createdAt: '2026-10-10T12:00:00Z',
   startedAt: '2026-10-10T12:00:01Z', cancelRequestedAt: null, failure: null, inputMessageIds: ['message-1'],
-  anchorMessageId: 'message-1', ...patch
+  anchorMessageId: 'message-1', publicTailSequenceAtStart: 1, executionEpoch: 1, ...patch
 } as AgentRunView)
 const message = (sequence: number, sourceAgentRunId: string | null, patch: Partial<ThreadMessageView> = {}): ThreadConversationTimelineItem => ({
   kind: 'camp_message', id: patch.id ?? 'message-' + sequence, createdAt: '2026-10-10T12:00:00Z', runtimeImageGroups: [],
@@ -49,14 +49,50 @@ describe('conversation Run presence', () => {
     ])
   })
 
-  it('restores an unsent Run from its input anchor, including late paged history', () => {
+  it('restores the frozen start boundary across re-entry and late paged history', () => {
     const a = run('a')
     const later = message(2,'peer',{createdAt:'2026-10-10T12:05:00Z'})
     expect(order([a],[message(1,null),later,message(3,null)])).toEqual(['message-1','run-presence:a','message-2','message-3'])
     expect(order([a],[later])).toEqual(['run-presence:a','message-2'])
     expect(order([a],[message(2,'peer',{createdAt:'2000-01-01T00:00:00Z'})])).toEqual(['run-presence:a','message-2'])
     expect(order([a],[message(1,null),later])).toEqual(['message-1','run-presence:a','message-2'])
-    expect(order([run('legacy','alice',{anchorMessageId:null})],[message(1,null),later])).toEqual(['message-1','run-presence:legacy','message-2'])
+    for (const publicTailSequenceAtStart of [null, undefined]) {
+      const legacy = run('legacy','alice',{publicTailSequenceAtStart})
+      expect(order([legacy],[message(1,null),later])).toEqual(['message-1','run-presence:legacy','message-2'])
+      expect(order([{...legacy,anchorMessageId:null}],[message(1,null),later])).toEqual(['message-1','run-presence:legacy','message-2'])
+    }
+  })
+
+  it('starts a queued follow-up after the previous reply, then moves only on its own publication', () => {
+    const next = run('next','alice',{inputMessageIds:['message-2'],anchorMessageId:'message-2',publicTailSequenceAtStart:3})
+    const beforeStart = [message(1,null),message(2,null),message(3,'previous')]
+    expect(order([next],beforeStart)).toEqual(['message-1','message-2','message-3','run-presence:next'])
+    expect(slots([next],beforeStart)).toEqual([['next',false]])
+    // Later messages, including a clock rollback, cannot move the start anchor.
+    const later = [...beforeStart,message(4,null,{createdAt:'2000-01-01T00:00:00Z'}),message(5,'peer')]
+    expect(order([next],later)).toEqual(['message-1','message-2','message-3','run-presence:next','message-4','message-5'])
+    expect(order([structuredClone(next)],later.slice(3))).toEqual(['run-presence:next','message-4','message-5'])
+    expect(order([next],[message(1,null),...later.slice(3)])).toEqual(['message-1','run-presence:next','message-4','message-5'])
+    expect(order([next],[message(3,'previous'),...later.slice(3)])).toEqual(['message-3','run-presence:next','message-4','message-5'])
+    const sent = [...later,message(6,'next'),message(7,'next'),message(8,'peer')]
+    expect(order([next],sent)).toEqual(['message-1','message-2','message-3','message-4','message-5','message-6','message-7','run-presence:next','message-8'])
+    expect(slots([next],sent)).toEqual([['next',true]])
+    expect(order([next],[message(3,null,{id:'optimistic:send'}),message(4,null)])).toEqual(['run-presence:next','optimistic:send','message-4'])
+    expect(order([{...next,publicTailSequenceAtStart:0}],[message(1,null)])).toEqual(['run-presence:next','message-1'])
+  })
+
+  it('never splits another Run reply from its joined, image and Files Changed cards', () => {
+    const a = run('a'), b = run('b','b',{anchorMessageId:'message-2',publicTailSequenceAtStart:2})
+    const joined = {kind:'member_joined',id:'joined-a',createdAt:a.createdAt,receipt:{sourceAgentRunId:'a'}} as ThreadConversationTimelineItem
+    const images = {kind:'run_images',id:'images-a',createdAt:a.createdAt,images:{agentRunId:'a'}} as ThreadConversationTimelineItem
+    const files = {kind:'run_file_changes',id:'files-a',createdAt:a.createdAt,changes:{agentRunId:'a'}} as ThreadConversationTimelineItem
+    const timeline = [message(1,null),message(2,'a'),joined,images,files,message(3,'peer')]
+    expect(order([b],timeline)).toEqual(['message-1','message-2','joined-a','images-a','files-a','run-presence:b','message-3'])
+    expect(slots([b],timeline)).toEqual([['b',false]])
+    expect(order([b,a],timeline)).toEqual(['message-1','message-2','joined-a','images-a','files-a','run-presence:a','run-presence:b','message-3'])
+    expect(slots([b,a],timeline)).toEqual([['a',true],['b',false]])
+    // The old projection's input anchor must respect the same atomic group.
+    expect(order([{...b,publicTailSequenceAtStart:null}],timeline)).toEqual(order([b],timeline))
   })
 
   it('keeps message artifacts together and continues the adjacent Run identity', () => {
@@ -107,36 +143,47 @@ describe('conversation Run presence', () => {
       ['\r\n第二','第二'],['行','第二行'],['\n  \n','第二行'],['第三行','第三行']
     ]) {
       events.push(event(events.length+1,delta))
-      expect(runPresencePreview(run('a'),buildLiveExecutionProgress(events,'a',{includePublicResults:false}))).toEqual({kind:'narration',text:expected})
+      expect(runPresencePreview(run('a'),events)).toEqual({kind:'narration',text:expected})
     }
     events.push({id:'command',agentRunId:'a',eventType:'activity.started',createdAt:'2026-10-10T12:01:00Z',
       payload:{item:{id:'command',type:'commandExecution',command:'pnpm typecheck',status:'inProgress'}}} as LiveRuntimeEvent)
-    const progress = buildLiveExecutionProgress(events,'a',{includePublicResults:false})
-    expect(runPresencePreview(run('a'),progress)).toMatchObject({kind:'command',text:'pnpm typecheck',iconKind:'terminal'})
-    expect(runPresencePreview(run('a','alice',{status:'failed'}),progress).kind).toBe('error')
-    expect(runPresencePreview(run('a','alice',{cancelRequestedAt:'now'}),progress)).toEqual({kind:'status',text:'正在停止…'})
+    expect(runPresencePreview(run('a'),events)).toMatchObject({kind:'command',text:'pnpm typecheck',iconKind:'terminal'})
+    expect(runPresencePreview(run('a','alice',{status:'failed'}),events).kind).toBe('error')
+    expect(runPresencePreview(run('a','alice',{cancelRequestedAt:'now'}),events)).toEqual({kind:'status',text:'正在停止…'})
   })
 
-  it('uses the accepted-input fence for connecting, then processing until visible evidence arrives', () => {
+  it('shows current-epoch activity before a late ACK while keeping old evidence behind the connection fence', () => {
     const initializing = run('a', 'alice', { waitReason: 'runtime_initializing' })
     const accepted = { ...initializing, waitReason: null }
-    const thinking = buildLiveExecutionProgress([], 'a', { includePublicResults: false })
+    const thinking: LiveRuntimeEvent = { id: 'phase', agentRunId: 'a', executionEpoch: 1,
+      eventType: 'agent_run.runtime_phase_changed', payload: { phase: 'thinking' }, createdAt: '2026-10-10T12:00:00Z' }
     expect(runPresencePreview(initializing)).toEqual({ kind: 'status', text: '正在连接智能体…' })
     expect(runPresencePreview(accepted)).toEqual({ kind: 'status', text: '正在处理你的请求…' })
-    expect(runPresencePreview(accepted, { ...thinking, runtimePhase: 'thinking' as const })).toEqual({ kind: 'status', text: '正在处理你的请求…' })
-    const titled = { ...thinking, runtimePhase: 'thinking' as const, runtimeThinkingTitle: '核对现有边界' }
-    expect(runPresencePreview(accepted, titled).text).toBe('核对现有边界')
-    expect(runPresencePreview(initializing, titled).text).toBe('正在连接智能体…')
+    expect(runPresencePreview(accepted, [thinking])).toEqual({ kind: 'status', text: '正在处理你的请求…' })
+    const titled = { ...thinking, payload: { phase: 'thinking', thinkingTitle: '核对现有边界' } }
+    expect(runPresencePreview(accepted, [titled]).text).toBe('核对现有边界')
+    expect(runPresencePreview(initializing, [titled]).text).toBe('正在连接智能体…')
 
-    const progress = buildLiveExecutionProgress([{
-      id: 'text', agentRunId: 'a', eventType: 'agent.text.delta',
+    const text: LiveRuntimeEvent = {
+      id: 'text', agentRunId: 'a', executionEpoch: 1, eventType: 'agent.text.delta',
       payload: { itemId: 'text', delta: '已经开始处理' }, createdAt: '2026-10-10T12:00:00Z'
-    } as LiveRuntimeEvent], 'a', { includePublicResults: false })
-    expect(runPresencePreview(accepted, progress)).toEqual({ kind: 'narration', text: '已经开始处理' })
+    }
+    const command: LiveRuntimeEvent = { id: 'command', agentRunId: 'a', executionEpoch: 1, eventType: 'activity.started',
+      createdAt: '2026-10-10T12:01:00Z', payload: { item: { id: 'command', type: 'commandExecution', command: 'pnpm typecheck', status: 'inProgress' } } }
+    expect(runPresencePreview(accepted, [text])).toEqual({ kind: 'narration', text: '已经开始处理' })
+    for (const current of [text, command]) {
+      expect(runPresencePreview(initializing, [current])).toEqual(runPresencePreview(accepted, [current]))
+      for (const untrusted of [{ ...current, executionEpoch: 0 }, { ...current, executionEpoch: null },
+        { ...current, executionEpoch: undefined }, { ...current, executionEpoch: 2 }, { ...current, agentRunId: 'another-run' }]) {
+        expect(runPresencePreview(initializing, [untrusted]).text).toBe('正在连接智能体…')
+      }
+    }
+    expect(runPresencePreview(initializing, [text, { ...command, executionEpoch: 0 }])).toEqual({ kind: 'narration', text: '已经开始处理' })
+    expect(runPresencePreview(initializing, [{ ...text, payload: { itemId: 'text', delta: '  ' } }]).text).toBe('正在连接智能体…')
     // A reconnect can still have earlier evidence; it must describe the new initialization.
-    expect(runPresencePreview(initializing, progress).text).toBe('正在连接智能体…')
-    expect(runPresencePreview({ ...initializing, cancelRequestedAt: 'now' }, progress).text).toBe('正在停止…')
-    expect(runPresencePreview({ ...initializing, status: 'failed' }, progress).kind).toBe('error')
-    expect(runPresencePreview({ ...initializing, status: 'waiting', waitReason: 'approval' }, progress).text).toBe('等待审批')
+    expect(runPresencePreview({ ...initializing, executionEpoch: 2 }, [text, command]).text).toBe('正在连接智能体…')
+    expect(runPresencePreview({ ...initializing, cancelRequestedAt: 'now' }, [text, command]).text).toBe('正在停止…')
+    expect(runPresencePreview({ ...initializing, status: 'failed' }, [text, command]).kind).toBe('error')
+    expect(runPresencePreview({ ...initializing, status: 'waiting', waitReason: 'approval' }, [text, command]).text).toBe('等待审批')
   })
 })

@@ -107,11 +107,7 @@ alone is not a patch. Supplying values already stored returns `changed:false` wi
 same version and no roster invalidation. Equivalent normalized source, crop and icon
 preserve the existing managed reference even when the upload uses a new request ID.
 
-`avatarFile` accepts the same local PNG/JPEG/GIF import as creation. PNG/JPEG normalize to
-a PNG portrait and derive the icon from the crop; GIF is the only dynamic format and keeps
-its animation — the source stays `source.gif`, the crop is applied to every frame, and the
-icon is derived as `icon-192.gif` with frame order, per-frame delay and loop count preserved
-(APNG/WebP are not extended; PNG selection still rejects APNG). Normalized source is the
+`avatarFile` accepts the same local PNG/JPEG import as creation. Normalized source is the
 portrait; its crop produces the icon. For create and update, the CLI preserves `avatarFile`
 from flags, stdin or an input file. After authenticating the AgentRun, Core resolves a
 relative path against that Run's frozen `execution_root`; an absolute path stays unchanged.
