@@ -1,7 +1,7 @@
 ---
 document_type: contracts-index
 authority: protocol-contract-routing
-last_updated: 2026-10-12
+last_updated: 2026-10-13
 ---
 
 # 长期接口合同
@@ -568,7 +568,8 @@ Architecture 解释组件如何组成，Version 概览记录交付范围；它�
 | [ContextManifest Evidence v9 (historical)](context-manifest-evidence-v9.md) | bounded public omission evidence；不作为 Formatter v13 恢复入口 |
 | [Context Delivery Profile v2 (historical)](context-delivery-profile-v2.md) | 公共引用链与历史 budget 的旧当前合同；不选择 self-active Task |
 | [Context Delivery Profile v1 (historical)](context-delivery-profile-v1.md) | AgentRun 公共消息窗口、Unicode scalar 正文截断、历史字符预算与遗漏提示 |
-| [Run Process Detail Surface v50（当前）](run-process-detail-surface-v50.md) | 每 Run 的发送前固定锚点与成功发送跟随、单行内按原文换行推进及 RunCard 高亮 |
+| [Run Process Detail Surface v51（当前）](run-process-detail-surface-v51.md) | 共享 4.8 秒高亮、执行行动态效果设置入口与真实连接／处理反馈 |
+| [Run Process Detail Surface v50（历史）](run-process-detail-surface-v50.md) | 每 Run 的发送前固定锚点与成功发送跟随、单行内按原文换行推进及 RunCard 高亮 |
 | [Run Process Detail Surface v49（历史）](run-process-detail-surface-v49.md) | 单行预览首次读取失败的事件驱动恢复、在途更新补拉及新旧 Evidence 合并；不改变 v48 展示与授权规则 |
 | [Run Process Detail Surface v48](run-process-detail-surface-v48.md) | 停止区短竖线分隔、默认中性色停止按钮；按持久化续做 Delivery 恢复已受理重试的收起状态 |
 | [Run Process Detail Surface v47（历史）](run-process-detail-surface-v47.md) | 会话内单行队员占位、V2 确认停止、命令图标与中断重试；复用已有命令和 Evidence |

@@ -4101,8 +4101,9 @@ button.task-event-card:focus-visible .task-card-chevron { color: var(--brand-ink
 .running-text-highlight { display: none; }
 .running-text-highlight::after { content: attr(data-text); }
 @supports (mask-image: linear-gradient(90deg, transparent, black)) {
-  .running-text-highlight { display: block; position: absolute; inset: 0; overflow: hidden; text-overflow: ellipsis; color: var(--ink); pointer-events: none; user-select: none; mask-image: linear-gradient(90deg, transparent 0%, black 36%, black 64%, transparent 100%); mask-size: 26% 100%; mask-repeat: no-repeat; animation: running-text-sweep 2.4s linear infinite; }
+  .running-text-highlight { display: block; position: absolute; inset: 0; overflow: hidden; text-overflow: ellipsis; color: var(--ink); pointer-events: none; user-select: none; mask-image: linear-gradient(90deg, transparent 0%, black 36%, black 64%, transparent 100%); mask-size: 26% 100%; mask-repeat: no-repeat; animation: running-text-sweep 4.8s linear infinite; }
 }
+:root[data-motion-preference="reduce"] .running-text-highlight { display: none; animation: none; }
 @keyframes running-text-sweep {
   0% { mask-position: -40% 0; }
   78%, 100% { mask-position: 140% 0; }

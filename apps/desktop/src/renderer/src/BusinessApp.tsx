@@ -2984,6 +2984,21 @@ export function BusinessApp({
     else void navigateToSettings(rememberedSection)
   }
 
+  const openMotionSettings = async (): Promise<void> => {
+    try {
+      if (!await navigateToSettings('appearance')) return
+      await afterNextPaint()
+      const { entries, index } = desktopNavigation.getSnapshot()
+      const target = entries[index]
+      if (target?.kind !== 'settings' || target.section !== 'appearance') return
+      const control = document.querySelector<HTMLSelectElement>('#appearance-motion')
+      control?.scrollIntoView({ block: 'center', behavior: 'instant' })
+      control?.focus({ preventScroll: true })
+    } catch (nextError) {
+      setError(errorMessage(nextError))
+    }
+  }
+
   const returnToMobileSettings = (): void => {
     const { entries, index } = desktopNavigation.getSnapshot()
     const previous = entries[index - 1]
@@ -4434,6 +4449,7 @@ export function BusinessApp({
             firstRunThread={firstRunThread}
             firstRunThreadId={firstRunThreadId}
             onConfigureRuntime={configureMemberRuntime}
+            onOpenMotionSettings={() => { void openMotionSettings() }}
             onDismissRuntimeRecovery={() => setRuntimeRecovery(null)}
             onNotify={notify}
             onNotifyError={notifyError}
