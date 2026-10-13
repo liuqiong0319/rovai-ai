@@ -334,31 +334,16 @@ pub fn confirm_member_create(
     let event_id = Uuid::new_v4().to_string();
     let user_id = CURRENT_USER_ID.to_string();
 
-    // Atomically confirm the preview (prevents replay/double-confirm).
-    let confirmed = database.connection_mut().execute(
-        r#"
-        UPDATE member_create_preview
-        SET status='confirmed', confirmed_at=?2, confirmation_event_id=?3
-        WHERE preview_id=?1 AND status='active' AND confirmed_at IS NULL
-        "#,
-        params![input.preview_id, now_str, event_id],
-    )?;
-    if confirmed != 1 {
-        return Err(MemberOperationError {
-            code: "member.confirmation_invalid",
-            message: "Preview is not in an active state that can be confirmed",
-            details: None,
-        }
-        .into());
-    }
-
-    // Insert the structured confirmation event (event_id PK blocks replay).
-    let preview = database
-        .connection()
+    // One transaction: the confirmation event must exist before the preview
+    // references it (immediate FK), and any rejection leaves no partial state.
+    let tx = database
+        .connection_mut()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let preview = tx
         .query_row(
             r#"
             SELECT user_id, scope_kind, scope_id, card_digest, source_run_id,
-                   creation_key, expires_at
+                   creation_key, expires_at, status
             FROM member_create_preview WHERE preview_id = ?1
             "#,
             params![input.preview_id],
@@ -371,6 +356,7 @@ pub fn confirm_member_create(
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
                 ))
             },
         )
@@ -383,15 +369,24 @@ pub fn confirm_member_create(
         source_run_id,
         _creation_key,
         preview_expires,
+        status,
     )) = preview
     else {
         return Err(MemberOperationError {
             code: "member.confirmation_invalid",
-            message: "Preview record disappeared",
+            message: "Preview is not in an active state that can be confirmed",
             details: None,
         }
         .into());
     };
+    if status != "active" {
+        return Err(MemberOperationError {
+            code: "member.confirmation_invalid",
+            message: "Preview is not in an active state that can be confirmed",
+            details: None,
+        }
+        .into());
+    }
     if owner != user_id || card_digest != input.card_digest {
         return Err(MemberOperationError {
             code: "member.card_mismatch",
@@ -403,7 +398,7 @@ pub fn confirm_member_create(
     let token = format!("{}{}", Uuid::new_v4(), Uuid::new_v4());
     let token_hash = sha256_hex(token.as_bytes());
     let credential_id = Uuid::new_v4().to_string();
-    let affected = database.connection_mut().execute(
+    let affected = tx.execute(
         r#"
         INSERT INTO member_confirmation_event(
             event_id, message_id, preview_id, action, user_id, camp_id, created_at, event_json
@@ -426,9 +421,26 @@ pub fn confirm_member_create(
         }
         .into());
     }
+    // Atomically confirm the preview (prevents replay/double-confirm).
+    let confirmed = tx.execute(
+        r#"
+        UPDATE member_create_preview
+        SET status='confirmed', confirmed_at=?2, confirmation_event_id=?3
+        WHERE preview_id=?1 AND status='active' AND confirmed_at IS NULL
+        "#,
+        params![input.preview_id, now_str, event_id],
+    )?;
+    if confirmed != 1 {
+        return Err(MemberOperationError {
+            code: "member.confirmation_invalid",
+            message: "Preview is not in an active state that can be confirmed",
+            details: None,
+        }
+        .into());
+    }
     // Issue the one-time capability, deriving authorized_run_id from the
     // trusted preview source_run_id via a JOIN (no client-asserted values).
-    let issued = database.connection_mut().execute(
+    let issued = tx.execute(
         r#"
         INSERT INTO member_create_capability(
             credential_id, preview_id, creation_key, user_id, scope_kind, scope_id,
@@ -456,6 +468,7 @@ pub fn confirm_member_create(
         }
         .into());
     }
+    tx.commit()?;
     let _ = data_dir;
     let _ = scope_kind;
     let _ = preview_expires;

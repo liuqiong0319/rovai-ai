@@ -29410,7 +29410,7 @@ impl Database {
                 CHECK ((scope_kind='camp' AND scope_id IS NOT NULL) OR (scope_kind='global_ui' AND scope_id IS NULL)),
                 CHECK (expires_at > issued_at)
             );
-            CREATE INDEX IF NOT EXISTS idx_preview_creation_key ON member_create_preview(creation_key);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_preview_creation_key ON member_create_preview(creation_key);
             CREATE INDEX IF NOT EXISTS idx_preview_scope ON member_create_preview(scope_kind, scope_id);
 
             CREATE TABLE IF NOT EXISTS member_confirmation_event (

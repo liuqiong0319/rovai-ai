@@ -2989,9 +2989,34 @@ mod tests {
         );
     }
 
+    fn confirmed_member_input(
+        database: &mut Database,
+        directory: &std::path::Path,
+        run: &AuthenticatedTeamToolRun,
+        draft: crate::member_studio::MemberCreateDraft,
+    ) -> crate::member_studio::MemberCreateInput {
+        let preview =
+            crate::member_studio::preview_member_create(database, directory, run, draft.clone())
+                .unwrap();
+        crate::member_studio::confirm_member_create(
+            database,
+            directory,
+            run,
+            crate::member_studio::MemberCreateConfirmInput {
+                preview_id: preview.preview_id.clone(),
+                card_digest: preview.card["cardDigest"].as_str().unwrap().to_string(),
+            },
+        )
+        .unwrap();
+        crate::member_studio::MemberCreateInput {
+            preview_id: preview.preview_id,
+            draft,
+        }
+    }
+
     #[test]
     fn confirmed_user_input_can_create_one_idempotent_member_but_agent_input_cannot() {
-        use crate::member_studio::{MemberCreateInput, resolve_member_avatar_input};
+        use crate::member_studio::{MemberCreateDraft, resolve_member_avatar_input};
         let mut fixture = Fixture::new();
         let authenticated_run = TeamToolService::default()
             .authenticate_attested_binding(
@@ -3004,16 +3029,21 @@ mod tests {
             )
             .unwrap();
         let creation_key = Uuid::new_v4().to_string();
-        let input = crate::member_studio::MemberCreateInput {
-            creation_key: creation_key.clone(),
-            display_name: "Nova Test Member".to_string(),
-            team_role: "Researcher".to_string(),
-            professional_responsibilities: "Synthesize bounded evidence.".to_string(),
-            personality_traits: vec!["Precise".to_string()],
-            working_principles: "State evidence and uncertainty.".to_string(),
-            growth_topic: "Shorten feedback loops.".to_string(),
-            avatar_file: None,
-        };
+        let input = confirmed_member_input(
+            &mut fixture.database,
+            &fixture.directory,
+            &authenticated_run,
+            MemberCreateDraft {
+                creation_key: creation_key.clone(),
+                display_name: "Nova Test Member".to_string(),
+                team_role: "Researcher".to_string(),
+                professional_responsibilities: "Synthesize bounded evidence.".to_string(),
+                personality_traits: vec!["Precise".to_string()],
+                working_principles: "State evidence and uncertainty.".to_string(),
+                growth_topic: "Shorten feedback loops.".to_string(),
+                avatar_file: None,
+            },
+        );
         let original_messages: i64 = fixture
             .database
             .connection()
@@ -3066,17 +3096,21 @@ mod tests {
         assert_eq!(first.execution.result.status, CommandResultStatus::Applied);
         assert!(!first.execution.replayed);
         assert!(first.avatar_ref.is_none());
+        // The one-time capability is consumed by the first create; a repeated
+        // create cannot mint a second member.
         let replay = crate::member_studio::create_member(
             &mut fixture.database,
             &fixture.directory,
             &authenticated_run,
-            input,
+            input.clone(),
         )
-        .unwrap();
-        assert!(replay.execution.replayed);
+        .unwrap_err();
         assert_eq!(
-            replay.execution.result.payload["agentId"],
-            first.execution.result.payload["agentId"]
+            replay
+                .downcast_ref::<crate::member_studio::MemberOperationError>()
+                .unwrap()
+                .code,
+            "member.confirmation_required"
         );
         let receipts = crate::member_studio::list_member_creations(
             fixture.database.connection(),
@@ -3212,14 +3246,11 @@ mod tests {
             &fixture.directory,
             &authenticated_run,
             crate::member_studio::MemberCreateInput {
-                creation_key: creation_key.clone(),
-                display_name: "Nova Test Member".to_string(),
-                team_role: "Changed after confirmation".to_string(),
-                professional_responsibilities: "Synthesize bounded evidence.".to_string(),
-                personality_traits: vec!["Precise".to_string()],
-                working_principles: "State evidence and uncertainty.".to_string(),
-                growth_topic: "Shorten feedback loops.".to_string(),
-                avatar_file: None,
+                draft: MemberCreateDraft {
+                    team_role: "Changed after confirmation".to_string(),
+                    ..input.draft.clone()
+                },
+                ..input.clone()
             },
         )
         .unwrap_err();
@@ -3228,7 +3259,38 @@ mod tests {
                 .downcast_ref::<crate::member_studio::MemberOperationError>()
                 .unwrap()
                 .code,
-            "member.creation_key_conflict"
+            "member.confirmation_required"
+        );
+        // An unconsumed capability is still bound to the confirmed card digest.
+        let pending = confirmed_member_input(
+            &mut fixture.database,
+            &fixture.directory,
+            &authenticated_run,
+            MemberCreateDraft {
+                creation_key: Uuid::new_v4().to_string(),
+                display_name: "Pending Card Member".to_string(),
+                ..input.draft.clone()
+            },
+        );
+        let mismatched = crate::member_studio::create_member(
+            &mut fixture.database,
+            &fixture.directory,
+            &authenticated_run,
+            crate::member_studio::MemberCreateInput {
+                draft: MemberCreateDraft {
+                    team_role: "Changed after confirmation".to_string(),
+                    ..pending.draft
+                },
+                ..pending
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            mismatched
+                .downcast_ref::<crate::member_studio::MemberOperationError>()
+                .unwrap()
+                .code,
+            "member.card_mismatch"
         );
 
         let (_, workspace) = TeamToolService::default()
@@ -3275,11 +3337,17 @@ mod tests {
                     "absolute input must stay unchanged"
                 );
             }
+            let with_image_input = confirmed_member_input(
+                &mut fixture.database,
+                &fixture.directory,
+                &authenticated_run,
+                serde_json::from_value::<MemberCreateDraft>(value).unwrap(),
+            );
             let with_image = crate::member_studio::create_member(
                 &mut fixture.database,
                 &fixture.directory,
                 &authenticated_run,
-                serde_json::from_value::<MemberCreateInput>(value).unwrap(),
+                with_image_input,
             )
             .unwrap();
             let portrait = crate::member_avatar::materialize_member_avatar(
@@ -3310,11 +3378,11 @@ mod tests {
                 value["avatarFile"],
                 json!(workspace.path().join("./linked.png"))
             );
-            let rejected = crate::member_studio::create_member(
+            let rejected = crate::member_studio::preview_member_create(
                 &mut fixture.database,
                 &fixture.directory,
                 &authenticated_run,
-                serde_json::from_value::<MemberCreateInput>(value).unwrap(),
+                serde_json::from_value::<MemberCreateDraft>(value).unwrap(),
             )
             .unwrap_err();
             assert_eq!(
@@ -3358,14 +3426,17 @@ mod tests {
             &fixture.directory,
             &authenticated_run,
             crate::member_studio::MemberCreateInput {
-                creation_key: Uuid::new_v4().to_string(),
-                display_name: "Blocked A2A Member".to_string(),
-                team_role: String::new(),
-                professional_responsibilities: String::new(),
-                personality_traits: Vec::new(),
-                working_principles: String::new(),
-                growth_topic: String::new(),
-                avatar_file: None,
+                preview_id: Uuid::new_v4().to_string(),
+                draft: MemberCreateDraft {
+                    creation_key: Uuid::new_v4().to_string(),
+                    display_name: "Blocked A2A Member".to_string(),
+                    team_role: String::new(),
+                    professional_responsibilities: String::new(),
+                    personality_traits: Vec::new(),
+                    working_principles: String::new(),
+                    growth_topic: String::new(),
+                    avatar_file: None,
+                },
             },
         )
         .unwrap_err();

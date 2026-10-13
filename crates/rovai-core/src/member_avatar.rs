@@ -8,8 +8,13 @@ use std::{
 use std::fs::File;
 
 use anyhow::Result;
-use gif::{DecodeOptions, Decoder as GifDecoder, DisposalMethod, Encoder as GifEncoder, Frame as GifFrame, Repeat};
-use image::{DynamicImage, GenericImageView, ImageDecoder, ImageFormat, ImageReader, Limits, RgbaImage};
+use gif::{
+    DecodeOptions, Decoder as GifDecoder, DisposalMethod, Encoder as GifEncoder, Frame as GifFrame,
+    Repeat,
+};
+use image::{
+    DynamicImage, GenericImageView, ImageDecoder, ImageFormat, ImageReader, Limits, RgbaImage,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -713,16 +718,17 @@ fn managed_member_avatar_rendition(
                 },
             })
         }
-        MemberAvatarReference::Managed(_) => read_managed_member_avatar(data_dir, avatar_ref, portrait)?
-            .ok_or_else(|| anyhow::anyhow!("Avatar rendition is unavailable")),
+        MemberAvatarReference::Managed(_) => {
+            read_managed_member_avatar(data_dir, avatar_ref, portrait)?
+                .ok_or_else(|| anyhow::anyhow!("Avatar rendition is unavailable"))
+        }
     }
 }
 
 fn member_avatar_bytes(data_dir: &Path, avatar_ref: &str, portrait: bool) -> Result<Vec<u8>> {
     use base64::Engine;
-    Ok(base64::engine::general_purpose::STANDARD.decode(
-        managed_member_avatar_rendition(data_dir, avatar_ref, portrait)?.base64,
-    )?)
+    Ok(base64::engine::general_purpose::STANDARD
+        .decode(managed_member_avatar_rendition(data_dir, avatar_ref, portrait)?.base64)?)
 }
 
 /// Returns the validated frame count of a GIF member-avatar file. The Core save
@@ -935,8 +941,7 @@ pub fn read_managed_member_avatar(
         )
     };
     anyhow::ensure!(
-        file.file == name
-            && file.media_type == if gif { "image/gif" } else { "image/png" },
+        file.file == name && file.media_type == if gif { "image/gif" } else { "image/png" },
         "Avatar rendition is invalid"
     );
     let bytes = read_existing_regular_file(&directory.join(name), maximum)?;
@@ -1052,7 +1057,13 @@ fn publish_managed_member_avatar_with(
     };
     let (source_manifest, icon_manifest) = if gif {
         (
-            gif_manifest_file(source_file, source_width, source_height, frame_count, source_bytes),
+            gif_manifest_file(
+                source_file,
+                source_width,
+                source_height,
+                frame_count,
+                source_bytes,
+            ),
             gif_manifest_file(icon_file, ICON_EDGE, ICON_EDGE, frame_count, icon_bytes),
         )
     } else {
@@ -1290,18 +1301,13 @@ fn parse_gif_info(bytes: &[u8]) -> std::result::Result<GifFileInfo, MemberAvatar
                 offset = offset
                     .checked_add(1)
                     .ok_or_else(|| invalid_gif_structure())?;
-                let label = *bytes
-                    .get(offset)
-                    .ok_or_else(|| invalid_gif_structure())?;
+                let label = *bytes.get(offset).ok_or_else(|| invalid_gif_structure())?;
                 offset = offset
                     .checked_add(1)
                     .ok_or_else(|| invalid_gif_structure())?;
                 if label == 0xff {
                     // Application extension: may carry the Netscape loop count.
-                    let size = *bytes
-                        .get(offset)
-                        .ok_or_else(|| invalid_gif_structure())?
-                        as usize;
+                    let size = *bytes.get(offset).ok_or_else(|| invalid_gif_structure())? as usize;
                     offset = offset
                         .checked_add(1)
                         .ok_or_else(|| invalid_gif_structure())?;
@@ -1320,8 +1326,7 @@ fn parse_gif_info(bytes: &[u8]) -> std::result::Result<GifFileInfo, MemberAvatar
                                     .get(offset + 1..offset.saturating_add(4))
                                     .ok_or_else(|| invalid_gif_structure())?;
                                 if payload[0] == 0x01 {
-                                    loop_count =
-                                        u16::from_le_bytes([payload[1], payload[2]]);
+                                    loop_count = u16::from_le_bytes([payload[1], payload[2]]);
                                 }
                             }
                         }
@@ -1342,9 +1347,7 @@ fn parse_gif_info(bytes: &[u8]) -> std::result::Result<GifFileInfo, MemberAvatar
                 offset = offset
                     .checked_add(9)
                     .ok_or_else(|| invalid_gif_structure())?;
-                let packed = *bytes
-                    .get(offset)
-                    .ok_or_else(|| invalid_gif_structure())?;
+                let packed = *bytes.get(offset).ok_or_else(|| invalid_gif_structure())?;
                 offset = offset
                     .checked_add(1)
                     .ok_or_else(|| invalid_gif_structure())?;
@@ -1365,7 +1368,9 @@ fn parse_gif_info(bytes: &[u8]) -> std::result::Result<GifFileInfo, MemberAvatar
                 offset = skip_gif_sub_blocks(bytes, offset)?;
             }
             _ => {
-                return Err(MemberAvatarImportError::invalid("Avatar GIF structure is invalid"));
+                return Err(MemberAvatarImportError::invalid(
+                    "Avatar GIF structure is invalid",
+                ));
             }
         }
     }
@@ -1387,10 +1392,7 @@ fn skip_gif_sub_blocks(
     mut offset: usize,
 ) -> std::result::Result<usize, MemberAvatarImportError> {
     loop {
-        let size = *bytes
-            .get(offset)
-            .ok_or_else(|| invalid_gif_structure())?
-            as usize;
+        let size = *bytes.get(offset).ok_or_else(|| invalid_gif_structure())? as usize;
         offset = offset
             .checked_add(1)
             .and_then(|value| value.checked_add(size))
@@ -1475,9 +1477,8 @@ fn decode_composited_gif_frames(
                 "Animated avatar exceeds the frame limit",
             ));
         }
-        cumulative_pixels = cumulative_pixels.saturating_add(
-            u64::from(canvas_width).saturating_mul(u64::from(canvas_height)),
-        );
+        cumulative_pixels = cumulative_pixels
+            .saturating_add(u64::from(canvas_width).saturating_mul(u64::from(canvas_height)));
         if cumulative_pixels > MAXIMUM_GIF_CUMULATIVE_DECODED_PIXELS {
             return Err(MemberAvatarImportError::invalid(
                 "Animated avatar exceeds the cumulative decode resource limit",
@@ -1562,12 +1563,8 @@ fn encode_animated_gif(
         for frame in frames {
             let (frame_width, frame_height) = frame.image.dimensions();
             let mut buffer = frame.image.to_vec();
-            let mut gif_frame = GifFrame::from_rgba_speed(
-                frame_width as u16,
-                frame_height as u16,
-                &mut buffer,
-                10,
-            );
+            let mut gif_frame =
+                GifFrame::from_rgba_speed(frame_width as u16, frame_height as u16, &mut buffer, 10);
             gif_frame.delay = frame.delay_centiseconds;
             encoder.write_frame(&gif_frame).map_err(|_| {
                 MemberAvatarImportError::invalid("Avatar GIF could not be normalized")
@@ -1657,11 +1654,7 @@ fn validate_normalized_gif(
     maximum_edge: u32,
     expected_frame_count: Option<u32>,
 ) -> std::result::Result<(), MemberAvatarImportError> {
-    if width == 0
-        || height == 0
-        || width > maximum_edge
-        || height > maximum_edge
-    {
+    if width == 0 || height == 0 || width > maximum_edge || height > maximum_edge {
         return Err(MemberAvatarImportError::invalid(
             "Avatar dimensions are invalid",
         ));
@@ -1890,8 +1883,10 @@ fn existing_asset_matches(
     {
         return Ok(false);
     }
-    let source =
-        read_existing_regular_file(&directory.join(&manifest.source.file.file), NORMALIZED_SOURCE_BYTES)?;
+    let source = read_existing_regular_file(
+        &directory.join(&manifest.source.file.file),
+        NORMALIZED_SOURCE_BYTES,
+    )?;
     let icon = read_existing_regular_file(&directory.join(&manifest.icon.file), ICON_BYTES)?;
     Ok(sha256(&source) == expected_source.sha256 && sha256(&icon) == expected_icon.sha256)
 }
@@ -2473,8 +2468,7 @@ mod tests {
 
         let heavy = directory.join("heavy-frames.gif");
         write_bytes(&heavy, &structure_gif(4096, 4096, 10, 0));
-        let error =
-            import_managed_member_avatar(&directory, Uuid::new_v4(), &heavy).unwrap_err();
+        let error = import_managed_member_avatar(&directory, Uuid::new_v4(), &heavy).unwrap_err();
         assert_eq!(error.kind, MemberAvatarImportErrorKind::Invalid);
         assert!(error.to_string().contains("cumulative"));
 

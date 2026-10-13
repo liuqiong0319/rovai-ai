@@ -8877,14 +8877,11 @@ impl Core {
                             anyhow::anyhow!("Raster avatar save requires iconBase64")
                         })?;
                         anyhow::ensure!(
-                            source.len() <= 23 * 1024 * 1024
-                                && icon.len() <= 1400 * 1024,
+                            source.len() <= 23 * 1024 * 1024 && icon.len() <= 1400 * 1024,
                             "Avatar exceeds the managed asset limit"
                         );
-                        let source =
-                            base64::engine::general_purpose::STANDARD.decode(source)?;
-                        let icon =
-                            base64::engine::general_purpose::STANDARD.decode(icon)?;
+                        let source = base64::engine::general_purpose::STANDARD.decode(source)?;
+                        let icon = base64::engine::general_purpose::STANDARD.decode(icon)?;
                         Ok(serde_json::to_value(
                             rovai_core::member_avatar::save_managed_member_avatar(
                                 &self.data_dir,
@@ -8897,10 +8894,9 @@ impl Core {
                         )?)
                     }
                     Some("gif") => {
-                        let source_gif =
-                            params.source_gif_base64.as_deref().ok_or_else(|| {
-                                anyhow::anyhow!("GIF avatar save requires sourceGifBase64")
-                            })?;
+                        let source_gif = params.source_gif_base64.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!("GIF avatar save requires sourceGifBase64")
+                        })?;
                         anyhow::ensure!(
                             source_gif.len() <= 14 * 1024 * 1024,
                             "Avatar exceeds the managed asset limit"
